@@ -43,11 +43,12 @@ export function setupScript() {
   ].join('\n')
 }
 
-export function scanCommand({ url, ref, nonce }) {
+/** The nonce isn't in here: it goes in on stdin, so it never appears in a process listing. */
+export function scanCommand({ url, ref }) {
   const args = [
     'env', '-u', 'GITHUB_TOKEN', '-u', 'GH_TOKEN', '-u', 'GITHUB_CODESPACE_TOKEN', '-u', 'GIT_ASKPASS', '-u', 'GIT_CONFIG_PARAMETERS',
     'node', '"$HOME/bouncer/scanner/main.js"',
-    '--url', shQuote(url), '--nonce', shQuote(nonce),
+    '--url', shQuote(url), '--nonce-stdin',
     ...(ref ? ['--ref', shQuote(ref)] : []),
     '--dir', '"$HOME/bouncer/work/repo"',
     '--osv', '"$HOME/bouncer/osv-scanner"',
@@ -89,7 +90,7 @@ export function createCodespaceRuntime({ exec = run, onLog = () => {}, branch = 
 
     async ensureImage() { return null },
 
-    async scan({ url, ref, nonce }) {
+    async scan({ url, ref, nonce, onSession = () => {} }) {
       onLog('Creating a throwaway Codespace from git-bouncer\'s own sandbox config (about a minute)...')
       let created = await gh(createArgs({ branch }))
       if (created.code !== 0 && /machine/i.test(created.stderr)) created = await gh(createArgs({ branch, machine: null }))
@@ -98,12 +99,13 @@ export function createCodespaceRuntime({ exec = run, onLog = () => {}, branch = 
         throw new Error(`could not create a Codespace: ${created.stderr.trim().split('\n').pop() || 'unknown error'}`)
       }
       const session = { engine: 'codespace', name }
+      onSession(session) // registered at once, so an interrupt deletes the Codespace
       try {
         const setup = await ssh(name, setupScript(), { timeoutMs: 5 * 60_000 })
         if (setup.code !== 0) throw new Error(`could not prepare the Codespace: ${setup.stderr.trim().split('\n').pop()}`)
         const cp = await gh(['codespace', 'cp', '--codespace', name, '--recursive', `${SANDBOX_DIR}scanner`, 'remote:bouncer/scanner'])
         if (cp.code !== 0) throw new Error(`could not copy the scanner into the Codespace: ${cp.stderr.trim().split('\n').pop()}`)
-        const r = await ssh(name, scanCommand({ url, ref, nonce }), { timeoutMs: 30 * 60_000, onStderr: s => onLog(s.trimEnd()) })
+        const r = await ssh(name, scanCommand({ url, ref }), { timeoutMs: 30 * 60_000, input: `${nonce}\n`, onStderr: s => onLog(s.trimEnd()) })
         return { reportText: r.stdout, exitCode: r.code, timedOut: r.timedOut, session }
       } catch (e) {
         e.session = session

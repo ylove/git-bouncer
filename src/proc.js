@@ -4,6 +4,8 @@
 // and a cap on captured output. Callers choose whether output is captured or shown live.
 
 import { spawn } from 'node:child_process'
+import { stat, access, constants } from 'node:fs/promises'
+import path from 'node:path'
 
 /**
  * @param {string} cmd
@@ -43,6 +45,28 @@ export function run(cmd, args, { cwd, env = process.env, timeoutMs = 120_000, in
     child.on('error', error => { clearTimeout(timer); resolve({ code: -1, stdout, stderr: stderr + String(error), timedOut, truncated, error }) })
     child.on('close', code => { clearTimeout(timer); resolve({ code: code ?? -1, stdout, stderr, timedOut, truncated }) })
   })
+}
+
+/**
+ * Find a program on PATH, using absolute PATH entries only. Relative entries like "." or
+ * "./node_modules/.bin" would let a freshly cloned repo supply its own `git` or `npm`.
+ * @returns {Promise<string|null>} absolute path
+ */
+export async function which(cmd, env = process.env) {
+  const dirs = (env.PATH || env.Path || '').split(path.delimiter).filter(d => d && path.isAbsolute(d))
+  const exts = process.platform === 'win32' ? (env.PATHEXT || '.EXE;.CMD;.BAT;.COM').split(';').filter(Boolean) : ['']
+  for (const d of dirs) {
+    for (const e of exts) {
+      const p = path.join(d, cmd + e)
+      try {
+        const st = await stat(p)
+        if (!st.isFile()) continue
+        if (process.platform !== 'win32') await access(p, constants.X_OK)
+        return p
+      } catch { /* keep looking */ }
+    }
+  }
+  return null
 }
 
 /** Is `cmd` runnable? (Runs `<cmd> --version`; nothing else.) */

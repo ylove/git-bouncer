@@ -14,7 +14,8 @@ test('shQuote makes any value a single inert shell word', () => {
 })
 
 test('the scan command removes tokens and quotes every input', () => {
-  const cmd = scanCommand({ url: 'https://github.com/a/b.git', ref: 'v1.0.0', nonce: 'f'.repeat(32) })
+  const cmd = scanCommand({ url: 'https://github.com/a/b.git', ref: 'v1.0.0' })
+  assert.ok(cmd.includes('--nonce-stdin') && !/[0-9a-f]{32}/.test(cmd), 'the nonce must not be on the command line')
   for (const t of ['GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_CODESPACE_TOKEN']) assert.ok(cmd.includes(`-u ${t}`), t)
   assert.ok(cmd.includes("--url 'https://github.com/a/b.git'"))
   assert.ok(cmd.includes("--ref 'v1.0.0'"))
