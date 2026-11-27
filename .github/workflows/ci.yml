@@ -34,6 +34,31 @@ jobs:
       # Zero dependencies, so there is nothing to install: the tests run straight from the checkout.
       - run: npm test
 
+  # Builds the sandbox image and runs the integration tests against a real container engine:
+  # hardening properties, checksum mismatch, OSV with a hostile osv-scanner.toml, .npmrc override,
+  # and a full scan + clone of a tiny public repo.
+  sandbox:
+    name: sandbox (${{ matrix.engine }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [docker, podman]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Integration tests
+        run: node --test --test-concurrency=1 test/integration/*.test.js
+        env:
+          BOUNCER_INTEGRATION: '1'
+          BOUNCER_ENGINE: ${{ matrix.engine }}
+
   # Fails if the repo leaks things a public repo never should: absolute home-directory paths,
   # email addresses, or leftover merge conflicts. The brackets stop these patterns matching this file.
   hygiene:
