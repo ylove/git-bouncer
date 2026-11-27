@@ -1,6 +1,7 @@
 // `bouncer scan` and `bouncer clone`: ID check -> sandbox pat-down -> verdict -> (clone) handoff.
 
 import { randomBytes } from 'node:crypto'
+import { rm } from 'node:fs/promises'
 import { detectContainerRuntime, createContainerRuntime } from '../runtimes/container.js'
 import { extractReport } from '../report.js'
 import { computeVerdict, EXIT } from '../verdict.js'
@@ -8,6 +9,10 @@ import { handoff, HandoffError } from '../handoff.js'
 import { snykReady, snykTest } from '../snyk.js'
 import { clean } from '../ui/sanitize.js'
 import { has } from '../proc.js'
+
+// Findings that mean "a check didn't run to the end". The result is then INCOMPLETE, not a WARN.
+const COVERAGE_GAPS = new Set(['SCAN-TRUNCATED', 'SCAN-INCOMPLETE', 'DEP-OSV-UNAVAILABLE', 'DEP-OSV-PARTIAL', 'DEP-INSTALL-FAILED',
+  'DEP-INSTALL-SKIPPED', 'LOCK-OUT-OF-SYNC', 'LOCK-UNPARSABLE', 'DEP-SIGNATURES-UNCHECKED'])
 
 /** Placeholder until the ID check (#2) is wired in: offline checks only. */
 async function runIdCheck(target, deps) {
@@ -38,9 +43,17 @@ export async function check(cmd, deps) {
   let session = null
   let runtime = null
   let keep = options.keep
+  let halfCloned = null // a destination folder the handoff is still filling in
   const cleanup = async () => { if (session && runtime && !keep) { await runtime.destroy(session).catch(() => {}); session = null } }
-  const onSigint = async () => { out.line(); out.note('Interrupted: removing the sandbox...'); keep = false; await cleanup(); process.exit(130) }
-  process.once('SIGINT', onSigint)
+  const onSignal = async signal => {
+    out.line(); out.note(`Interrupted (${signal}): removing the sandbox${halfCloned ? ' and the unfinished clone' : ''}...`)
+    keep = false
+    await cleanup()
+    if (halfCloned) await rm(halfCloned, { recursive: true, force: true }).catch(() => {})
+    process.exit(signal === 'SIGINT' ? 130 : 143)
+  }
+  const signals = ['SIGINT', 'SIGTERM', 'SIGHUP']
+  for (const s of signals) process.once(s, onSignal)
 
   try {
     out.line(`${out.c.bold('git-bouncer')} ${out.c.dim(version)}  checking ${clean(target.display)}${options.ref ? ` @ ${clean(options.ref)}` : ''}`)
@@ -71,9 +84,17 @@ export async function check(cmd, deps) {
       return EXIT.ERROR
     }
     out.note(`using ${runtime.describe()}`)
+    if (runtime.sweepStale) await runtime.sweepStale().catch(() => 0)
     const image = runtime.ensureImage ? await runtime.ensureImage(version) : null
     const nonce = randomBytes(16).toString('hex')
-    const result = await runtime.scan({ url: target.url, ref: options.ref, nonce, image })
+    let result
+    try {
+      // onSession hands us the sandbox's name before it starts, so an interrupt can always remove it.
+      result = await runtime.scan({ url: target.url, ref: options.ref, nonce, image, onSession: s => { session = s } })
+    } catch (e) {
+      session = e.session ?? session
+      throw e
+    }
     session = result.session
     const { report, complete, problems } = extractReport(result.reportText, nonce)
     if (report) all.push(...report.findings)
@@ -98,7 +119,8 @@ export async function check(cmd, deps) {
     const sandboxFindings = all.filter(f => !id.findings.includes(f))
     if (sandboxFindings.length) out.findings(sandboxFindings)
     else out.note('nothing suspicious found')
-    const v = computeVerdict(all, { complete: complete && id.complete !== false })
+    const gaps = all.filter(f => COVERAGE_GAPS.has(f.id))
+    const v = computeVerdict(all, { complete: complete && id.complete !== false && gaps.length === 0 })
     out.verdict(v.verdict, v.counts)
     if (report?.target?.commit) out.note(`scanned commit ${report.target.commit} (${report.stats?.files ?? '?'} files)`)
 
@@ -110,7 +132,10 @@ export async function check(cmd, deps) {
 
     // 4. Clone: ask before anything touches this machine.
     out.line()
-    if (v.verdict === 'fail' || v.verdict === 'incomplete') {
+    if (v.verdict === 'incomplete' && report && report.status === 'ok' && !v.counts.critical && !v.counts.high) {
+      out.note(`Some checks couldn't finish (${gaps.map(g => g.id).join(', ') || 'see above'}). Nothing bad was found, but this is not a clean result.`)
+    }
+    if (v.verdict === 'fail' || (v.verdict === 'incomplete' && !(report && report.status === 'ok'))) {
       const del = await prompter.confirm('Delete the sandbox and everything in it?', { defaultYes: true, safeAnswer: true })
       if (!del) {
         keep = true
@@ -119,13 +144,13 @@ export async function check(cmd, deps) {
       return v.exitCode
     }
     const ok = await prompter.confirm(
-      v.verdict === 'warn'
-        ? `Let it in anyway? Clone to ./${cmd.dir}${options.install ? ' and install dependencies' : ''}`
-        : `Let it in? Clone to ./${cmd.dir}${options.install ? ' and install dependencies' : ''}`,
+      v.verdict === 'pass'
+        ? `Let it in? Clone to ./${cmd.dir}${options.install ? ' and install dependencies' : ''}`
+        : `Let it in anyway? Clone to ./${cmd.dir}${options.install ? ' and install dependencies' : ''}`,
       { defaultYes: v.verdict === 'pass', safeAnswer: false })
     if (!ok) { out.note('Not cloned. The sandbox will be removed.'); return v.exitCode }
     try {
-      const h = await handoff({ target: { ...target, ref: options.ref }, report, findings: all, dir: cmd.dir, install: options.install, runtime, session, prompter, out })
+      const h = await handoff({ target: { ...target, ref: options.ref }, report, findings: all, dir: cmd.dir, install: options.install, runtime, session, prompter, out, onCreated: d => { halfCloned = d } })
       out.line()
       out.line(`${out.c.green('✔')} ${h.installed ? 'Cloned and installed' : 'Cloned'} into ./${cmd.dir}${h.ignoreScripts ? ' (install scripts were not run)' : ''}`)
     } catch (e) {
@@ -134,7 +159,7 @@ export async function check(cmd, deps) {
     }
     return v.exitCode
   } finally {
-    process.removeListener('SIGINT', onSigint)
+    for (const s of signals) process.removeListener(s, onSignal)
     await cleanup()
     if (session && keep && runtime && !json) out.note(`Sandbox kept: ${session.name}`)
   }
