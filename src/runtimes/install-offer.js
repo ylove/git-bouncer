@@ -230,3 +230,94 @@ export function explainChoices(plan) {
   }
   return lines.join('\n')
 }
+
+function manualSummary(plan) {
+  const linux = plan.platform === 'linux'
+  return [
+    `Install Podman (recommended, free and open source): ${LINKS.podman}`,
+    linux
+      ? `Or Docker Engine: ${LINKS.dockerEngine}`
+      : `Or Docker Desktop: ${LINKS.dockerDesktop} (check Docker's license terms for work use: ${LINKS.dockerTerms})`,
+    DOCTOR,
+  ]
+}
+
+/**
+ * Explain the choice, let the person pick, and run each install step only after an explicit yes.
+ *
+ * @param {object} io
+ * @param {string} [io.platform]  defaults to process.platform
+ * @param {(cmd: string) => boolean} io.has  is a program on PATH
+ * @param {(question: string, opts: {default: boolean}) => Promise<boolean>} [io.confirm]  yes/no prompt
+ * @param {(question: string, options: {key: string, label: string}[]) => Promise<string>} [io.choose]
+ * @param {(cmd: string, args: string[]) => Promise<{code: number|null}>} io.exec  run a program, stdio inherited
+ * @param {(text: string) => void} [io.out]  print
+ * @param {() => string|null} [io.readOsRelease]  the text of /etc/os-release, or null
+ * @param {boolean} [io.interactive]  false (or no confirm/choose) means: offer nothing, run nothing
+ * @returns {Promise<{installed: boolean, runtime?: 'podman'|'docker', reason: string, nextSteps: string[]}>}
+ *   installed: an install command ran and succeeded during this call.
+ *   reason: 'installed' | 'non-interactive' | 'cancelled' | 'manual' | 'already-installed' | 'declined' | 'failed'
+ *   Prompts that throw (Ctrl-C) propagate to the caller; nothing runs after them.
+ */
+export async function offerInstall({
+  platform = process.platform,
+  has,
+  confirm,
+  choose,
+  exec,
+  out = text => process.stdout.write(`${text}\n`),
+  readOsRelease: read = () => null,
+  interactive = true,
+} = {}) {
+  const plan = planInstall({ platform, has, osRelease: platform === 'linux' ? read() : null })
+  if (interactive !== true || typeof confirm !== 'function' || typeof choose !== 'function') {
+    return { installed: false, reason: 'non-interactive', nextSteps: manualSummary(plan) }
+  }
+
+  out(explainChoices(plan))
+  const picked = await choose('Which would you like to install?', [
+    { key: 'podman', label: `${plan.options.podman.name} (recommended)` },
+    { key: 'docker', label: plan.options.docker.name },
+    { key: 'cancel', label: 'Cancel' },
+  ])
+  // Only the two known keys select anything; anything else, including a typo, is a cancel.
+  if (picked !== 'podman' && picked !== 'docker') {
+    out('Cancelled. Nothing was installed.')
+    return { installed: false, reason: 'cancelled', nextSteps: manualSummary(plan) }
+  }
+  const opt = plan.options[picked]
+  const runtime = picked
+
+  if (opt.installed || opt.steps.length === 0) {
+    out(['', `${opt.name}:`, ...opt.notes.map(n => `  ${n}`), ...opt.manual.map(m => `  ${m}`)].join('\n'))
+    return { installed: false, runtime, reason: opt.installed ? 'already-installed' : 'manual', nextSteps: opt.manual }
+  }
+
+  const total = opt.steps.length
+  out(['', ...opt.notes, total === 1 ? 'This takes 1 step, and it asks you first.' : `This takes ${total} steps. Each one asks you first.`].join('\n'))
+  let installed = false
+  for (let i = 0; i < total; i++) {
+    const step = opt.steps[i]
+    const cmd = show(step.argv)
+    const rest = opt.steps.slice(i).map(s => `Run: ${show(s.argv)}`)
+    out(`\nStep ${i + 1} of ${total}: ${cmd}\n  ${step.what}`)
+    if (await confirm(`Run "${cmd}" now?`, { default: false }) !== true) {
+      out('Skipped. Nothing else was run.')
+      return { installed, runtime, reason: 'declined', nextSteps: [...rest, ...opt.after] }
+    }
+    let result
+    try {
+      result = await exec(step.argv[0], step.argv.slice(1))
+    } catch (e) {
+      result = { code: null, error: e && e.message ? e.message : String(e) }
+    }
+    if (!result || result.code !== 0) {
+      const why = result && result.code !== null && result.code !== undefined ? `exit code ${result.code}` : clean(result && result.error ? result.error : 'it could not be started')
+      out(`"${cmd}" did not finish (${why}). Nothing else was run.`)
+      return { installed, runtime, reason: 'failed', nextSteps: [`"${cmd}" did not finish (${why}). Its output above should say why.`, ...rest, ...opt.after] }
+    }
+    if (step.installs) installed = true
+  }
+  out(`\n${opt.name} is installed.`)
+  return { installed, runtime, reason: 'installed', nextSteps: opt.after }
+}

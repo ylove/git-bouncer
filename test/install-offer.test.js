@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { planInstall, explainChoices, parseOsRelease, LINKS, WINGET_IDS } from '../src/runtimes/install-offer.js'
+import { planInstall, offerInstall, explainChoices, parseOsRelease, LINKS, WINGET_IDS } from '../src/runtimes/install-offer.js'
 
 // A fake machine: `programs` is what's "on PATH". Nothing in these tests installs or runs an installer.
 const hasOnly = (...programs) => cmd => programs.includes(cmd)
@@ -17,6 +17,25 @@ const OS_RELEASE = {
   alpine: 'NAME="Alpine Linux"\nID=alpine\n',
 }
 
+/** Drives offerInstall like a person at a keyboard, and records everything that happened. */
+function session(opts = {}) {
+  const { pick: _pick, answers = [], execResults = [], ...io } = opts
+  const pick = Object.hasOwn(opts, 'pick') ? opts.pick : 'podman' // so a test can pick `undefined`
+  const log = { out: '', questions: [], confirms: [], execs: [], choices: null }
+  const yes = [...answers]
+  const results = [...execResults]
+  return {
+    log,
+    run: () => offerInstall({
+      out: text => { log.out += `${text}\n` },
+      choose: async (question, options) => { log.questions.push(question); log.choices = options; return pick },
+      confirm: async (question, opts) => { log.confirms.push({ question, opts }); return yes.length ? yes.shift() : false },
+      exec: async (cmd, args) => { log.execs.push([cmd, ...args]); return results.length ? results.shift() : { code: 0 } },
+      readOsRelease: () => null,
+      ...io,
+    }),
+  }
+}
 
 // --- planInstall: what each platform is offered ------------------------------------------------
 
@@ -147,4 +166,120 @@ test('parseOsRelease reads quoted values and ID_LIKE lists, and ignores junk', (
   assert.deepEqual(parseOsRelease(OS_RELEASE.rocky), { id: 'rocky', idLike: ['rhel', 'centos', 'fedora'], name: 'Rocky Linux' })
   assert.deepEqual(parseOsRelease('garbage\n=x\nID\n'), { id: null, idLike: [], name: null })
   assert.deepEqual(parseOsRelease(null), { id: null, idLike: [], name: null })
+})
+
+// --- offerInstall: consent ----------------------------------------------------------------------
+
+test('non-interactive: nothing is offered, asked or run', async () => {
+  let ran = false
+  const exec = async () => { ran = true; return { code: 0 } }
+  const noPrompts = await offerInstall({ platform: 'darwin', has: hasOnly('brew'), exec, out: () => { ran = true } })
+  assert.equal(noPrompts.installed, false)
+  assert.equal(noPrompts.reason, 'non-interactive')
+  assert.ok(noPrompts.nextSteps.some(s => s.includes(LINKS.podman)))
+
+  // Even with prompts available, interactive: false wins.
+  const s = session({ platform: 'darwin', has: hasOnly('brew'), interactive: false, answers: [true, true, true], exec })
+  const r = await s.run()
+  assert.equal(r.reason, 'non-interactive')
+  assert.equal(s.log.questions.length, 0)
+  assert.equal(s.log.confirms.length, 0)
+  assert.equal(ran, false)
+})
+
+test('macOS, yes to everything: runs exactly the three commands, in order, each after its own yes (default no)', async () => {
+  const s = session({ platform: 'darwin', has: hasOnly('brew'), pick: 'podman', answers: [true, true, true] })
+  const r = await s.run()
+  assert.deepEqual(s.log.execs, [['brew', 'install', 'podman'], ['podman', 'machine', 'init'], ['podman', 'machine', 'start']])
+  assert.deepEqual(s.log.confirms.map(c => c.question), [
+    'Run "brew install podman" now?',
+    'Run "podman machine init" now?',
+    'Run "podman machine start" now?',
+  ])
+  assert.ok(s.log.confirms.every(c => c.opts.default === false))
+  assert.deepEqual(s.log.choices.map(c => c.key), ['podman', 'docker', 'cancel'])
+  assert.equal(r.installed, true)
+  assert.equal(r.runtime, 'podman')
+  assert.equal(r.reason, 'installed')
+  assert.match(r.nextSteps.join(' '), /bouncer doctor/)
+})
+
+test('no means no: declining the first step runs nothing', async () => {
+  const s = session({ platform: 'darwin', has: hasOnly('brew'), pick: 'podman', answers: [false] })
+  const r = await s.run()
+  assert.deepEqual(s.log.execs, [])
+  assert.equal(s.log.confirms.length, 1) // it stops asking, too
+  assert.deepEqual(r, {
+    installed: false, runtime: 'podman', reason: 'declined',
+    nextSteps: ['Run: brew install podman', 'Run: podman machine init', 'Run: podman machine start', 'Then run "bouncer doctor" to check that git-bouncer can use it.'],
+  })
+})
+
+test('only the boolean true is a yes: "y", 1 and "true" all count as no', async () => {
+  for (const answer of ['y', 'yes', 1, 'true', {}, null, undefined]) {
+    const s = session({ platform: 'win32', has: hasOnly('winget'), pick: 'docker', answers: [answer] })
+    const r = await s.run()
+    assert.deepEqual(s.log.execs, [], String(answer))
+    assert.equal(r.reason, 'declined')
+  }
+})
+
+test('yes to installing, no to the virtual machine: Podman is installed and the rest are next steps', async () => {
+  const s = session({ platform: 'darwin', has: hasOnly('brew'), pick: 'podman', answers: [true, false] })
+  const r = await s.run()
+  assert.deepEqual(s.log.execs, [['brew', 'install', 'podman']])
+  assert.equal(r.installed, true)
+  assert.equal(r.reason, 'declined')
+  assert.deepEqual(r.nextSteps.slice(0, 2), ['Run: podman machine init', 'Run: podman machine start'])
+})
+
+test('a failed step stops everything after it', async () => {
+  const s = session({ platform: 'darwin', has: hasOnly('brew'), pick: 'podman', answers: [true, true, true], execResults: [{ code: 1 }] })
+  const r = await s.run()
+  assert.deepEqual(s.log.execs, [['brew', 'install', 'podman']])
+  assert.equal(s.log.confirms.length, 1)
+  assert.equal(r.installed, false)
+  assert.equal(r.reason, 'failed')
+  assert.match(r.nextSteps[0], /exit code 1/)
+})
+
+test('an installer that cannot start (or throws) is a failure, not a crash, and its message is sanitized', async () => {
+  const s = session({ platform: 'win32', has: hasOnly('winget'), pick: 'podman', answers: [true], exec: async () => { throw new Error('spawn failed\u001B[2K') } })
+  const r = await s.run()
+  assert.equal(r.reason, 'failed')
+  assert.doesNotMatch(r.nextSteps[0], /\u001B/)
+  assert.doesNotMatch(s.log.out, /\u001B/)
+})
+
+test('Cancel, and anything that is not a known choice, installs nothing', async () => {
+  for (const pick of ['cancel', undefined, '', 'Podman', '__proto__', 'constructor', 'podman; rm -rf ~']) {
+    const s = session({ platform: 'darwin', has: hasOnly('brew'), pick, answers: [true, true, true] })
+    const r = await s.run()
+    assert.equal(r.reason, 'cancelled', String(pick))
+    assert.equal(r.installed, false)
+    assert.deepEqual(s.log.confirms, [])
+    assert.deepEqual(s.log.execs, [])
+  }
+})
+
+test('Linux: shows the commands, never asks to run them, never runs anything', async () => {
+  for (const pick of ['podman', 'docker']) {
+    const s = session({ platform: 'linux', has: hasOnly('apt-get', 'sudo'), pick, answers: [true, true], readOsRelease: () => OS_RELEASE.ubuntu })
+    const r = await s.run()
+    assert.deepEqual(s.log.execs, [], pick)
+    assert.deepEqual(s.log.confirms, [], pick)
+    assert.equal(r.reason, 'manual')
+    assert.equal(r.installed, false)
+  }
+  const s = session({ platform: 'linux', has: hasOnly('apt-get'), pick: 'podman', readOsRelease: () => OS_RELEASE.ubuntu })
+  await s.run()
+  assert.match(s.log.out, /sudo apt-get -y install podman/)
+  assert.match(s.log.out, /prints the commands instead of running them/)
+})
+
+test('already installed: says so, runs nothing', async () => {
+  const s = session({ platform: 'darwin', has: hasOnly('brew', 'podman'), pick: 'podman', answers: [true, true, true] })
+  const r = await s.run()
+  assert.equal(r.reason, 'already-installed')
+  assert.deepEqual(s.log.execs, [])
 })
