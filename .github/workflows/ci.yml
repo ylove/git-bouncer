@@ -58,6 +58,10 @@ jobs:
         env:
           BOUNCER_INTEGRATION: '1'
           BOUNCER_ENGINE: ${{ matrix.engine }}
+          # The ID check asks the GitHub API through gh. Runners share IPs, so anonymous requests get
+          # rate-limited and the check (correctly) reports INCOMPLETE. This read-only job token is used
+          # on the host only; the hardening test proves it never reaches the sandbox.
+          GH_TOKEN: ${{ github.token }}
 
   # Fails if the repo leaks things a public repo never should: absolute home-directory paths,
   # email addresses, or leftover merge conflicts. The brackets stop these patterns matching this file.
