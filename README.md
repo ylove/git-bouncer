@@ -22,7 +22,7 @@ git bouncer <url>        # the same thing, as a git subcommand
 
 1. **ID check**, on your machine, before anything downloads. Who published this repo, and are they who they look like? Look-alike owners (`micr0s0ft`, `vercell`), impersonated famous projects, accounts that changed hands, brand-new accounts, and repos named in public malware reporting.
 2. **Pat-down**, in a throwaway container with **none of your credentials**: no capabilities, read-only filesystem, nothing from your machine mounted. The repo is cloned there and checked for the techniques real campaigns use. **None of its code is run.**
-3. **Verdict.** Clean: it asks before cloning to your machine, at the **exact commit it checked**, and installs only the dependency tree it verified. Not clean: it tells you what it found, in plain language, and deletes the sandbox.
+3. **Verdict.** Clean: it asks before cloning to your machine, at the **exact commit it checked**, verifies the files on disk, and installs npm dependencies from the verified lockfile **with install scripts off** (git-bouncer never runs install scripts for you). Not clean: it tells you what it found, in plain language, and deletes the sandbox.
 
 ![A look-alike account is turned away before anything is downloaded](site/img/turned-away.gif)
 
