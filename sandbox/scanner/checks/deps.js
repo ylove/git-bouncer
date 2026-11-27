@@ -10,7 +10,7 @@
 //
 // Nothing in this file executes code from the repo or its dependencies.
 
-import { readFile, rename, readdir, stat } from 'node:fs/promises'
+import { open, rename, readdir, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { run, cleanEnv } from '../proc.js'
 import { DOWNLOAD_EXEC } from './content.js'
@@ -64,12 +64,15 @@ const LOCKFILE_NAMES = new Set(['package-lock.json', 'npm-shrinkwrap.json', 'yar
 const isRegistryUrl = u => { try { const x = new URL(u); return x.protocol === 'https:' && REGISTRY_HOSTS.has(x.hostname) } catch { return false } }
 const KNOWN_PY_INDEXES = /^https:\/\/(download\.pytorch\.org|pypi\.nvidia\.com|data\.pyg\.org)\//
 
+/** Read a whole file (size-capped) through one open handle, so the size check and the read can't diverge. */
 async function readText(file, max = 8 * 1024 * 1024) {
+  let fh
   try {
-    const st = await stat(file)
+    fh = await open(file, 'r')
+    const st = await fh.stat()
     if (!st.isFile() || st.size > max) return null
-    return await readFile(file, 'utf8')
-  } catch { return null }
+    return await fh.readFile('utf8')
+  } catch { return null } finally { await fh?.close() }
 }
 async function readJson(file) { const t = await readText(file); if (t === null) return null; try { return JSON.parse(t.replace(/^\uFEFF/, '')) } catch { return undefined } }
 
