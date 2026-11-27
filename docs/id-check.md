@@ -59,7 +59,7 @@ Two tricks, two defenses.
 
 Same skeleton, different name: a look-alike.
 
-**Typos.** Measured as [Damerau-Levenshtein distance](https://en.wikipedia.org/wiki/Damerau%E2%80%93Levenshtein_distance) (insert, delete, change, or swap two neighbouring characters) between the skeletons. How close counts depends on the length of the well-known name, because in a short name one changed letter is usually just a different word:
+**Typos.** Measured as [Damerau-Levenshtein distance](https://en.wikipedia.org/wiki/Damerau%E2%80%93Levenshtein_distance) (insert, delete, change, or swap two neighbouring characters) after the single-character swaps. The letter pairs (`rn`, `vv`, `cl`) are left out here, because folding them changes a name's length: it made the real `golangci` organization look one letter away from `golang`. How close counts depends on the length of the well-known name, because in a short name one changed letter is usually just a different word:
 
 | Well-known name length | Counts as a look-alike when the name... |
 |---|---|
@@ -72,6 +72,8 @@ Two more rules keep false alarms down:
 
 - A typo match must keep the **first letter**. People notice a wrong first letter, and dropping it tends to produce unrelated real words (`llama` vs `ollama`, `interest` vs `pinterest`).
 - A name that's **on the known list** is never a look-alike of another known name (`vuejs` and `vitejs` are both real).
+
+These rules were tested against about 1,300 of GitHub's most-followed accounts and about 1,200 of its most-starred repos, and none of them is flagged. That test found three false alarms along the way, which is how `containers` and `fastai` got onto the known list and why letter pairs aren't used for typos.
 
 Repo names are compared against famous repo names the same way, with two differences: a version suffix isn't a disguise (`tensorflow2`, `react18`), and a plain typo is only `low`, because repos are often honestly named after the thing they build on (`flasky` is a popular Flask tutorial). And a well-known owner's own repo names are its business: `microsoft/anything` is never flagged as a look-alike repo.
 

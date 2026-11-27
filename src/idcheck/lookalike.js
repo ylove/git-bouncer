@@ -39,8 +39,9 @@ export function skeleton(name) {
   return s
 }
 
-// The skeleton without the letter pairs. Typos are measured on both forms, because folding pairs can
-// hide a typo: "vercl" is "vercel" missing an "e", but its "cl" folds to "d".
+// The skeleton without the letter pairs. Typos are measured on this form only, because folding pairs
+// distorts lengths: it can hide a typo ("vercl" is "vercel" missing an "e", but its "cl" folds to "d")
+// and invent one ("golangci", a real org, folds to "golangd", one letter from "golang").
 function singleCharSkeleton(name) {
   return loose(name).replace(/[01i34578]/g, ch => LOOKALIKE_CHARS[ch])
 }
@@ -98,25 +99,22 @@ const CHANGED_LETTER_LENGTH = 8
  */
 export function createMatcher(knownNames) {
   const known = [...knownNames].map(name => ({
-    name, lower: name.toLowerCase(), loose: loose(name), forms: [singleCharSkeleton(name), skeleton(name)],
+    name, lower: name.toLowerCase(), loose: loose(name), chars: singleCharSkeleton(name), skeleton: skeleton(name),
   }))
   const exact = new Set(known.map(k => k.lower))
   return function findLookalike(name) {
     if (typeof name !== 'string' || name.length === 0) return null
     if (exact.has(name.toLowerCase())) return null // it IS a known name, so it isn't pretending to be one
     const l = loose(name)
-    const forms = [singleCharSkeleton(name), skeleton(name)]
+    const chars = singleCharSkeleton(name)
+    const full = skeleton(name)
     let typo = null
     for (const k of known) {
       if (k.loose.length < MIN_LENGTH) continue
-      if (forms[1] === k.forms[1]) return { match: k.name, kind: l === k.loose ? 'separators' : 'characters' }
-      if (typo || k.loose.length < TYPO_LENGTH) continue
-      for (let f = 0; f < forms.length && !typo; f++) {
-        const [a, b] = [forms[f], k.forms[f]]
-        if (a[0] !== b[0] || editDistance(a, b) !== 1) continue
-        const kind = oneEditKind(a, b)
-        if (kind !== 'changed' || k.loose.length >= CHANGED_LETTER_LENGTH) typo = { match: k.name, kind }
-      }
+      if (full === k.skeleton) return { match: k.name, kind: l === k.loose ? 'separators' : 'characters' }
+      if (typo || k.loose.length < TYPO_LENGTH || chars[0] !== k.chars[0] || editDistance(chars, k.chars) !== 1) continue
+      const kind = oneEditKind(chars, k.chars)
+      if (kind !== 'changed' || k.loose.length >= CHANGED_LETTER_LENGTH) typo = { match: k.name, kind }
     }
     return typo // a look-alike-character match anywhere in the list beats the first typo match
   }
