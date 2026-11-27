@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- A security tool's own page should practice what it preaches: no third-party scripts, fonts or trackers. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>git-bouncer: don't just git clone</title>
+<meta name="description" content="A door check for repositories you didn't write: ID check, a sandboxed pat-down, then a verdict before anything touches your machine.">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="hero">
+  <p class="eyebrow">open source · zero dependencies · Apache-2.0</p>
+  <h1>Don't just <code>git clone</code>.<br>Let the bouncer check it first.</h1>
+  <p class="lede">Malicious repos are now a routine way to attack developers: poisoned starter kits, fake take-home tests, look-alike accounts like <code>micr0s0ft</code>. git-bouncer checks a repo in a throwaway sandbox <em>before</em> any of it touches your laptop.</p>
+  <div class="install">
+    <pre><code id="cmd">npm install -g git-bouncer</code></pre>
+    <button type="button" id="copy" aria-label="Copy the install command">Copy</button>
+  </div>
+  <p class="then">Then, instead of <code>git clone &lt;url&gt;</code>: <code>bouncer clone &lt;url&gt;</code> or <code>git bouncer &lt;url&gt;</code></p>
+</header>
+
+<main>
+  <section class="steps" aria-label="How it works">
+    <article>
+      <h2><span>1</span> ID check</h2>
+      <p>Before anything downloads: who published this? Look-alike owners, impersonated projects, brand-new accounts and repos named in active malware campaigns are caught on your machine, from public GitHub metadata.</p>
+    </article>
+    <article>
+      <h2><span>2</span> Pat-down</h2>
+      <p>The repo is cloned into a locked-down, throwaway container with <strong>none of your credentials</strong>. No capabilities, read-only filesystem, nothing mounted. Then it's checked for the techniques real campaigns use. <strong>None of its code is run.</strong></p>
+    </article>
+    <article>
+      <h2><span>3</span> Verdict</h2>
+      <p>Clean? It asks before cloning to your machine, at the <em>exact commit</em> it checked, and installs only the dependency tree it verified. Not clean? It tells you what it found, in plain language, and deletes the sandbox.</p>
+    </article>
+  </section>
+
+  <section aria-label="Demo">
+    <figure>
+      <img src="img/let-in.gif" alt="Terminal: bouncer scan on a clean repository. ID check passes, the pat-down finds nothing suspicious, verdict LET IN." width="960" height="540" loading="lazy">
+      <figcaption>A clean repo gets let in.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/turned-away.gif" alt="Terminal: bouncer scan github.com/micr0s0ft/vscode is turned away at the ID check because micr0s0ft looks like microsoft. Nothing is downloaded." width="960" height="540" loading="lazy">
+      <figcaption>A look-alike is turned away at the door. Nothing is downloaded.</figcaption>
+    </figure>
+  </section>
+
+  <section class="checks" aria-label="What it checks">
+    <h2>What the pat-down looks for</h2>
+    <ul>
+      <li><strong>Runs when you open the folder:</strong> VS Code tasks set to <code>folderOpen</code>, dev container commands that run on your host, AI-agent hooks and MCP servers.</li>
+      <li><strong>Runs when you install:</strong> every install script npm would run, including <code>binding.gyp</code> builds and workspace scripts, plus <code>.npmrc</code>, <code>.yarnrc</code> and <code>.pnpmfile.cjs</code> tricks that work even with <code>--ignore-scripts</code>.</li>
+      <li><strong>Poisoned dependencies:</strong> known-malicious packages (OSV), checksum mismatches against the lockfile, invalid registry signatures, typosquats, packages from outside the registry.</li>
+      <li><strong>Hidden code:</strong> payloads pushed off-screen with whitespace, decode-then-execute, fake font files that are JavaScript, blockchain command-and-control, invisible Unicode and Trojan Source.</li>
+      <li><strong>Git tricks:</strong> symlinks out of the repo, <code>.git</code> look-alike paths, case collisions, odd submodules. The clone itself happens in the sandbox.</li>
+    </ul>
+    <p><a href="https://github.com/ylove/git-bouncer/blob/main/docs/checks.md">Every check, with its severity →</a></p>
+  </section>
+
+  <section class="limits" aria-label="Limitations">
+    <h2>What it can't do</h2>
+    <p>A clean result means <em>no known red flags</em>, not "safe". Static checks can be evaded, brand-new malware isn't in the databases yet, and nothing is run, so behavior that only shows up at runtime isn't seen. git-bouncer shrinks the blast radius of your first contact with an unfamiliar repo. It doesn't replace your judgment. <a href="https://github.com/ylove/git-bouncer/blob/main/THREAT_MODEL.md">Read the threat model →</a></p>
+  </section>
+
+  <section class="noDocker" aria-label="Without Docker">
+    <h2>No Docker?</h2>
+    <p>It works with <strong>Podman</strong> (free, open source, no account), and can offer to install it. It can also use a throwaway <strong>GitHub Codespace</strong>, or your own cloud account.</p>
+  </section>
+</main>
+
+<footer>
+  <p><a href="https://github.com/ylove/git-bouncer">github.com/ylove/git-bouncer</a> · built in public: read the <a href="https://github.com/ylove/git-bouncer/pulls?q=is%3Apr">pull requests</a> to see how · <a href="https://github.com/ylove/git-bouncer/security/advisories/new">report a vulnerability</a></p>
+</footer>
+<script src="copy.js"></script>
+</body>
+</html>
