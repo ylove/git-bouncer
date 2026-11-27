@@ -13,7 +13,7 @@
 // Nothing here executes repository code. Files are read as bytes and inspected. Every regex here
 // is linear-time on hostile input (no nested quantifiers over overlapping classes).
 
-import { readdir, lstat, open } from 'node:fs/promises'
+import { readdir, open, constants } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { excerpt } from '../findings.js'
@@ -455,8 +455,12 @@ export async function contentChecks(root, findings) {
 
   for (const rel of files) {
     const abs = path.join(root, rel)
-    const st = await lstat(abs).catch(() => null)
-    if (!st || !st.isFile()) continue
+    // Open first, then stat the open handle: no gap between checking a file and reading it, and
+    // O_NOFOLLOW refuses symlinks outright (there shouldn't be any: links are checked out as files).
+    const fh = await open(abs, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)).catch(() => null)
+    if (!fh) continue
+    const st = await fh.stat().catch(() => null)
+    if (!st || !st.isFile()) { await fh.close(); continue }
     stats.files++
     const name = path.posix.basename(rel)
     const base = name.toLowerCase()
@@ -467,10 +471,9 @@ export async function contentChecks(root, findings) {
         title: `File name matches a known ${c.campaign} indicator`,
         detail: `Reported in public research (snapshot ${IOC_SNAPSHOT_DATE}): ${c.source}` })
     }
-    if (st.size === 0) continue
-    if (stats.scanned >= MAX_FILES || stats.bytes > MAX_TOTAL_BYTES) { stats.truncated = true; break }
+    if (st.size === 0) { await fh.close(); continue }
+    if (stats.scanned >= MAX_FILES || stats.bytes > MAX_TOTAL_BYTES) { await fh.close(); stats.truncated = true; break }
 
-    const fh = await open(abs, 'r')
     let buf
     try {
       const size = Math.min(st.size, MAX_FILE_BYTES)

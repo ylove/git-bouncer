@@ -60,6 +60,8 @@ const BENIGN_ROOT_SCRIPT = /^(husky( install)?|is-ci \|\| husky( install)?|npx h
 const LOCKFILE_NAMES = new Set(['package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lock',
   'requirements.txt', 'poetry.lock', 'Pipfile.lock', 'uv.lock', 'pdm.lock', 'packages.lock.json', 'Cargo.lock',
   'go.mod', 'Gemfile.lock', 'composer.lock', 'pubspec.lock', 'mix.lock', 'gradle.lockfile', 'pom.xml'])
+/** Compare hosts after parsing; a regex on the raw string would accept https://evil.example/registry.npmjs.org. */
+const isRegistryUrl = u => { try { const x = new URL(u); return x.protocol === 'https:' && REGISTRY_HOSTS.has(x.hostname) } catch { return false } }
 const KNOWN_PY_INDEXES = /^https:\/\/(download\.pytorch\.org|pypi\.nvidia\.com|data\.pyg\.org)\//
 
 async function readText(file, max = 8 * 1024 * 1024) {
@@ -390,7 +392,7 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
           detail: '`yarnPath` makes every yarn command run the repo\'s own copy of Yarn. That\'s normal for Yarn Berry, but it means the repo controls the program that installs your dependencies.' })
       }
       const reg = text.match(/^\s*npmRegistryServer:\s*["']?([^"'\s]+)/m)
-      if (reg && !/registry\.(npmjs\.org|yarnpkg\.com)/.test(reg[1])) findings.add({ id: 'NPMRC-OVERRIDE', severity: 'high', file: rc, evidence: `npmRegistryServer: ${reg[1].slice(0, 100)}`,
+      if (reg && !isRegistryUrl(reg[1])) findings.add({ id: 'NPMRC-OVERRIDE', severity: 'high', file: rc, evidence: `npmRegistryServer: ${reg[1].slice(0, 100)}`,
         title: 'Yarn is pointed at a different package registry', detail: 'Every package would be downloaded from this server instead of the npm registry.' })
       continue
     }
