@@ -1,12 +1,19 @@
 // Auto-run checks: things that execute just because you OPENED the folder, started an AI
 // agent in it, or ran the project's normal commands. No install step required.
+//
+// Paths are matched case-insensitively: on macOS and Windows, `.VSCode/tasks.json` IS
+// `.vscode/tasks.json` as far as the editor is concerned.
 
-import { readFile } from 'node:fs/promises'
+import { readFile, readdir, stat } from 'node:fs/promises'
 import path from 'node:path'
-import { DOWNLOAD_EXEC } from './content.js'
 
-/** Parse JSON-with-comments (VS Code, devcontainer) without evaluating anything. */
+// Something fetched from the network and run, or decoded and run. (A plain URL is not enough here:
+// MCP configs legitimately point at remote servers.)
+const FETCH_AND_RUN = /(\b(curl|wget|iwr|Invoke-WebRequest|Invoke-RestMethod)\b[^\n]{0,300}?(\||;|&&)\s*(sudo\s+)?(ba|z|da|k)?sh\b|\b(iex|Invoke-Expression)\b|powershell(\.exe)?\s+(-\w+\s+)*-(e|enc|encodedcommand)\b|base64\s+(-d|--decode)|\batob\s*\(|\b(curl|wget)\b[^\n]{0,200}?-o\s*\S+[^\n]{0,80}?(chmod|\bsh\b|bash|node|python))/i
+
+/** Parse JSON-with-comments (VS Code, devcontainer) without evaluating anything. Tolerates a BOM. */
 export function parseJsonc(text) {
+  text = text.replace(/^\uFEFF/, '')
   let out = ''
   let inStr = false
   for (let i = 0; i < text.length; i++) {
@@ -25,8 +32,25 @@ export function parseJsonc(text) {
   return JSON.parse(out.replace(/,(\s*[}\]])/g, '$1'))
 }
 
-async function readText(root, rel) {
-  try { return await readFile(path.join(root, rel), 'utf8') } catch { return null }
+/** JSON string escapes decoded, so text fallbacks see "folderOpen" even if it was written folderOpen. */
+const unescapeJson = t => t.replace(/^\uFEFF/, '').replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(Number.parseInt(h, 16)))
+
+/** Map every lowercased relative path (a few levels deep) to its real spelling. */
+async function caseMap(root, maxDepth = 4) {
+  const map = new Map()
+  const walk = async (rel, depth) => {
+    let entries
+    try { entries = await readdir(path.join(root, rel), { withFileTypes: true }) } catch { return }
+    for (const e of entries) {
+      const r = rel ? `${rel}/${e.name}` : e.name
+      if (e.isDirectory()) {
+        if (depth < maxDepth && e.name !== '.git' && e.name !== 'node_modules') await walk(r, depth + 1)
+      } else if (e.isFile() && !map.has(r.toLowerCase())) map.set(r.toLowerCase(), r)
+      if (map.size > 20000) return
+    }
+  }
+  await walk('', 0)
+  return map
 }
 
 const cmdText = v => (Array.isArray(v) ? v.map(cmdText).join(' ') : typeof v === 'object' && v ? Object.values(v).map(cmdText).join(' ; ') : String(v ?? ''))
@@ -34,114 +58,147 @@ const cmdText = v => (Array.isArray(v) ? v.map(cmdText).join(' ') : typeof v ===
 // Workspace settings that make VS Code run a program from the repo (Workspace Trust guards these,
 // but people click "Trust" on take-home tests all the time).
 const VSCODE_EXEC_SETTINGS = /^(typescript\.tsdk|eslint\.(nodePath|runtime)|python\.(defaultInterpreterPath|pythonPath)|git\.path|terminal\.integrated\.(profiles|shell|shellArgs|automationProfile|env)\.?|php\.validate\.executablePath|go\.(alternateTools|goroot)|rust-analyzer\.server\.path|.*\.(executablePath|serverPath|binaryPath))/
+// Claude Code settings that run a shell command, not just hooks.
+const CLAUDE_COMMAND_SETTINGS = ['apiKeyHelper', 'awsAuthRefresh', 'awsCredentialExport', 'otelHeadersHelper']
 
 export async function autorunChecks(root, findings) {
-  // 1. VS Code tasks that run on folder open.
-  const tasksText = await readText(root, '.vscode/tasks.json')
-  if (tasksText) {
+  const files = await caseMap(root)
+  const real = rel => files.get(rel.toLowerCase()) ?? null
+  const read = async rel => {
+    const r = real(rel)
+    if (!r) return null
+    try { return { rel: r, text: await readFile(path.join(root, r), 'utf8') } } catch { return null }
+  }
+  const unparsable = rel => findings.add({ id: 'AUTORUN-CONFIG-UNPARSABLE', severity: 'medium', file: rel,
+    title: `${rel} could not be parsed`,
+    detail: 'Editors and agents read these files leniently, so a file that breaks a strict parser may still run commands. Its contents were checked with text matching instead.' })
+
+  // 1. VS Code tasks that run on folder open (in .vscode/tasks.json or any *.code-workspace file).
+  const taskSources = [await read('.vscode/tasks.json'), ...await Promise.all([...files.values()].filter(f => /\.code-workspace$/i.test(f) && !f.includes('/')).slice(0, 10).map(read))].filter(Boolean)
+  for (const { rel, text } of taskSources) {
     let flagged = false
+    let parsed = true
     try {
-      const tasks = parseJsonc(tasksText).tasks || []
-      for (const t of tasks) {
+      const conf = parseJsonc(text)
+      const tasks = (rel.endsWith('.code-workspace') ? conf.tasks?.tasks : conf.tasks) || []
+      for (const t of Array.isArray(tasks) ? tasks : []) {
         if (t?.runOptions?.runOn === 'folderOpen') {
           flagged = true
           findings.add({
-            id: 'AUTORUN-VSCODE-FOLDEROPEN', severity: 'high', file: '.vscode/tasks.json',
-            evidence: cmdText([t.command, ...(t.args || [])]).slice(0, 200),
+            id: 'AUTORUN-VSCODE-FOLDEROPEN', severity: 'high', file: rel,
+            evidence: cmdText([t.command, ...(Array.isArray(t.args) ? t.args : [])]).slice(0, 200),
             title: 'VS Code task runs automatically when the folder is opened',
             detail: '`"runOn": "folderOpen"` runs this command the moment you open the repo in VS Code (or Cursor). Recent campaigns, PolinRider included, used this to run malware without any install step.',
           })
         }
       }
-    } catch { /* fall through to the text match */ }
-    if (!flagged && /"runOn"\s*:\s*"folderOpen"/.test(tasksText)) {
-      findings.add({ id: 'AUTORUN-VSCODE-FOLDEROPEN', severity: 'high', file: '.vscode/tasks.json',
+    } catch { parsed = false; unparsable(rel) }
+    if (!flagged && /"runOn"\s*:\s*"folderOpen"/.test(unescapeJson(text))) {
+      findings.add({ id: 'AUTORUN-VSCODE-FOLDEROPEN', severity: 'high', file: rel,
         title: 'VS Code task runs automatically when the folder is opened',
-        detail: 'The file contains `"runOn": "folderOpen"` (it couldn\'t be parsed cleanly, which is itself unusual).' })
+        detail: `The file contains \`"runOn": "folderOpen"\`${parsed ? '' : ' (and couldn\'t be parsed cleanly, which is itself unusual)'}.` })
     }
   }
 
   // 2. VS Code settings that point at executables.
-  const settingsText = await readText(root, '.vscode/settings.json')
-  if (settingsText) {
+  const settings = await read('.vscode/settings.json')
+  if (settings) {
     try {
-      const keys = Object.keys(parseJsonc(settingsText)).filter(k => VSCODE_EXEC_SETTINGS.test(k))
+      const keys = Object.keys(parseJsonc(settings.text)).filter(k => VSCODE_EXEC_SETTINGS.test(k))
       if (keys.length) {
-        findings.add({ id: 'AUTORUN-VSCODE-SETTINGS', severity: 'medium', file: '.vscode/settings.json', evidence: keys.slice(0, 6).join(', '),
+        findings.add({ id: 'AUTORUN-VSCODE-SETTINGS', severity: 'medium', file: settings.rel, evidence: keys.slice(0, 6).join(', '),
           title: 'Workspace settings choose which programs VS Code runs',
           detail: 'These settings can make the editor execute a binary or script from the repo once you trust the workspace.' })
       }
-    } catch { /* unparsable settings aren't executable either */ }
+    } catch { unparsable(settings.rel) }
   }
 
-  // 3. Dev containers: initializeCommand runs on YOUR HOST, before any container exists.
-  for (const rel of ['.devcontainer/devcontainer.json', '.devcontainer.json']) {
-    const text = await readText(root, rel)
-    if (!text) continue
-    let conf
-    try { conf = parseJsonc(text) } catch { continue }
-    if (conf.initializeCommand) {
-      findings.add({ id: 'AUTORUN-DEVCONTAINER-HOST', severity: 'high', file: rel, evidence: cmdText(conf.initializeCommand).slice(0, 200),
+  // 3. Dev containers (root and named configs): initializeCommand runs on YOUR HOST.
+  const devcontainers = [...files.values()].filter(f => /^(\.devcontainer\/devcontainer\.json|\.devcontainer\.json|\.devcontainer\/[^/]+\/devcontainer\.json)$/i.test(f)).slice(0, 20)
+  for (const rel of devcontainers) {
+    const { text } = await read(rel)
+    let conf = null
+    try { conf = parseJsonc(text) } catch { unparsable(rel) }
+    const flat = unescapeJson(text)
+    const init = conf ? conf.initializeCommand : (flat.match(/"initializeCommand"\s*:\s*("([^"\\]|\\.)*"|\[[^\]]*\])/) || [])[1]
+    if (init) {
+      findings.add({ id: 'AUTORUN-DEVCONTAINER-HOST', severity: 'high', file: rel, evidence: cmdText(init).slice(0, 200),
         title: 'Dev container runs a command on your host machine',
         detail: '`initializeCommand` runs on your own computer (not in the container) when you "Reopen in Container" or create a Codespace from this repo.' })
     }
-    const inContainer = ['onCreateCommand', 'updateContentCommand', 'postCreateCommand', 'postStartCommand', 'postAttachCommand'].filter(k => conf[k])
-    if (inContainer.length) {
-      const all = inContainer.map(k => cmdText(conf[k])).join(' ; ')
-      findings.add({ id: 'AUTORUN-DEVCONTAINER', severity: DOWNLOAD_EXEC.test(all) ? 'medium' : 'low', file: rel, evidence: all.slice(0, 200),
-        title: `Dev container lifecycle commands: ${inContainer.join(', ')}`,
-        detail: 'These run inside the container (or Codespace) when it is created or started, with whatever tokens that environment has.' })
+    if (conf) {
+      const inContainer = ['onCreateCommand', 'updateContentCommand', 'postCreateCommand', 'postStartCommand', 'postAttachCommand'].filter(k => conf[k])
+      if (inContainer.length) {
+        const all = inContainer.map(k => cmdText(conf[k])).join(' ; ')
+        findings.add({ id: 'AUTORUN-DEVCONTAINER', severity: FETCH_AND_RUN.test(all) ? 'medium' : 'low', file: rel, evidence: all.slice(0, 200),
+          title: `Dev container lifecycle commands: ${inContainer.join(', ')}`,
+          detail: 'These run inside the container (or Codespace) when it is created or started, with whatever tokens that environment has.' })
+      }
     }
-    const mounts = JSON.stringify(conf.mounts || []) + JSON.stringify(conf.runArgs || [])
-    if (/\.ssh|\.aws|\.config|\.npmrc|\.gitconfig|docker\.sock|--privileged|source=\$\{localEnv:HOME/i.test(mounts)) {
+    const mounts = conf ? JSON.stringify([conf.mounts ?? [], conf.runArgs ?? [], conf.workspaceMount ?? '']) : flat
+    if (/\.ssh|\.aws|\.config|\.npmrc|\.gitconfig|\.kube|docker\.sock|--privileged|localEnv:HOME|localEnv:USERPROFILE/i.test(mounts) && /(mounts|runArgs|workspaceMount)/.test(conf ? 'mounts' : flat)) {
       findings.add({ id: 'AUTORUN-DEVCONTAINER-MOUNTS', severity: 'high', file: rel, evidence: mounts.slice(0, 200),
         title: 'Dev container mounts your credentials or gets privileged access',
         detail: 'Mounting ~/.ssh, cloud credentials or the Docker socket into the container hands them to whatever code runs inside.' })
     }
   }
 
-  // 4. AI coding agents: hooks and MCP servers start processes when the agent starts.
-  const claude = await readText(root, '.claude/settings.json')
-  if (claude) {
-    try {
-      const hooks = parseJsonc(claude).hooks
-      if (hooks && Object.keys(hooks).length) {
-        const all = cmdText(hooks)
-        findings.add({ id: 'AUTORUN-AGENT-HOOKS', severity: DOWNLOAD_EXEC.test(all) ? 'high' : 'medium', file: '.claude/settings.json',
-          evidence: all.slice(0, 200), title: 'Repo defines AI-agent hooks',
-          detail: 'Hooks are shell commands an AI coding agent runs automatically on events (session start, tool use). A repo that ships them can run code as soon as you point an agent at it.' })
-      }
-    } catch { /* ignore */ }
+  // 4. AI coding agents: hooks, helper commands and MCP servers start processes on their own.
+  for (const rel of ['.claude/settings.json', '.claude/settings.local.json']) {
+    const f = await read(rel)
+    if (!f) continue
+    let conf = null
+    try { conf = parseJsonc(f.text) } catch { unparsable(f.rel) }
+    const parts = []
+    if (conf) {
+      if (conf.hooks && Object.keys(conf.hooks).length) parts.push(`hooks: ${cmdText(conf.hooks)}`)
+      if (conf.statusLine && conf.statusLine.command) parts.push(`statusLine: ${cmdText(conf.statusLine.command)}`)
+      for (const k of CLAUDE_COMMAND_SETTINGS) if (conf[k]) parts.push(`${k}: ${cmdText(conf[k])}`)
+    } else if (/"(hooks|statusLine|apiKeyHelper|awsAuthRefresh|awsCredentialExport|otelHeadersHelper)"/.test(unescapeJson(f.text))) {
+      parts.push(unescapeJson(f.text).slice(0, 300))
+    }
+    if (parts.length) {
+      const all = parts.join(' | ')
+      findings.add({ id: 'AUTORUN-AGENT-HOOKS', severity: FETCH_AND_RUN.test(all) ? 'high' : 'medium', file: f.rel,
+        evidence: all.slice(0, 200), title: 'Repo configures commands your AI agent runs automatically',
+        detail: 'Hooks, the status line and helper settings are shell commands an AI coding agent runs on its own (on session start, on tool use, to fetch keys). A repo that ships them can run code as soon as you point an agent at it.' })
+    }
   }
-  for (const rel of ['.mcp.json', '.cursor/mcp.json', '.vscode/mcp.json', '.gemini/settings.json']) {
-    const text = await readText(root, rel)
-    if (!text) continue
+  for (const rel of ['.mcp.json', '.cursor/mcp.json', '.vscode/mcp.json', '.gemini/settings.json', '.roo/mcp.json']) {
+    const f = await read(rel)
+    if (!f) continue
     try {
-      const conf = parseJsonc(text)
+      const conf = parseJsonc(f.text)
       const servers = conf.mcpServers || conf.servers || {}
-      const cmds = Object.entries(servers).filter(([, s]) => s && s.command).map(([n, s]) => `${n}: ${cmdText([s.command, ...(s.args || [])])}`)
+      const cmds = Object.entries(servers).filter(([, s]) => s && s.command).map(([n, s]) => `${n}: ${cmdText([s.command, ...(Array.isArray(s.args) ? s.args : [])])}`)
       if (cmds.length) {
-        findings.add({ id: 'AUTORUN-AGENT-MCP', severity: DOWNLOAD_EXEC.test(cmds.join(' ')) ? 'high' : 'medium', file: rel,
+        findings.add({ id: 'AUTORUN-AGENT-MCP', severity: FETCH_AND_RUN.test(cmds.join(' ')) ? 'high' : 'medium', file: f.rel,
           evidence: cmds.join(' | ').slice(0, 200), title: 'Repo configures MCP servers that launch local commands',
           detail: 'If you approve the project\'s MCP servers, your AI agent will start these programs on your machine.' })
       }
-    } catch { /* ignore */ }
+    } catch {
+      unparsable(f.rel)
+      if (/"command"\s*:/.test(unescapeJson(f.text))) findings.add({ id: 'AUTORUN-AGENT-MCP', severity: 'medium', file: f.rel,
+        title: 'Repo configures MCP servers that launch local commands', detail: 'The file couldn\'t be parsed, but it contains server commands.' })
+    }
   }
 
   // 5. Hidden instructions for AI agents in instruction files.
-  for (const rel of ['AGENTS.md', 'CLAUDE.md', 'GEMINI.md', '.cursorrules', '.github/copilot-instructions.md']) {
-    const text = await readText(root, rel)
-    if (text && DOWNLOAD_EXEC.test(text) && /\b(curl|wget|iwr|Invoke-WebRequest)\b[^\n]*\|\s*(ba|z)?sh|\bnode\s+-e\b|\bpowershell\b[^\n]*-e/i.test(text)) {
-      findings.add({ id: 'AUTORUN-AGENT-INSTRUCTIONS', severity: 'medium', file: rel,
+  for (const rel of ['AGENTS.md', 'CLAUDE.md', 'GEMINI.md', '.cursorrules', '.github/copilot-instructions.md', '.windsurfrules']) {
+    const f = await read(rel)
+    if (f && FETCH_AND_RUN.test(f.text)) {
+      findings.add({ id: 'AUTORUN-AGENT-INSTRUCTIONS', severity: 'medium', file: f.rel,
         title: 'Agent instruction file tells the agent to download and run something',
         detail: 'Instruction files are read by AI coding agents as if you wrote them. Download-and-execute commands here are a prompt-injection risk.' })
     }
   }
 
-  // 6. Git hook managers wire commands into your commits after install.
-  for (const rel of ['.husky/pre-commit', '.husky/post-checkout', '.husky/post-merge', '.husky/pre-push']) {
-    const text = await readText(root, rel)
-    if (text && DOWNLOAD_EXEC.test(text)) {
+  // 6. Git hook managers wire commands into your commits after install: every husky hook, not just four names.
+  for (const rel of [...files.values()].filter(f => /^\.husky\/[^/_][^/]*$/i.test(f)).slice(0, 50)) {
+    const st = await stat(path.join(root, rel)).catch(() => null)
+    if (!st || st.size > 256 * 1024) continue
+    const { text } = await read(rel)
+    if (FETCH_AND_RUN.test(text) || /https?:\/\//.test(text)) {
       findings.add({ id: 'AUTORUN-GIT-HOOK', severity: 'high', file: rel, evidence: text.trim().slice(0, 200),
         title: 'Git hook downloads or executes code',
         detail: 'Husky installs these hooks during `npm install` (via the prepare script); after that they run on every commit, checkout or push.' })
