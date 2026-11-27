@@ -2,33 +2,77 @@
 
 import { randomBytes } from 'node:crypto'
 import { rm } from 'node:fs/promises'
-import { detectContainerRuntime, createContainerRuntime } from '../runtimes/container.js'
+import { detectContainerRuntime, createContainerRuntime, SANDBOX_DIR } from '../runtimes/container.js'
+import { createGcpRuntime } from '../runtimes/gcp.js'
+import { createAwsRuntime } from '../runtimes/aws.js'
+import { offerInstall } from '../runtimes/install-offer.js'
 import { extractReport } from '../report.js'
 import { computeVerdict, EXIT } from '../verdict.js'
 import { handoff, HandoffError } from '../handoff.js'
+import { idCheck as realIdCheck } from '../idcheck/index.js'
 import { snykReady, snykTest } from '../snyk.js'
 import { clean } from '../ui/sanitize.js'
 import { has } from '../proc.js'
 
 // Findings that mean "a check didn't run to the end". The result is then INCOMPLETE, not a WARN.
 const COVERAGE_GAPS = new Set(['SCAN-TRUNCATED', 'SCAN-INCOMPLETE', 'DEP-OSV-UNAVAILABLE', 'DEP-OSV-PARTIAL', 'DEP-INSTALL-FAILED',
-  'DEP-INSTALL-SKIPPED', 'LOCK-OUT-OF-SYNC', 'LOCK-UNPARSABLE', 'DEP-SIGNATURES-UNCHECKED'])
+  'DEP-INSTALL-SKIPPED', 'LOCK-OUT-OF-SYNC', 'LOCK-UNPARSABLE', 'DEP-SIGNATURES-UNCHECKED', 'ID-API-UNAVAILABLE', 'ID-IOC-UNAVAILABLE'])
 
-/** Placeholder until the ID check (#2) is wired in: offline checks only. */
+/** The ID check (src/idcheck): look-alikes, known-bad repos and reputation, before anything downloads. */
 async function runIdCheck(target, deps) {
-  if (deps.idCheck) return deps.idCheck(target)
-  return { findings: [], facts: {}, complete: true }
+  try {
+    const r = await (deps.idCheck ?? realIdCheck)(target)
+    return { findings: r.findings ?? [], facts: r.facts ?? {}, complete: r.complete === true }
+  } catch (e) {
+    // Never let an ID-check bug turn into a pass: report it as an incomplete check.
+    return { findings: [{ id: 'ID-API-UNAVAILABLE', severity: 'low', title: 'The ID check could not run', detail: String(e && e.message ? e.message : e).slice(0, 300) }], facts: {}, complete: false }
+  }
 }
+
+/** One line about the publisher, from public GitHub metadata (all values are re-sanitized on print). */
+function describePublisher(facts) {
+  const parts = []
+  if (facts.ownerType) parts.push(facts.ownerType === 'Organization' ? 'organization' : 'personal account')
+  if (facts.ownerCreatedAt) parts.push(`since ${String(facts.ownerCreatedAt).slice(0, 10)}`)
+  if (facts.verifiedOrg && facts.orgWebsite) parts.push(`verified domain ${facts.orgWebsite}`)
+  if (Number.isFinite(facts.stars)) parts.push(`${facts.stars} stars`)
+  if (facts.latestRelease) parts.push(`latest release ${facts.latestRelease}`)
+  return parts.join(', ')
+}
+
+const CLOUD = { gcp: createGcpRuntime, aws: createAwsRuntime }
 
 async function pickRuntime(options, deps) {
   if (deps.runtime) return { runtime: deps.runtime, reasons: [] }
-  if (options.runtime === 'docker' || options.runtime === 'podman') {
-    const rt = createContainerRuntime(options.runtime, { onLog: deps.onLog })
+  const explicit = options.runtime
+  if (explicit === 'docker' || explicit === 'podman') {
+    const rt = createContainerRuntime(explicit, { onLog: deps.onLog })
     const a = await rt.available()
     return a.ok ? { runtime: rt, reasons: [] } : { runtime: null, reasons: [a.reason] }
   }
-  if (options.runtime) return { runtime: null, reasons: [`the ${options.runtime} runtime is not available in this version yet`] }
-  return detectContainerRuntime({ onLog: deps.onLog })
+  if (CLOUD[explicit]) {
+    const rt = CLOUD[explicit]({ onLog: deps.onLog })
+    const a = await rt.available()
+    return a.ok ? { runtime: rt, reasons: [] } : { runtime: null, reasons: [`${explicit}: ${a.reason}`] }
+  }
+  if (explicit) return { runtime: null, reasons: [`the ${explicit} runtime is not available in this version yet`] }
+  const local = await detectContainerRuntime({ onLog: deps.onLog })
+  if (local.runtime) return local
+  // No local engine. A signed-in cloud CLI is offered next, but only with a yes (it costs money).
+  for (const [name, make] of Object.entries(CLOUD)) {
+    const rt = make({ onLog: deps.onLog })
+    const a = await rt.available().catch(() => ({ ok: false }))
+    if (a.ok && await deps.prompter.confirm(`No Docker or Podman here, but you're signed in to ${name === 'gcp' ? 'Google Cloud' : 'AWS'}. Run the check there instead? It runs a build in your account, which may cost money.`, { defaultYes: false, safeAnswer: false })) {
+      return { runtime: rt, reasons: [] }
+    }
+  }
+  return local
+}
+
+/** Print exactly what a cloud runtime would run, without running anything. */
+async function printPlan(runtime, target, options, stdout) {
+  const p = await runtime.plan({ url: target.url, ref: options.ref, nonce: '0'.repeat(32), sandboxDir: SANDBOX_DIR })
+  stdout.write(`${JSON.stringify({ runtime: runtime.name, steps: p.steps, files: p.files, notes: p.notes }, null, 2)}\n`)
 }
 
 /**
@@ -63,6 +107,8 @@ export async function check(cmd, deps) {
     out.step('ID check: who published this, and is it who it claims to be?')
     const id = await runIdCheck({ ...target, ref: options.ref }, deps)
     all.push(...id.findings)
+    const who = describePublisher(id.facts)
+    if (who) out.note(clean(who, { max: 200 }))
     if (id.findings.length) out.findings(id.findings)
     else out.note('no problems with the publisher found')
     const early = computeVerdict(id.findings, { complete: true })
@@ -75,14 +121,32 @@ export async function check(cmd, deps) {
 
     // 2. Pat-down in the sandbox.
     out.line()
+    // A dry run only prints the cloud plan: it works before the cloud setup exists, so you can see what it needs.
+    if (options.dryRun) {
+      if (!CLOUD[options.runtime]) { out.note('--dry-run only applies to --runtime gcp or aws.'); return EXIT.ERROR }
+      await printPlan(CLOUD[options.runtime]({}), target, options, stdout)
+      const a = await CLOUD[options.runtime]({}).available().catch(e => ({ ok: false, reason: e.message }))
+      if (!a.ok) out.note(`Not runnable yet: ${a.reason}`)
+      return EXIT.PASS
+    }
     out.step('Pat-down: cloning into a throwaway sandbox with none of your credentials')
     const picked = await pickRuntime(options, { ...deps, onLog: s => out.progress(s) })
     runtime = picked.runtime
     if (!runtime) {
-      out.note(`No sandbox runtime is available: ${picked.reasons.join('; ')}.`)
-      out.note('Install Podman (free, open source, no account) or Docker, then run this again. `bouncer doctor` shows what was found.')
+      out.note(`No sandbox runtime is available: ${picked.reasons.map(r => String(r).replace(/[.\s]+$/, '')).join('; ')}.`)
+      if (!options.runtime) {
+        const offer = await offerInstall({
+          interactive: prompter.interactive,
+          confirm: (q, o) => prompter.confirm(q, o),
+          choose: prompter.choose ? (q, opts) => prompter.choose(q, opts) : undefined,
+          out: s => out.line(s),
+        })
+        for (const step of offer.nextSteps || []) out.note(step)
+        if (offer.installed) out.note('Installed. Run the same bouncer command again to check the repo.')
+      }
       return EXIT.ERROR
     }
+
     out.note(`using ${runtime.describe()}`)
     if (runtime.sweepStale) await runtime.sweepStale().catch(() => 0)
     const image = runtime.ensureImage ? await runtime.ensureImage(version) : null
@@ -90,7 +154,7 @@ export async function check(cmd, deps) {
     let result
     try {
       // onSession hands us the sandbox's name before it starts, so an interrupt can always remove it.
-      result = await runtime.scan({ url: target.url, ref: options.ref, nonce, image, onSession: s => { session = s } })
+      result = await runtime.scan({ url: target.url, ref: options.ref, nonce, image, sandboxDir: SANDBOX_DIR, onSession: s => { session = s } })
     } catch (e) {
       session = e.session ?? session
       throw e
@@ -136,7 +200,8 @@ export async function check(cmd, deps) {
       out.note(`Some checks couldn't finish (${gaps.map(g => g.id).join(', ') || 'see above'}). Nothing bad was found, but this is not a clean result.`)
     }
     if (v.verdict === 'fail' || (v.verdict === 'incomplete' && !(report && report.status === 'ok'))) {
-      const del = await prompter.confirm('Delete the sandbox and everything in it?', { defaultYes: true, safeAnswer: true })
+      // A cloud build is already gone when it finishes; only a local sandbox can be kept to look around.
+      const del = CLOUD[runtime.name] ? true : await prompter.confirm('Delete the sandbox and everything in it?', { defaultYes: true, safeAnswer: true })
       if (!del) {
         keep = true
         out.note(`Kept. Look around with: ${runtime.name} exec -it ${session.name} sh   (then: ${runtime.name} rm -f ${session.name})`)

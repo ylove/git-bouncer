@@ -29,6 +29,7 @@ Options:
   --json                        machine-readable report on stdout (never installs anything)
   --keep                        keep the sandbox afterwards so you can inspect it
   --no-install                  clone to your machine but don't install dependencies
+  --dry-run                     with --runtime gcp|aws: print the exact cloud plan, run nothing
   --snyk / --no-snyk            also run Snyk on the dependency manifests (asks by default if Snyk is set up)
   -h, --help                    show this help
   -v, --version                 show the version
@@ -46,6 +47,7 @@ const OPTIONS = {
   json: { type: 'boolean', default: false },
   keep: { type: 'boolean', default: false },
   'no-install': { type: 'boolean', default: false },
+  'dry-run': { type: 'boolean', default: false },
   snyk: { type: 'boolean' },
   'no-snyk': { type: 'boolean', default: false },
   help: { type: 'boolean', short: 'h', default: false },
@@ -68,6 +70,10 @@ export function parseCommand(argv, { asGitSubcommand = false } = {}) {
   }
   const { values, positionals } = parsed
   if (values.help) return { command: 'help' }
+  // `--version` means "print the version" only on its own. With a command it's almost certainly a git
+  // option passed through a wrapper (`git clone -v <url> --bouncer`), and exiting 0 there would look
+  // like a successful check that never happened.
+  if (values.version && positionals.length) throw new UsageError('-v/--version can\'t be combined with a command.', 'bouncer clone takes no -v option; run "bouncer --help" for its options.')
   if (values.version) return { command: 'version' }
 
   let [command, ...rest] = positionals
@@ -94,6 +100,7 @@ export function parseCommand(argv, { asGitSubcommand = false } = {}) {
     json: values.json,
     keep: values.keep,
     install: !values['no-install'],
+    dryRun: values['dry-run'],
     snyk: values['no-snyk'] ? false : (values.snyk ?? null),
   }
 
@@ -168,6 +175,16 @@ export async function main(argv, { asGitSubcommand = false, stdout = process.std
       // --json is for scripts: never ask questions, never install anything.
       const prompter = cmd.options.json ? createPrompter({ interactive: false }) : (deps.prompter ?? createPrompter())
       return check(cmd, { out, prompter, stdout, version: VERSION, ...deps })
+    }
+    case 'shell-init': {
+      const { shellInit, detectShell } = await import('./shell-init.js')
+      const shell = cmd.shell ?? detectShell()
+      if (!shell) {
+        stderr.write('bouncer: couldn\'t tell which shell you use. Pass one: bouncer shell-init bash|zsh|fish|powershell\n')
+        return EXIT.ERROR
+      }
+      stdout.write(shellInit(shell))
+      return EXIT.PASS
     }
     case 'doctor': {
       const { doctor } = await import('./commands/doctor.js')
