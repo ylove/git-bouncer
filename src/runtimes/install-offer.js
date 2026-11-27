@@ -8,8 +8,9 @@
 //  2. Show the exact command, then run it only after an explicit yes. One yes per command: saying
 //     yes to "install Podman" is not saying yes to "create a virtual machine". Only the boolean
 //     `true` counts as yes; anything else (a typo, "y" as a string, an error) counts as no.
-//  3. Never escalate. Nothing here runs sudo. On Linux, where installing needs root, the commands
-//     are printed so the person can read them and run them themselves.
+//  3. Never escalate for you. Nothing here runs sudo. Some installers ask for your password or a
+//     Windows UAC prompt themselves, and the step says so before you agree. On Linux, where
+//     installing needs root, the commands are printed for the person to read and run themselves.
 //  4. Never without a person at a terminal. It only asks when the caller says it may
 //     (interactive: true), stdin and stderr are both terminals, and CI isn't set. Otherwise nothing
 //     is offered and nothing runs; the caller gets the manual instructions to print instead.
@@ -25,6 +26,8 @@ import { clean } from '../ui/sanitize.js'
 // Official pages only. Docker's terms change, so we link them instead of quoting numbers.
 export const LINKS = Object.freeze({
   podman: 'https://podman.io/docs/installation',
+  podmanSite: 'https://podman.io',
+  podmanReleases: 'https://github.com/podman-container-tools/podman/releases',
   dockerDesktop: 'https://www.docker.com/products/docker-desktop/',
   dockerTerms: 'https://docs.docker.com/subscription/desktop-license/',
   dockerEngine: 'https://docs.docker.com/engine/install/',
@@ -56,6 +59,13 @@ const LINUX_FAMILIES = [
 ]
 // Used only when os-release is missing or unfamiliar: is the package manager itself on PATH?
 const PM_PROGRAMS = [['apt', 'apt-get'], ['dnf', 'dnf'], ['pacman', 'pacman'], ['zypper', 'zypper'], ['apk', 'apk']]
+
+// Podman's own words, from the macOS section of https://podman.io/docs/installation.
+const PODMAN_ON_HOMEBREW = 'It\'s not recommended to install via Homebrew because it is a community-maintained package manager, and we cannot guarantee the stability of the Podman installation.'
+
+// One yes, one action: without this, `brew install` first runs `brew update`, which can upgrade
+// Homebrew and refresh every formula before it does the thing you agreed to.
+const BREW_ENV = Object.freeze({ HOMEBREW_NO_AUTO_UPDATE: '1' })
 
 const show = argv => argv.join(' ')
 // Every program a plan may need. offerInstall looks them all up once, before planning.
@@ -99,6 +109,8 @@ function linuxPackageManager(osRelease, has) {
  *   manual  what to do yourself instead (always present)
  *   after   what's left to do once every step has succeeded
  *   notes   shown before the steps
+ *   preferManual, alternative   the vendor recommends the manual route: show it first, and run
+ *           the steps only after a separate yes to alternative.question
  *
  * @param {{platform?: string, has: (cmd: string) => boolean, osRelease?: string|null}} opts
  *   has: is this program on PATH?  osRelease: the text of /etc/os-release (Linux only)
@@ -113,19 +125,29 @@ export function planInstall({ platform = process.platform, has, osRelease = null
 
   if (platform === 'darwin') {
     packageManager = has('brew') === true ? 'brew' : null
+    // Podman's docs recommend their own installer and advise against Homebrew, so that's the order here.
     podman = option('podman', 'Podman', {
-      notes: packageManager ? [`Podman's own docs recommend their installer (${LINKS.podman}). The Homebrew package used here is maintained by the Homebrew community.`] : [],
+      preferManual: true,
+      alternative: packageManager ? {
+        notes: [`Homebrew can install it too, but Podman's docs say: "${PODMAN_ON_HOMEBREW}"`],
+        question: 'Install it with Homebrew instead?',
+      } : null,
       steps: packageManager ? [
-        { argv: ['brew', 'install', 'podman'], installs: true, what: 'Installs Podman with Homebrew.' },
+        { argv: ['brew', 'install', 'podman'], installs: true, env: BREW_ENV, what: 'Installs Podman with Homebrew. Homebrew may also install or upgrade the packages Podman depends on.' },
         { argv: ['podman', 'machine', 'init'], what: 'Creates the small Linux virtual machine that Podman runs containers in. It downloads a disk image, so it can take a few minutes.' },
         { argv: ['podman', 'machine', 'start'], what: 'Starts that virtual machine.' },
       ] : [],
-      manual: [`Download the Podman installer for macOS: ${LINKS.podman}`, 'Then run: podman machine init', 'Then run: podman machine start'],
+      manual: [
+        `Podman recommends its own installer. Download it from ${LINKS.podmanSite} (or the .pkg from ${LINKS.podmanReleases}).`,
+        'Then run: podman machine init',
+        'Then run: podman machine start',
+        DOCTOR,
+      ],
       after: [DOCTOR],
     })
     docker = option('docker', 'Docker Desktop', {
       steps: packageManager ? [
-        { argv: ['brew', 'install', '--cask', 'docker-desktop'], installs: true, what: 'Installs Docker Desktop with Homebrew. Homebrew may ask for your Mac password to finish.' },
+        { argv: ['brew', 'install', '--cask', 'docker-desktop'], installs: true, env: BREW_ENV, what: 'Installs Docker Desktop with Homebrew. Homebrew may ask for your Mac password, and may also install the packages it depends on.' },
       ] : [],
       manual: [`Download Docker Desktop for Mac: ${LINKS.dockerDesktop}`, 'Open Docker Desktop once. It asks you to accept Docker\'s terms, then starts its engine.'],
       after: ['Open Docker Desktop from your Applications folder once. It asks you to accept Docker\'s terms, then starts its engine.', DOCTOR],
@@ -195,22 +217,32 @@ export function planInstall({ platform = process.platform, has, osRelease = null
   return { platform, packageManager, distro, options: { podman, docker } }
 }
 
-function option(key, name, { installed = false, notes = [], steps = [], manual = [], after = [] }) {
-  return { key, name, installed, notes, steps, manual, after }
+function option(key, name, { installed = false, notes = [], steps = [], manual = [], after = [], preferManual = false, alternative = null }) {
+  return { key, name, installed, notes, steps, manual, after, preferManual, alternative }
 }
 
 /** The one screen that explains the choice. */
 export function explainChoices(plan) {
   const vm = plan.platform === 'darwin' || plan.platform === 'win32'
-  const lines = [
-    'git-bouncer checks repositories inside a throwaway container, so it needs Podman or Docker,',
-    'and it couldn\'t find either one. It can help you install one now.',
+  // Installed but not usable (a stopped VM, a Docker Desktop that isn't open) is a different problem.
+  const present = [plan.options.podman, plan.options.docker].filter(o => o.installed).map(o => o.name)
+  const lines = present.length === 0
+    ? [
+        'git-bouncer checks repositories inside a throwaway container, so it needs Podman or Docker,',
+        'and it couldn\'t find either one. It can help you install one now.',
+      ]
+    : [
+        'git-bouncer checks repositories inside a throwaway container, so it needs Podman or Docker.',
+        `${present.join(' and ')} ${present.length === 1 ? 'is' : 'are'} installed, but git-bouncer couldn't use ${present.length === 1 ? 'it' : 'them'}.`,
+        present.length === 1 ? 'Pick it below to see how to start it, or install the other one.' : 'Pick one below to see how to start it.',
+      ]
+  lines.push(
     'Nothing is installed unless you say yes, and you can cancel at any step.',
     '',
     '  Podman (recommended)',
     '    Free and open source. No account or sign-up needed.',
     '    Daemonless: no background service running as root. On Linux, containers run as your own user.',
-  ]
+  )
   if (vm) lines.push('    On macOS and Windows it runs containers inside a small Linux virtual machine.')
   lines.push('')
   if (plan.platform === 'linux') {
@@ -222,9 +254,9 @@ export function explainChoices(plan) {
   } else {
     lines.push(
       '  Docker Desktop',
-      '    Free for personal use, education, non-commercial open source projects and small businesses.',
-      '    Larger companies and government organizations need a paid subscription.',
-      `    Check Docker's current terms before you use it for work: ${LINKS.dockerTerms}`,
+      '    Free for personal use, education, non-commercial open source and small businesses (Docker',
+      '    limits both headcount and revenue). Professional use in larger organizations, and government',
+      `    use, needs a paid subscription. Check the current terms: ${LINKS.dockerTerms}`,
     )
   }
   lines.push('', '  Cancel', '    Install nothing now. You can install either one yourself later.')
@@ -316,6 +348,13 @@ export async function offerInstall({
   if (opt.installed || opt.steps.length === 0) {
     out(['', `${opt.name}:`, ...opt.notes.map(n => `  ${n}`), ...opt.manual.map(m => `  ${m}`)].join('\n'))
     return { installed: false, runtime, reason: opt.installed ? 'already-installed' : 'manual', nextSteps: opt.manual }
+  }
+  if (opt.preferManual) {
+    // The vendor's way first. Their discouraged route only runs after its own, separate yes.
+    out(['', `${opt.name}:`, ...opt.manual.map(m => `  ${m}`), '', ...opt.alternative.notes].join('\n'))
+    if (await confirm(opt.alternative.question, ASK) !== true) {
+      return { installed: false, runtime, reason: 'manual', nextSteps: opt.manual }
+    }
   }
 
   const total = opt.steps.length

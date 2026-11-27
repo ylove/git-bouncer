@@ -76,7 +76,15 @@ test('macOS with Homebrew: Podman is brew install, then machine init and start; 
   ])
   // Homebrew renamed the "docker" cask to "docker-desktop"; use the current name.
   assert.deepEqual(argvs(plan.options.docker), [['brew', 'install', '--cask', 'docker-desktop']])
-  assert.match(plan.options.podman.notes.join(' '), /community/) // honest about who maintains the formula
+  // Podman's own advice: their installer first; Homebrew is "not recommended", and we say so in their words.
+  assert.equal(plan.options.podman.preferManual, true)
+  assert.ok(plan.options.podman.manual[0].includes(LINKS.podmanSite))
+  assert.match(plan.options.podman.alternative.notes.join(' '), /"It's not recommended to install via Homebrew because it is a community-maintained package manager/)
+  // One yes, one action: no "brew update" first, and the step says what Homebrew may still do.
+  for (const step of [plan.options.podman.steps[0], plan.options.docker.steps[0]]) {
+    assert.deepEqual(step.env, { HOMEBREW_NO_AUTO_UPDATE: '1' })
+    assert.match(step.what, /may also install/)
+  }
 })
 
 test('macOS without Homebrew: nothing to run, just the official download pages (never "install Homebrew first")', () => {
@@ -85,7 +93,7 @@ test('macOS without Homebrew: nothing to run, just the official download pages (
   assert.deepEqual(argvs(plan.options.podman), [])
   assert.deepEqual(argvs(plan.options.docker), [])
   const manual = [...plan.options.podman.manual, ...plan.options.docker.manual].join('\n')
-  assert.ok(manual.includes(LINKS.podman))
+  assert.ok(manual.includes(LINKS.podmanSite))
   assert.ok(manual.includes(LINKS.dockerDesktop))
   assert.doesNotMatch(manual, /curl|install\.sh|brew/)
 })
@@ -178,8 +186,18 @@ test('the explanation recommends Podman, links Docker\'s terms instead of quotin
     assert.doesNotMatch(text, /\$\s?\d|\d+\s*(employees|million)|\d+ ?%/, platform) // terms change; we link, we don't quote
   }
   const mac = explainChoices(planInstall({ platform: 'darwin', has: hasOnly() }))
-  assert.match(mac, /paid subscription/)
+  assert.match(mac, /couldn't find either one/)
+  assert.match(mac, /Professional use in larger organizations, and government\s+use, needs a paid subscription/)
+  assert.match(mac, /limits both headcount and revenue/)
   assert.match(mac, /Colima/)
+})
+
+test('when a runtime is installed but not working, the screen says that instead of "couldn\'t find either"', () => {
+  const one = explainChoices(planInstall({ platform: 'darwin', has: hasOnly('podman') }))
+  assert.doesNotMatch(one, /couldn't find either/)
+  assert.match(one, /Podman is installed, but git-bouncer couldn't use it/)
+  const both = explainChoices(planInstall({ platform: 'win32', has: hasOnly('podman', 'docker') }))
+  assert.match(both, /Podman and Docker Desktop are installed, but git-bouncer couldn't use them/)
 })
 
 test('the distro name from os-release is sanitized before it is printed', () => {
@@ -234,17 +252,20 @@ await offerInstall({ platform: 'linux', interactive: true, isTTY: { stdin: true,
 })
 
 test('macOS, yes to everything: the three commands run by absolute path, in order, from your home folder', async () => {
-  const s = session({ platform: 'darwin', ...MAC, pick: 'podman', answers: [true, true, true] })
+  const s = session({ platform: 'darwin', ...MAC, pick: 'podman', answers: [true, true, true, true] })
   const r = await s.run()
   assert.deepEqual(ran(s), [[BREW, 'install', 'podman'], [PODMAN, 'machine', 'init'], [PODMAN, 'machine', 'start']])
   // The question names the exact file that then runs.
   assert.deepEqual(s.log.confirms.map(c => c.question), [
+    'Install it with Homebrew instead?',
     `Run "${BREW} install podman" now?`,
     `Run "${PODMAN} machine init" now?`,
     `Run "${PODMAN} machine start" now?`,
   ])
   assert.ok(s.log.confirms.every(c => c.opts.defaultYes === false && c.opts.safeAnswer === false)) // ui/prompt.js's options
   assert.ok(s.log.execs.every(e => e.cwd === HOME), 'installers never start in the current folder')
+  assert.equal(s.log.execs[0].env.HOMEBREW_NO_AUTO_UPDATE, '1')
+  assert.equal(s.log.execs[1].env.HOMEBREW_NO_AUTO_UPDATE, undefined) // only brew gets it
   assert.deepEqual(s.log.choices.map(c => c.key), ['podman', 'docker', 'cancel'])
   assert.equal(r.installed, true)
   assert.equal(r.runtime, 'podman')
@@ -268,11 +289,22 @@ test('Windows: winget runs by absolute path too', async () => {
   assert.equal(s.log.execs[0].cwd, HOME)
 })
 
-test('no means no: declining the first step runs nothing', async () => {
-  const s = session({ platform: 'darwin', ...MAC, pick: 'podman', answers: [false] })
+test('macOS Podman: Podman\'s own installer comes first, and Homebrew only runs after a separate yes', async () => {
+  const s = session({ platform: 'darwin', ...MAC, pick: 'podman', answers: [false, true, true, true] })
   const r = await s.run()
   assert.deepEqual(ran(s), [])
-  assert.equal(s.log.confirms.length, 1) // it stops asking, too
+  assert.equal(s.log.confirms.length, 1)
+  assert.equal(r.reason, 'manual')
+  assert.ok(r.nextSteps[0].includes(LINKS.podmanSite))
+  assert.ok(s.log.out.indexOf(LINKS.podmanSite) < s.log.out.indexOf('Homebrew can install it too'))
+  assert.match(s.log.out, /not recommended to install via Homebrew/)
+})
+
+test('no means no: declining the first step runs nothing', async () => {
+  const s = session({ platform: 'darwin', ...MAC, pick: 'podman', answers: [true, false] })
+  const r = await s.run()
+  assert.deepEqual(ran(s), [])
+  assert.equal(s.log.confirms.length, 2) // it stops asking, too
   assert.deepEqual(r, {
     installed: false, runtime: 'podman', reason: 'declined',
     nextSteps: ['Run: brew install podman', 'Run: podman machine init', 'Run: podman machine start', 'Then run "bouncer doctor" to check that git-bouncer can use it.'],
@@ -289,7 +321,7 @@ test('only the boolean true is a yes: "y", 1 and "true" all count as no', async 
 })
 
 test('yes to installing, no to the virtual machine: Podman is installed and the rest are next steps', async () => {
-  const s = session({ platform: 'darwin', ...MAC, pick: 'podman', answers: [true, false] })
+  const s = session({ platform: 'darwin', ...MAC, pick: 'podman', answers: [true, true, false] })
   const r = await s.run()
   assert.deepEqual(ran(s), [[BREW, 'install', 'podman']])
   assert.equal(r.installed, true)
@@ -299,29 +331,29 @@ test('yes to installing, no to the virtual machine: Podman is installed and the 
 
 test('a program that is not in a trusted folder stops the steps instead of guessing', async () => {
   // brew "succeeds" but no podman appears where we'd trust it.
-  const s = session({ platform: 'darwin', programs: { brew: BREW }, pick: 'podman', answers: [true, true, true] })
+  const s = session({ platform: 'darwin', programs: { brew: BREW }, pick: 'podman', answers: [true, true, true, true] })
   const r = await s.run()
   assert.deepEqual(ran(s), [[BREW, 'install', 'podman']])
-  assert.equal(s.log.confirms.length, 1)
+  assert.equal(s.log.confirms.length, 2)
   assert.equal(r.installed, true)
   assert.equal(r.reason, 'not-found')
   assert.deepEqual(r.nextSteps.slice(0, 2), ['Open a new terminal, then continue with: podman machine init', 'Run: podman machine start'])
 })
 
 test('a failed step stops everything after it', async () => {
-  const s = session({ platform: 'darwin', ...MAC, pick: 'podman', answers: [true, true, true], execResults: [{ code: 1 }] })
+  const s = session({ platform: 'darwin', ...MAC, pick: 'podman', answers: [true, true, true, true], execResults: [{ code: 1 }] })
   const r = await s.run()
   assert.deepEqual(ran(s), [[BREW, 'install', 'podman']])
-  assert.equal(s.log.confirms.length, 1)
+  assert.equal(s.log.confirms.length, 2)
   assert.equal(r.installed, false)
   assert.equal(r.reason, 'failed')
   assert.match(r.nextSteps[0], /exit code 1/)
 })
 
 test('an installer stopped by a signal, or one that could not start, says so', async () => {
-  const stopped = session({ platform: 'darwin', ...MAC, pick: 'podman', answers: [true], execResults: [{ code: -1, signal: 'SIGINT' }] })
+  const stopped = session({ platform: 'darwin', ...MAC, pick: 'podman', answers: [true, true], execResults: [{ code: -1, signal: 'SIGINT' }] })
   assert.match((await stopped.run()).nextSteps[0], /stopped by SIGINT/)
-  const unstartable = session({ platform: 'darwin', ...MAC, pick: 'podman', answers: [true], execResults: [{ code: -1, signal: null, error: new Error('spawn EACCES') }] })
+  const unstartable = session({ platform: 'darwin', ...MAC, pick: 'podman', answers: [true, true], execResults: [{ code: -1, signal: null, error: new Error('spawn EACCES') }] })
   assert.match((await unstartable.run()).nextSteps[0], /spawn EACCES/)
 })
 
