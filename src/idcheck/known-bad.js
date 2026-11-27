@@ -2,8 +2,9 @@
 //
 // The indicators live in one place: the sandbox scanner's dated IOC snapshot
 // (sandbox/scanner/checks/iocs.js). The host reads the same list, so the two can never disagree. Only
-// that data module is loaded on your machine. It has no side effects, and none of the scanner's checks
-// run here.
+// that data module is loaded on your machine, and none of the scanner's checks run here. The file says
+// at the top that the host imports it, and a test fails if it ever imports anything or touches the
+// file system, network, process or environment, so it can't grow side effects by accident.
 //
 // It's loaded when it's needed instead of imported at the top of the file. If it's missing (a broken
 // install, or a checkout that predates it), the ID check still runs and reports that this list wasn't
