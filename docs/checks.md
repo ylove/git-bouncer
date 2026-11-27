@@ -100,10 +100,10 @@ The **ID check** (look-alike owners, account age and more) runs on your machine 
 | `NPMRC-SCOPED-REGISTRY` | medium | Some scopes come from a third-party registry (common for paid packages like Font Awesome Pro). |
 | `BUNFIG-PRELOAD` | medium | `bunfig.toml` preloads scripts before your code runs. |
 | `PY-INDEX-OVERRIDE` | medium | A requirements file adds or replaces the Python package index (dependency confusion). |
-| `DEP-VULN` | medium | Known vulnerabilities (CVEs) in dependencies. A warning, not a fail: they make the app vulnerable, not your machine at install time. |
 | `NPMRC-TOKEN` | medium | An npm auth token is committed (poor hygiene, possibly stolen). |
 | `DEP-INSTALL-FAILED`, `DEP-INSTALL-SKIPPED`, `DEP-OSV-UNAVAILABLE`, `DEP-OSV-PARTIAL`, `DEP-SIGNATURES-UNCHECKED` | medium / low | A dependency check couldn't complete (or was deliberately skipped, because the lockfile points at servers the sandbox shouldn't contact), so the result is incomplete. |
 | `DEP-PLATFORM-RESTRICTED` | low | The project refuses to install on Linux; the sandbox installed it anyway to check the dependencies. |
+| `DEP-VULN` | low | Known vulnerabilities (CVEs) in dependencies, with the critical and high counts in the title. Low, because the verdict answers "will this repo attack me?" and a CVE answers "is this app vulnerable?": it makes the app vulnerable, not your machine at install time. |
 | `LOCK-RESOLVED-GIT`, `LOCK-WEAK-INTEGRITY` | low | Git dependencies (no registry signatures) or SHA-1-only integrity. |
 | `DEP-INSTALL-SCRIPT-KNOWN` | info | Well-known packages with install scripts (esbuild, sharp, …). |
 

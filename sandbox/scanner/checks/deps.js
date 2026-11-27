@@ -303,9 +303,11 @@ async function osvChecks(root, lockfiles, findings, { osvBin, osvConfig }) {
   if (vulnPkgs.size) {
     const total = Object.values(buckets).reduce((a, b) => a + b, 0)
     const top = [...vulnPkgs.entries()].slice(0, 4).map(([k, ids]) => `${k}: ${ids.slice(0, 2).join(', ')}`).join('; ')
-    findings.add({ id: 'DEP-VULN', severity: 'medium', evidence: top,
+    // Low on purpose: the verdict answers "will this repo attack me?", and an ordinary CVE answers "is this
+    // app vulnerable?". The counts stay in the title so a critical CVE is still visible at a glance.
+    findings.add({ id: 'DEP-VULN', severity: 'low', evidence: top,
       title: `${total} known vulnerabilit${total === 1 ? 'y' : 'ies'} in ${vulnPkgs.size} package(s) (${buckets.critical} critical, ${buckets.high} high)`,
-      detail: 'These are ordinary security bugs (CVEs), not malware: they make the app vulnerable, not your machine at install time. Worth knowing before you build on it.' })
+      detail: 'These are ordinary security bugs (CVEs), not malware: they make the app vulnerable, not your machine at install time. Worth knowing before you build on it or deploy it.' })
   }
   return { ran: ok > 0, lockfiles: Math.min(lockfiles.length, MAX_OSV_LOCKFILES) }
 }

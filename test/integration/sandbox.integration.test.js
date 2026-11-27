@@ -105,6 +105,7 @@ test('known vulnerabilities are reported, and the repo cannot hide them with its
   const first = await scanFixture(files)
   const vuln = first.findings.find(f => f.id === 'DEP-VULN')
   assert.ok(vuln, JSON.stringify(first.findings.map(f => f.id)))
+  assert.equal(vuln.severity, 'low', 'an ordinary CVE is context, not a reason to turn the repo away')
   const ids = [...new Set((vuln.evidence.match(/GHSA-[a-z0-9-]+|CVE-\d+-\d+/g) || []))]
   assert.ok(ids.length > 0, vuln.evidence)
   const toml = ids.map(id => `[[IgnoredVulns]]\nid = "${id}"\nreason = "trust me"\n`).join('\n')
