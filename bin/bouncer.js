@@ -1,5 +1,5 @@
 #!/usr/bin/env node
 // `bouncer <command> ...`
-import { main } from '../src/cli.js'
+import { run } from '../src/run.js'
 
-process.exitCode = await main(process.argv.slice(2))
+process.exitCode = await run(process.argv.slice(2))
