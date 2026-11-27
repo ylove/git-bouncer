@@ -28,9 +28,9 @@ export const KNOWN_OWNERS = Object.freeze({
   square: 82592, paypal: 476675, salesforce: 453694, ibm: 1459110, intel: 17888862, nvidia: 1728152, adobe: 476009,
   oracle: 4430336, sap: 2531208, alibaba: 1961952, bytedance: 4158466, samsung: 6210390, mozilla: 131524,
   atlassian: 168166, jetbrains: 878437, docker: 5429470, hashicorp: 761456, elastic: 6764390, grafana: 7195757,
-  mongodb: 45120, redis: 1529926, discord: 1965106, dropbox: 559357, pinterest: 541152, twilio: 109142,
+  mongodb: 45120, 'mongodb-js': 11214950, redis: 1529926, discord: 1965106, dropbox: 559357, pinterest: 541152, twilio: 109142,
   actions: 44036562, figma: 5155369, whatsapp: 5508982, instagram: 549085, telegramdesktop: 6113871,
-  makenotion: 4792552, brave: 12301619, chromium: 30044, datadog: 365230, getsentry: 1396951, posthog: 60330232,
+  makenotion: 4792552, brave: 12301619, chromium: 30044, datadog: 365230, 'datadog-labs': 259158689, getsentry: 1396951, posthog: 60330232,
   'n8n-io': 45487711, clerk: 49538330,
   // Cloud and hosting
   aws: 2232217, awslabs: 3299148, 'aws-samples': 8931462, cloudflare: 314135, vercel: 14985020,

@@ -51,7 +51,8 @@ test('known names that are one look-alike step from another known name are liste
   const expectedPairs = [
     'containerd ~ containers', 'containers ~ containerd', 'data-dog ~ datadog', 'datadog ~ data-dog', 'fastai ~ fastapi', 'fastapi ~ fastai',
     // The brand next to its own sub-organization (compared by stem, so only one direction matches).
-    'googlechrome ~ googlechromelabs', 'jupyter ~ jupyterlab', 'nginx ~ nginxinc', 'react ~ reactjs', 'vercel ~ vercel-labs', 'vercel-labs ~ vercel',
+    'datadog-labs ~ datadog', 'googlechrome ~ googlechromelabs', 'jupyter ~ jupyterlab', 'mongodb ~ mongodb-js', 'mongodb-js ~ mongodb',
+    'nginx ~ nginxinc', 'react ~ reactjs', 'vercel ~ vercel-labs', 'vercel-labs ~ vercel',
   ]
   const pairs = []
   for (const list of [LOOKALIKE_NAMES, Object.keys(FAMOUS_REPOS)]) {
