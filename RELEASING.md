@@ -22,7 +22,9 @@ npm's [trusted publishing](https://docs.npmjs.com/trusted-publishers) uses GitHu
 2. **Switch to trusted publishing:** on npmjs.com, open the package settings, add a trusted publisher of type GitHub Actions with organization/user `ylove`, repository `git-bouncer`, workflow `release.yml`, and environment `release`. The first trusted publish must happen within 2 days of adding it.
 3. **Turn tokens off:** under Settings → Publishing access, choose "Require two-factor authentication and disallow tokens". Trusted publishing keeps working.
 
-After that, a release is: version-bump PR → tag → approve. No token exists anywhere.
+After that, a release is: version-bump PR → tag → approve. No token exists anywhere. (1.0.0 itself is the one exception: it's published with that short-lived token, then the token is revoked.)
+
+The release workflow also refuses a tag that points at a commit not on `main`, and a ruleset protects `v*` tags from being moved or deleted.
 
 ## Verifying a release
 

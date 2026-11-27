@@ -11,8 +11,8 @@ The first release. git-bouncer is a door check for repositories you didn't write
   - install-time execution: every script npm would run (`hasInstallScript`, `binding.gyp`, workspaces, the `dependencies` hook), plus `.npmrc`/`.yarnrc`/`.pnpmfile.cjs` tricks that work even with `--ignore-scripts`
   - poisoned dependencies: known-malicious packages (OSV), lockfile checksum mismatches (`npm ci --ignore-scripts`), invalid registry signatures, non-registry sources, typosquats
   - hidden code: off-screen payloads, decode-then-execute, fake fonts, blockchain C2, invisible Unicode, Trojan Source
-- **Verdict and handoff:** let in / warning / turned away / incomplete. A clean repo is cloned to your machine at the exact scanned commit (verified by commit and tree hash) with isolated git, and npm projects the sandbox installed are installed lockfile-exact with your consent for any install script.
-- **No Docker?** Podman, an install offer (Podman recommended), or GCP Cloud Build / AWS CodeBuild in your own account (`--runtime gcp|aws`, `--dry-run`; not live-tested by the maintainer).
+- **Verdict and handoff:** let in / warning / turned away / incomplete. A clean repo is cloned to your machine at the exact scanned commit, with isolated git (no hooks, filters, LFS or your global config) and symlinks written as plain files, and `git status` must confirm the files on disk match the commit. npm projects the sandbox installed are installed lockfile-exact with `npm ci --ignore-scripts`: **git-bouncer never runs install scripts for you.**
+- **No Docker?** Podman, an install offer (Podman recommended), or GCP Cloud Build / AWS CodeBuild in your own account (`--runtime gcp|aws`, `--dry-run`; not live-tested by the maintainer). A GitHub Codespaces runtime is planned.
 - **Opt-in shell integration:** `git clone <url> --bouncer`.
 - Optional **Snyk** on copies of the manifests, with your token kept on the host.
 

@@ -26,12 +26,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0 # full history, so the ancestry check below can see main
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           # A release must never restore a cache that a pull request could have written.
           package-manager-cache: false
+
+      - name: Tagged commit must be on main
+        # A tag pushed at an unreviewed commit (for example with a stolen token) must not publish.
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "Tag $GITHUB_REF_NAME points at a commit that is not on main"; exit 1; }
 
       - name: Tag must match package.json
         run: |
