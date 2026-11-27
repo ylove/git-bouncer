@@ -1,5 +1,11 @@
 // Indicators of compromise from public reporting: a dated snapshot.
 //
+// SHARED WITH THE HOST. Unlike the rest of sandbox/scanner/, this file also runs on your machine: the
+// host-side ID check (src/idcheck/known-bad.js) imports it to look up known-bad repo names before
+// anything is downloaded. So it must stay pure data and pure functions: no imports, no top-level
+// calls other than building the data, and no file, network, process or environment access. Anything
+// added here runs outside the sandbox too. test/idcheck.test.js checks this.
+//
 // This list is defense in depth, not the main detector. Known-malicious packages are caught
 // live through the OSV database (osv-scanner), which is updated continuously. This snapshot
 // catches the specific campaigns that motivated this tool even if they aren't in OSV yet,
