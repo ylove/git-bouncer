@@ -117,19 +117,24 @@ async function viaGh(spawn, path, timeoutMs, maxBytes) {
 }
 
 async function viaFetch(fetch, path, timeoutMs, maxBytes) {
-  let res
+  // A plain timer rather than AbortSignal.timeout(): that one's timer doesn't keep Node running, so a
+  // request with nothing else holding the process open could end the program instead of timing out.
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(new GitHubApiError('The GitHub API did not answer in time.')), timeoutMs)
   try {
-    res = await fetch(`https://api.github.com${path}`, {
+    const res = await fetch(`https://api.github.com${path}`, {
       method: 'GET',
       headers: { ...HEADERS, 'User-Agent': 'git-bouncer' },
       redirect: 'follow', // GitHub redirects renamed repos (facebook/react -> react/react)
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: controller.signal,
     })
     if (res.url && new URL(res.url).origin !== 'https://api.github.com') throw new GitHubApiError('GitHub redirected the request to another site.')
     return { status: res.status, json: parseJson(await readCapped(res, maxBytes)) }
   } catch (e) {
     if (e instanceof GitHubApiError) throw e
-    throw new GitHubApiError(e && e.name === 'TimeoutError' ? 'The GitHub API did not answer in time.' : 'Could not reach the GitHub API.')
+    throw new GitHubApiError(controller.signal.aborted ? 'The GitHub API did not answer in time.' : 'Could not reach the GitHub API.')
+  } finally {
+    clearTimeout(timer)
   }
 }
 
