@@ -8,7 +8,7 @@
 // The properties that matter, each one tested:
 //  - Every git command without --bouncer reaches the real git with exactly the same arguments
 //    (spaces, quotes, empty strings, "--") and returns git's exit code.
-//  - The snippets are constants. The only input is the shell name, checked against the known
+//  - The snippets are constants. The only input is the shell name, checked against four known
 //    values, so nothing from outside can end up inside text you are going to eval.
 //  - It fails safe. If the snippet isn't loaded, git itself rejects --bouncer as an unknown
 //    option, so "git clone <url> --bouncer" can never quietly clone without the check.
@@ -20,7 +20,7 @@
 import path from 'node:path'
 import { UsageError } from './url.js'
 
-export const SHELLS = Object.freeze(['bash', 'zsh', 'fish'])
+export const SHELLS = Object.freeze(['bash', 'zsh', 'fish', 'powershell'])
 
 const NO_SETUP = [
   'No setup at all: "git bouncer <url>" already works, because git runs any',
@@ -126,11 +126,90 @@ function git --description 'git, plus "git clone <url> --bouncer" for git-bounce
 end
 `
 
+// PowerShell is different on purpose. A PowerShell function can't wrap git transparently: before
+// a function sees its arguments, PowerShell removes a bare `--` and splits `-a:b` into two, so a
+// git function would turn "git checkout -- file" into "git checkout file". Instead, the snippet
+// rewrites the line you typed when you press Enter, and only when it is exactly
+// `git clone ... --bouncer`. git itself is never wrapped. The rewrite uses PowerShell's own parser
+// and edits only the "git" and "--bouncer" words, so the rest of the line is byte-for-byte yours.
+const POWERSHELL = `${header('PowerShell', [
+  'This adds one thing: when you type "git clone <url> [dir] --bouncer" and press Enter,',
+  'the line is rewritten to "bouncer clone <url> [dir]" before it runs, and you see the rewrite.',
+  'Nothing else you type is changed. git itself is not wrapped, so every other git command,',
+  'and every script, runs the real git exactly as before.',
+  '(Why not a git function, as in bash, zsh and fish? PowerShell changes a function\'s arguments',
+  'before the function sees them: it removes a bare -- and splits -a:b into two.)',
+  '',
+  'Turn it on:  add this line to your profile (notepad $PROFILE), then open a new terminal:',
+  '               Invoke-Expression (& bouncer shell-init powershell | Out-String)',
+  'Turn it off: delete that line and open a new terminal (or, in this one, run:',
+  '               Set-PSReadLineKeyHandler -Chord Enter -Function AcceptLine)',
+  'Needs PSReadLine, which PowerShell loads by default in a terminal window.',
+])}
+function global:ConvertTo-BouncerClone {
+  # Returns the rewritten line, or $null to leave the line exactly as typed.
+  # (global: so the Enter handler finds it however this snippet was loaded.)
+  param([string]$Line)
+  $tokens = $null
+  $errors = $null
+  $ast = [System.Management.Automation.Language.Parser]::ParseInput($Line, [ref]$tokens, [ref]$errors)
+  if ($errors.Count -ne 0 -or $null -eq $ast.EndBlock -or $ast.EndBlock.Statements.Count -ne 1) { return $null }
+  $pipeline = $ast.EndBlock.Statements[0]
+  if ($pipeline -isnot [System.Management.Automation.Language.PipelineAst] -or $pipeline.PipelineElements.Count -ne 1) { return $null }
+  $command = $pipeline.PipelineElements[0]
+  if ($command -isnot [System.Management.Automation.Language.CommandAst]) { return $null }
+  if ($command.InvocationOperator -ne 'Unknown' -or $command.Redirections.Count -ne 0) { return $null }
+  $words = $command.CommandElements
+  $isWord = {
+    param($element, $value)
+    ($element -is [System.Management.Automation.Language.StringConstantExpressionAst]) -and
+      $element.StringConstantType -eq 'BareWord' -and $element.Value -ceq $value
+  }
+  if ($words.Count -lt 3 -or -not (& $isWord $words[0] 'git') -or -not (& $isWord $words[1] 'clone')) { return $null }
+  $flags = @()
+  for ($i = 2; $i -lt $words.Count; $i++) {
+    if ($words[$i].Extent.Text -in @('--', "'--'", '"--"')) { break }
+    if (& $isWord $words[$i] '--bouncer') { $flags += $i }
+  }
+  if ($flags.Count -eq 0) { return $null }
+  # Remove each --bouncer and the space before it, last one first so earlier offsets stay valid.
+  $new = $Line
+  for ($k = $flags.Count - 1; $k -ge 0; $k--) {
+    $from = $words[$flags[$k] - 1].Extent.EndOffset
+    $new = $new.Remove($from, $words[$flags[$k]].Extent.EndOffset - $from)
+  }
+  $git = $words[0].Extent
+  return $new.Remove($git.StartOffset, $git.EndOffset - $git.StartOffset).Insert($git.StartOffset, 'bouncer')
+}
+
+if (Get-Command Set-PSReadLineKeyHandler -ErrorAction Ignore) {
+  $enter = Get-PSReadLineKeyHandler -Bound | Where-Object { $_.Key -eq 'Enter' } | Select-Object -First 1
+  if ($null -eq $enter -or $enter.Function -in @('AcceptLine', 'GitBouncerAcceptLine')) {
+    Set-PSReadLineKeyHandler -Chord Enter -BriefDescription GitBouncerAcceptLine -Description 'Rewrite "git clone <url> --bouncer" to "bouncer clone <url>", then run the line' -ScriptBlock {
+      param($key, $arg)
+      try {
+        $line = $null
+        $cursor = $null
+        [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
+        $new = ConvertTo-BouncerClone $line
+        if ($null -ne $new) { [Microsoft.PowerShell.PSConsoleReadLine]::Replace(0, $line.Length, $new) }
+      } catch {
+        # Never get in the way of Enter. If this fails, the line runs as typed, and git rejects
+        # --bouncer as an unknown option, so nothing is cloned without the check.
+      }
+      [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine($key, $arg)
+    }
+  } else {
+    Write-Warning "git-bouncer: Enter is already bound to $($enter.Function), so 'git clone <url> --bouncer' was not set up. 'git bouncer <url>' works without it."
+  }
+}
+`
 
 const SNIPPETS = Object.freeze({
   bash: posix('bash', '~/.bashrc (on macOS, ~/.bash_profile)'),
   zsh: posix('zsh', '~/.zshrc'),
   fish: FISH,
+  powershell: POWERSHELL,
 })
 
 /**

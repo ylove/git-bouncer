@@ -20,6 +20,7 @@ test('every shell gets a snippet that explains how to turn it on, how to turn it
     bash: 'eval "$(bouncer shell-init bash)"',
     zsh: 'eval "$(bouncer shell-init zsh)"',
     fish: 'bouncer shell-init fish | source',
+    powershell: 'Invoke-Expression (& bouncer shell-init powershell | Out-String)',
   }
   for (const shell of SHELLS) {
     const text = shellInit(shell)
@@ -32,8 +33,8 @@ test('every shell gets a snippet that explains how to turn it on, how to turn it
   }
 })
 
-test('only the known shell names are accepted', () => {
-  for (const bad of ['sh', 'cmd', 'powershell', 'BASH', 'bash ', 'bash; rm -rf ~', '$(id)', '', undefined, null, '__proto__', 'toString', 'constructor']) {
+test('only the four known shell names are accepted', () => {
+  for (const bad of ['sh', 'cmd', 'BASH', 'bash ', 'bash; rm -rf ~', '$(id)', '', undefined, null, '__proto__', 'toString', 'constructor']) {
     assert.throws(() => shellInit(bad), UsageError, String(bad))
   }
 })
@@ -54,6 +55,12 @@ test('bash, zsh and fish wrap git with a function that falls through to the real
   assert.match(shellInit('fish'), /command git \$argv/)
 })
 
+test('PowerShell does not wrap git at all; it rewrites only the typed line', () => {
+  const ps = shellInit('powershell')
+  assert.doesNotMatch(ps, /function\s+git\b/i)
+  assert.match(ps, /Set-PSReadLineKeyHandler -Chord Enter/)
+  assert.match(ps, /\[System\.Management\.Automation\.Language\.Parser\]::ParseInput/)
+})
 
 test('detectShell reads $SHELL, and PSModulePath for PowerShell', () => {
   assert.equal(detectShell({ SHELL: '/bin/zsh' }, 'darwin'), 'zsh')
@@ -179,6 +186,60 @@ test('fish: passes everything else through and reroutes only git clone ... --bou
   assert.equal(run(['status'], 3).code, 3)
   assert.equal(run(['clone', 'x', '--bouncer'], 5).code, 5)
 })
+
+// PowerShell: the rewrite function is checked line by line, then a rewritten line is run against a
+// fake bouncer.ps1. Runs with pwsh (any OS) and with Windows PowerShell 5.1 when present.
+const LINES = [
+  ['git clone https://github.com/a/b --bouncer', 'bouncer clone https://github.com/a/b'],
+  ['git clone --bouncer https://github.com/a/b my-dir', 'bouncer clone https://github.com/a/b my-dir'],
+  ["git clone 'https://github.com/a/b'   'my dir'  --bouncer --ref v1.2", "bouncer clone 'https://github.com/a/b'   'my dir' --ref v1.2"],
+  ['git clone $url --bouncer', 'bouncer clone $url'],
+  ['git status -s', null],
+  ['git checkout -- main', null],
+  ['git clone https://github.com/a/b', null],
+  ['git clone https://github.com/a/b -- --bouncer', null],
+  ["git clone https://github.com/a/b '--bouncer'", null], // quoted: a literal argument, left for git to refuse
+  ['git log --bouncer', null],
+  ['git clone a --bouncer | Out-Null', null],
+  ['git clone a --bouncer; Remove-Item x', null],
+  ['git clone a --bouncer > out.txt', null],
+  ['& git clone a --bouncer', null],
+  ['Git clone a --bouncer', null],
+  ['git clone a --bouncer "unterminated', null],
+  ['', null],
+]
+
+for (const ps of ['pwsh', 'powershell']) {
+  const skip = ps === 'powershell' && !isWindows ? 'Windows PowerShell 5.1 only exists on Windows'
+    : !works(ps, ['-NoProfile', '-NonInteractive', '-Command', 'exit 0']) ? `${ps} is not installed` : false
+  test(`${ps}: rewrites only "git clone ... --bouncer", never wraps git, and the rewritten line runs bouncer`, { skip }, t => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'bouncer-ps-'))
+    t.after(() => rmSync(dir, { recursive: true, force: true }))
+    writeFileSync(path.join(dir, 'bouncer.ps1'), '"bouncer" + (($args | ForEach-Object { " <$_>" }) -join "")\n')
+    writeFileSync(path.join(dir, 'lines.txt'), LINES.map(([line]) => line).join('\n'))
+    writeFileSync(path.join(dir, 'test.ps1'), [
+      '$ErrorActionPreference = "Stop"',
+      'Invoke-Expression $env:GB_SNIPPET',
+      'if (Get-Command git -CommandType Function -ErrorAction Ignore) { "git is wrapped" } else { "git is not wrapped" }',
+      'foreach ($line in [System.IO.File]::ReadAllText($env:GB_LINES) -split "\\n") {',
+      '  $r = ConvertTo-BouncerClone $line',
+      '  if ($null -eq $r) { "<unchanged>" } else { "=> $r" }',
+      '}',
+      'Invoke-Expression (ConvertTo-BouncerClone "git clone \'https://github.com/a/b\' \'my dir\' --bouncer")',
+    ].join('\n'))
+    const r = spawnSync(ps, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(dir, 'test.ps1')], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${dir}${path.delimiter}${process.env.PATH}`, GB_SNIPPET: shellInit('powershell'), GB_LINES: path.join(dir, 'lines.txt') },
+    })
+    assert.equal(r.status, 0, r.stderr)
+    const out = r.stdout.trim().split(/\r?\n/)
+    assert.deepEqual(out, [
+      'git is not wrapped',
+      ...LINES.map(([, want]) => (want === null ? '<unchanged>' : `=> ${want}`)),
+      'bouncer <clone> <https://github.com/a/b> <my dir>',
+    ])
+  })
+}
 
 // --- failing safe ---------------------------------------------------------------------------
 
