@@ -215,8 +215,20 @@ async function countFiles(dir, limit) {
  */
 export async function gitChecks(dir, findings) {
   const ls = await git(['ls-files', '-s', '-z'], dir)
-  if (ls.code !== 0) return
-  const entries = ls.stdout.split('\0').filter(Boolean).map(line => {
+  // Every check below works from this listing, so a failed or cut-off listing is a coverage gap, not
+  // a clean result.
+  if (ls.code !== 0 || ls.truncated) {
+    findings.add({
+      id: 'GIT-LISTING-INCOMPLETE', severity: 'medium',
+      evidence: ls.code !== 0 ? `git ls-files exited ${ls.code}: ${(ls.stderr || '').trim().split('\n').pop()?.slice(0, 160) ?? ''}` : 'the listing was larger than the scanner reads',
+      title: 'The list of files in the commit could not be read completely',
+      detail: 'The git-level checks (symlinks, case collisions, .git look-alikes, submodules) work from git\'s own list of files. That list was incomplete, so those checks are too. Treat the result as incomplete.',
+    })
+    if (ls.code !== 0) return
+  }
+  // A cut-off listing ends mid-entry; only entries followed by their NUL terminator are complete.
+  const listing = ls.truncated ? ls.stdout.slice(0, ls.stdout.lastIndexOf('\0') + 1) : ls.stdout
+  const entries = listing.split('\0').filter(Boolean).map(line => {
     const tab = line.indexOf('\t')
     const [mode, sha] = line.slice(0, tab).split(' ')
     return { mode, sha, file: line.slice(tab + 1) }

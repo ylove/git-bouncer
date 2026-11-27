@@ -23,6 +23,7 @@ The **ID check** (look-alike owners, account age and more) runs on your machine 
 | `GIT-SUBMODULE-PATH` | high | A submodule path contains `..`, `.git` or a leading `-`, which are known exploit patterns. |
 | `GIT-CASE-COLLISION` | medium | Two paths differ only by case. On macOS/Windows they overwrite each other; this was the trigger for CVE-2024-32002. |
 | `GIT-SUBMODULE-URL` | medium | A submodule uses a non-https URL. |
+| `GIT-LISTING-INCOMPLETE` | medium | `git ls-files` failed or its output was cut off, so the git-level checks above are incomplete. A coverage gap: the result is incomplete. |
 | `GIT-SUBMODULES` | low | Submodules exist and were not fetched or scanned. |
 | `GIT-SYMLINKS` | info | Symlinks exist (checked out as plain files in the sandbox). |
 | `GIT-SYMLINKS-RESOLVED` | info | In-repo symlinks were replaced with copies of their targets for scanning, because tools on your machine would follow them (`package.json -> tools/manifest.json`). |

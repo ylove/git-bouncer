@@ -4,7 +4,12 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import { Findings } from '../sandbox/scanner/findings.js'
+import { gitChecks } from '../sandbox/scanner/clone.js'
 import { dependencyChecks } from '../sandbox/scanner/checks/deps.js'
 import { fixture } from './helpers/fixture.js'
 import { fakeOsv } from './helpers/fake-osv.js'
@@ -65,4 +70,18 @@ test('[audit 5] yarnPath is a warning even at the standard .yarn/releases path',
     assert.equal(y?.severity, 'medium', ids(f.toJSON()))
     assert.match(y.detail, /repo-controlled code/)
   } finally { await fx.cleanup() }
+})
+
+// --- 14: a failed `git ls-files` silently skipped every git-level check ---------------------------
+
+test('[audit 14] a git listing that fails is reported as a coverage gap, not a clean result', { skip: posix }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'bouncer-git-'))
+  try {
+    execFileSync('git', ['-C', dir, 'init', '-q'])
+    await writeFile(path.join(dir, '.git', 'index'), 'DIRC this is not a valid index') // ls-files refuses it
+    const f = new Findings()
+    await gitChecks(dir, f)
+    const r = f.toJSON()
+    assert.ok(r.some(x => x.id === 'GIT-LISTING-INCOMPLETE' && x.severity === 'medium' && /exited/.test(x.evidence)), ids(r))
+  } finally { await rm(dir, { recursive: true, force: true }) }
 })
