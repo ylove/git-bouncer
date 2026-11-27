@@ -11,7 +11,7 @@
 //   credential.helper=  (+ GIT_TERMINAL_PROMPT=0)          no credentials are available or asked for
 //   no submodules                                          listed and reported, never fetched
 
-import { mkdir } from 'node:fs/promises'
+import { mkdir, lstat, rm, cp, readdir } from 'node:fs/promises'
 import path from 'node:path'
 import { run, cleanEnv } from './proc.js'
 
@@ -114,20 +114,120 @@ export async function hardenedClone(url, ref, dir) {
  * Git-level checks on the checked-out tree (symlinks, submodules, case collisions, .git lookalikes).
  * Uses the index, because with core.symlinks=false the working tree shows links as plain files.
  */
+/** Read many blobs in one `git cat-file --batch` call (no per-link process, no cap on link count). */
+async function readBlobs(dir, shas) {
+  if (!shas.length) return new Map()
+  const r = await run('git', [...GIT_HARDENING, 'cat-file', '--batch'], { cwd: dir, env: cleanEnv(), input: `${shas.join('\n')}\n`, timeoutMs: 120000 })
+  const out = new Map()
+  const buf = Buffer.from(r.stdout, 'utf8')
+  let at = 0
+  while (at < buf.length) {
+    const nl = buf.indexOf(10, at)
+    if (nl === -1) break
+    const [sha, type, size] = buf.subarray(at, nl).toString('utf8').split(' ')
+    at = nl + 1
+    if (type !== 'blob') continue
+    const n = Number(size)
+    out.set(sha, buf.subarray(at, at + n).toString('utf8'))
+    at += n + 1
+  }
+  return out
+}
+
+const MAX_MATERIALIZE_FILES = 5000
+
+/**
+ * The sandbox checks out symlinks as plain text files (core.symlinks=false), so nothing can follow
+ * them out of the repo. But a normal clone on your machine WOULD follow a link that stays inside the
+ * repo: `package.json -> tools/manifest.json` makes npm read tools/manifest.json. So each in-repo link
+ * is replaced with a copy of what it points to, and the scanner checks what your tools would really see.
+ */
+async function materializeLinks(dir, links, findings) {
+  const targets = new Map(links.map(l => [l.file, l.target]))
+  // Resolve a repo-relative path through any links on the way (a/b where a is a link), max 40 hops.
+  const resolve = p => {
+    let cur = path.posix.normalize(p)
+    for (let hop = 0; hop < 40; hop++) {
+      const parts = cur.split('/')
+      let changed = false
+      for (let i = 1; i <= parts.length; i++) {
+        const prefix = parts.slice(0, i).join('/')
+        if (targets.has(prefix)) {
+          const t = targets.get(prefix)
+          if (t.startsWith('/') || /^[A-Za-z]:[\\/]/.test(t) || t.startsWith('~')) return null
+          cur = path.posix.normalize(path.posix.join(path.posix.dirname(prefix), t, ...parts.slice(i)))
+          if (cur.startsWith('..')) return null
+          changed = true
+          break
+        }
+      }
+      if (!changed) return cur
+    }
+    return null // a loop
+  }
+  let done = 0
+  let copiedFiles = 0
+  for (const link of links) {
+    const real = resolve(link.file)
+    if (!real || real === link.file) continue
+    const src = path.join(dir, real)
+    const st = await lstat(src).catch(() => null)
+    if (!st) continue
+    const dest = path.join(dir, link.file)
+    try {
+      if (st.isFile()) {
+        await rm(dest, { force: true })
+        await cp(src, dest)
+        copiedFiles++
+      } else if (st.isDirectory()) {
+        const count = await countFiles(src, MAX_MATERIALIZE_FILES - copiedFiles)
+        if (count < 0) continue
+        await rm(dest, { force: true, recursive: true })
+        await cp(src, dest, { recursive: true })
+        copiedFiles += count
+      } else continue
+      done++
+    } catch { /* leave the placeholder; the link itself is still reported */ }
+    if (copiedFiles >= MAX_MATERIALIZE_FILES) break
+  }
+  if (done) {
+    findings.add({ id: 'GIT-SYMLINKS-RESOLVED', severity: 'info', title: `${done} in-repo symlink(s) were resolved for scanning`,
+      detail: 'Tools on your machine would follow these links, so their targets\' contents were checked at the link locations too.' })
+  }
+}
+
+async function countFiles(dir, limit) {
+  let n = 0
+  const stack = [dir]
+  while (stack.length) {
+    for (const e of await readdir(stack.pop(), { withFileTypes: true })) {
+      if (e.isDirectory()) stack.push(path.join(e.parentPath ?? e.path, e.name))
+      else n++
+      if (n > limit) return -1
+    }
+  }
+  return n
+}
+
+/**
+ * Git-level checks on the checked-out tree (symlinks, submodules, case collisions, .git lookalikes).
+ * Uses the index, because with core.symlinks=false the working tree shows links as plain files.
+ */
 export async function gitChecks(dir, findings) {
   const ls = await git(['ls-files', '-s', '-z'], dir)
   if (ls.code !== 0) return
   const entries = ls.stdout.split('\0').filter(Boolean).map(line => {
     const tab = line.indexOf('\t')
-    const [mode, , ] = line.slice(0, tab).split(' ')
-    return { mode, file: line.slice(tab + 1) }
+    const [mode, sha] = line.slice(0, tab).split(' ')
+    return { mode, sha, file: line.slice(tab + 1) }
   })
 
-  // Symlinks: report any that point outside the repository (e.g. at ~/.ssh) or at absolute paths.
-  const links = entries.filter(e => e.mode === '120000')
-  for (const link of links.slice(0, 200)) {
-    const show = await git(['cat-file', '-p', `:${link.file}`], dir, 30000)
-    const target = show.code === 0 ? show.stdout.slice(0, 500) : ''
+  // Symlinks: every one is checked (one batched git call), and in-repo ones are resolved for scanning.
+  const linkEntries = entries.filter(e => e.mode === '120000')
+  const blobs = await readBlobs(dir, [...new Set(linkEntries.map(l => l.sha))])
+  const links = linkEntries.map(l => ({ file: l.file, target: (blobs.get(l.sha) ?? '').slice(0, 1000) }))
+  for (const link of links) {
+    const { target } = link
     const resolved = path.posix.normalize(path.posix.join(path.posix.dirname(link.file), target))
     if (target.startsWith('/') || /^[A-Za-z]:[\\/]/.test(target) || target.startsWith('~') || resolved.startsWith('..')) {
       findings.add({
@@ -140,8 +240,9 @@ export async function gitChecks(dir, findings) {
   if (links.length) {
     findings.add({
       id: 'GIT-SYMLINKS', severity: 'info', title: `${links.length} symlink(s) in the repository`,
-      detail: 'Symlinks were checked out as plain files inside the sandbox. Only ones pointing outside the repo are flagged.',
+      detail: 'Symlinks were checked out as plain files inside the sandbox. Ones pointing outside the repo are flagged; ones inside it are resolved so their targets are scanned where your tools would read them.',
     })
+    await materializeLinks(dir, links, findings)
   }
 
   // Path components git itself treats specially.
