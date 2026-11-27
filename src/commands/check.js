@@ -2,6 +2,7 @@
 
 import { randomBytes } from 'node:crypto'
 import { detectContainerRuntime, createContainerRuntime } from '../runtimes/container.js'
+import { createCodespaceRuntime } from '../runtimes/codespace.js'
 import { extractReport } from '../report.js'
 import { computeVerdict, EXIT } from '../verdict.js'
 import { handoff, HandoffError } from '../handoff.js'
@@ -17,13 +18,22 @@ async function runIdCheck(target, deps) {
 
 async function pickRuntime(options, deps) {
   if (deps.runtime) return { runtime: deps.runtime, reasons: [] }
-  if (options.runtime === 'docker' || options.runtime === 'podman') {
-    const rt = createContainerRuntime(options.runtime, { onLog: deps.onLog })
+  const explicit = options.runtime
+  if (explicit === 'docker' || explicit === 'podman' || explicit === 'codespace') {
+    const rt = explicit === 'codespace' ? createCodespaceRuntime({ onLog: deps.onLog }) : createContainerRuntime(explicit, { onLog: deps.onLog })
     const a = await rt.available()
     return a.ok ? { runtime: rt, reasons: [] } : { runtime: null, reasons: [a.reason] }
   }
-  if (options.runtime) return { runtime: null, reasons: [`the ${options.runtime} runtime is not available in this version yet`] }
-  return detectContainerRuntime({ onLog: deps.onLog })
+  if (explicit) return { runtime: null, reasons: [`the ${explicit} runtime is not available in this version yet`] }
+  const local = await detectContainerRuntime({ onLog: deps.onLog })
+  if (local.runtime) return local
+  // No local engine: offer a throwaway Codespace, but only with consent (it uses the user's quota).
+  const cs = createCodespaceRuntime({ onLog: deps.onLog })
+  const a = await cs.available()
+  if (a.ok && await deps.prompter.confirm('No Docker or Podman here. Use a throwaway GitHub Codespace instead? (It uses your Codespaces allowance and is deleted afterwards.)', { defaultYes: true, safeAnswer: false })) {
+    return { runtime: cs, reasons: [] }
+  }
+  return { runtime: null, reasons: [...local.reasons, `Codespaces: ${a.ok ? 'declined' : a.reason}`] }
 }
 
 /**
@@ -73,7 +83,13 @@ export async function check(cmd, deps) {
     out.note(`using ${runtime.describe()}`)
     const image = runtime.ensureImage ? await runtime.ensureImage(version) : null
     const nonce = randomBytes(16).toString('hex')
-    const result = await runtime.scan({ url: target.url, ref: options.ref, nonce, image })
+    let result
+    try {
+      result = await runtime.scan({ url: target.url, ref: options.ref, nonce, image })
+    } catch (e) {
+      session = e.session ?? null // whatever was created must still be cleaned up
+      throw e
+    }
     session = result.session
     const { report, complete, problems } = extractReport(result.reportText, nonce)
     if (report) all.push(...report.findings)
