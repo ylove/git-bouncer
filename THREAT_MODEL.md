@@ -18,7 +18,7 @@ This document says what it protects, what it assumes, what it does about each th
 - **A compromised legitimate repository.** A real project whose maintainer was phished, so the history and reputation look fine but recent commits don't.
 - **Look-alike identities.** `micr0s0ft/vscode`, `expresss`, `cross-env` vs `crossenv`.
 
-Out of scope: an attacker who already controls your machine, your network path to GitHub/npm (TLS is trusted), the container runtime, GitHub/npm/OSV themselves, or the npm package you installed git-bouncer from (see "Trusting git-bouncer itself" below).
+Out of scope: an attacker who already controls your machine, your DNS or your network path to GitHub/npm (TLS is trusted), the container runtime, GitHub/npm/OSV themselves, or the npm package you installed git-bouncer from (see "Trusting git-bouncer itself" below).
 
 ## Trust boundaries
 
@@ -44,7 +44,7 @@ Rule of the boundary: **secrets never cross into the sandbox, and nothing from t
 ### T1. The repo runs code during install
 npm/yarn/pnpm lifecycle scripts (`preinstall`, `install`, `postinstall`, `prepare`) run automatically. So do Python `setup.py` builds, `.pth` files, MSBuild targets on `dotnet build`, and husky hooks once installed.
 - In the sandbox, dependencies are installed with `--ignore-scripts`, so **no repo or dependency code is executed**.
-- Every lifecycle script in the repo **and in every installed dependency** is listed (`npm query`). Download-and-execute patterns are FAIL. Unknown install scripts are WARN. A short, documented allowlist of well-known native packages (esbuild, sharp, …) is informational.
+- Every install-time script npm would run is listed: the repo's own (including workspaces, the `dependencies` hook and `binding.gyp` builds) and every dependency the lockfile marks `hasInstallScript`, read from that package's own `package.json`. Download-and-execute patterns are FAIL. Unknown install scripts are WARN. A short, documented allowlist of well-known native packages (esbuild, sharp, …) is informational.
 - When you install on your machine afterwards and install scripts were found, you're asked whether to run them (`--ignore-scripts` is offered as the safe default).
 
 ### T2. The repo runs code when you merely open it
@@ -66,7 +66,7 @@ npm/yarn/pnpm lifecycle scripts (`preinstall`, `install`, `postinstall`, `prepar
 - **Checksum mismatch:** `npm ci` verifies every tarball against the lockfile's sha512 `integrity`; a mismatch (`EINTEGRITY`) → FAIL. Invalid registry signatures (`npm audit signatures`) → FAIL.
 - Lockfile tampering: `resolved` URLs that point anywhere but the registry (http, git, random tarball hosts) → FAIL/WARN. Missing or weak (sha1) integrity → WARN.
 - Project `.npmrc` that redirects the registry, or sets `git`, `script-shell`, `node-options` and similar (which can make npm run arbitrary programs even with `--ignore-scripts`) → FAIL. In the sandbox the project `.npmrc` is moved aside before npm runs.
-- Typosquatted dependency names (`expresss`, `crossenv`) → WARN, FAIL if the package is newly published.
+- Typosquatted dependency names (`expresss`, `crossenv`) → WARN.
 - Ordinary known vulnerabilities (CVEs) → WARN only. git-bouncer answers "will this repo attack *me*?", not "is this app secure?". A tutorial repo with an old lodash isn't an attack on you.
 
 ### T5. The repo attacks git during clone
@@ -118,5 +118,6 @@ A security tool you install from npm is itself a supply-chain risk, so:
 - **npm gets the deepest dependency checks.** yarn, pnpm, bun, Python, NuGet and others get lockfile parsing and OSV matching, but not install-time checksum verification inside the sandbox.
 - **Private repositories aren't supported in v1**, because that would mean putting credentials in the sandbox.
 - **Network egress from the sandbox is allowed** (git, the npm registry and OSV need it). No repo code runs there, but a container on your network is still a container on your network.
+- **Hosts are an allowlist, but DNS isn't checked.** Only github.com, gitlab.com, bitbucket.org, codeberg.org and hosts you name with `--allow-host` are accepted, and internal or wildcard-DNS names are always refused. git-bouncer doesn't verify what an allowed name *resolves* to, so an attacker who controls your DNS is out of scope.
 - **The cloud runtimes (GCP Cloud Build, AWS CodeBuild) are not live-tested by the maintainer**, because they cost money. They're documented as a starting point for your own configuration.
 - **You're the last check.** A WARN asks you to look. If you don't understand why something was flagged, don't install it on your daily machine.

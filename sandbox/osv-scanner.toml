@@ -1,0 +1,5 @@
+# git-bouncer's own osv-scanner configuration, passed with --config.
+#
+# It is deliberately empty. osv-scanner normally honors an osv-scanner.toml found in the scanned
+# project, and that file can tell it to ignore specific advisories. The scanned repository is
+# attacker-controlled, so we never let it configure the scanner: this file is used instead.
