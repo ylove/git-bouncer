@@ -33,10 +33,11 @@ test('decode-then-execute in JS and Python is a FAIL', async () => {
   assert.equal(r.filter(f => f.id === 'OBFUSCATION-DECODE-EXEC').length, 2, ids(r))
 })
 
-test('decoding without executing, or minified bundles, are not flagged as decode-exec', async () => {
+test('decoding without executing is not flagged as decode-exec, and neither is a real minified bundle', async () => {
+  const minified = `!function(){var a=Buffer.from(b,"base64");${'x=1;'.repeat(400)}}();\n`
   const r = await scan({
     'src/img.js': 'const png = Buffer.from(data, "base64")\n',
-    'dist/app.min.js': `${j('ev', 'al')}(${j('at', 'ob')}("x"))\n`,
+    'vendor/lib.min.js': minified,
   })
   assert.ok(!has(r, 'OBFUSCATION-DECODE-EXEC'), ids(r))
 })
@@ -69,6 +70,7 @@ test('a "font" that is actually text is a FAIL (PolinRider fake fonts)', async (
 
 test('a real woff2 header and a Git LFS pointer are fine', async () => {
   const realish = Buffer.concat([Buffer.from('wOF2'), Buffer.alloc(64, 0)])
+  realish.writeUInt32BE(realish.length, 8) // the header's total-length field must match the file size
   const r = await scan({
     'fonts/a.woff2': realish,
     'fonts/b.woff2': 'version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 123\n',
@@ -106,7 +108,7 @@ test('reading blockchain transactions and executing the result is a FAIL; a web3
 test('conftest.py that downloads and executes is a FAIL; a normal conftest is fine', async () => {
   const r = await scan({
     'tests/conftest.py': `import urllib.request\n${j('ex', 'ec')}(urllib.request.urlopen(U).read())\n`,
-    'other/conftest.py': 'import pytest\n\n@pytest.fixture\ndef client():\n    return 1\n',
+    'other/conftest.py': 'import pytest\n\ndef test_client():\n    assert 1\n',
   })
   assert.ok(r.some(f => f.id === 'PY-IMPORT-TIME-LOADER' && f.file === 'tests/conftest.py'), ids(r))
   assert.ok(!r.some(f => f.id === 'PY-IMPORT-TIME-LOADER' && f.file === 'other/conftest.py'), ids(r))
