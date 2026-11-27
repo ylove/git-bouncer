@@ -4,21 +4,25 @@
 // tests with a fake `exec`, and `plan()` lets anyone see exactly what would run. See docs/cloud.md.
 //
 // The rules this file enforces for both providers:
-//  1. Commands are argument arrays handed to spawn() without a shell. Never a command string.
+//  1. Commands are argument arrays handed to spawn() without a shell, through the same helper the
+//     rest of git-bouncer uses (src/proc.js). Programs are found on absolute PATH entries only.
 //  2. The repository URL, ref and nonce are re-validated here even though the CLI already did,
 //     because this module must not trust its caller. Valid values contain no quotes, spaces, "$",
 //     newlines or anything else a YAML file or a shell could give meaning to.
 //  3. Generated files are produced from plain objects by one small serializer (toYaml), which
 //     quotes every string. No hand-written YAML with values pasted into it.
-//  4. Nothing we run in the cloud gets credentials, mounts or environment variables from the host.
+//  4. The sandbox container gets exactly the local runtime's hardening (sandboxFlags() from
+//     container.js), no credentials, mounts or environment, and the nonce only on stdin.
 
-import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { validateRef } from '../url.js'
+import { extractReport } from '../report.js'
+import { run, which } from '../proc.js'
 import { clean } from '../ui/sanitize.js'
+import { sandboxFlags } from './container.js'
 
 /** The local tag the sandbox image gets inside the build machine. Never pushed anywhere. */
 export const SANDBOX_IMAGE = 'git-bouncer-sandbox:scan'
@@ -26,36 +30,58 @@ export const SANDBOX_IMAGE = 'git-bouncer-sandbox:scan'
 /** Where sandbox/Dockerfile puts the scanner. */
 export const SCANNER_ENTRY = '/opt/bouncer/scanner/main.js'
 
-/**
- * The container hardening flags. They must stay identical to the local Docker/Podman runtime
- * (issue #3), so a cloud scan is exactly as locked down as a local one:
- *   --cap-drop=ALL                    no Linux capabilities at all
- *   --security-opt=no-new-privileges  setuid binaries can't raise privileges
- *   --read-only                       the image's filesystem can't be changed
- *   --user=10001:10001                an unprivileged user, never root
- *   --tmpfs ... noexec,nosuid,nodev   the only writable places, size-capped, nothing there can run
- *   --pids-limit / --memory           no fork bombs, no eating the build machine's memory
- */
-export const SANDBOX_RUN_FLAGS = Object.freeze([
-  '--cap-drop=ALL',
-  '--security-opt=no-new-privileges',
-  '--read-only',
-  '--user=10001:10001',
-  '--tmpfs=/work:rw,noexec,nosuid,nodev,size=2g',
-  '--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=768m',
-  '--pids-limit=512',
-  '--memory=3g',
-])
-
-/**
- * `docker run` arguments for the cloud runtimes: remove the container afterwards, and say out loud
- * that it joins Docker's default bridge network. On Cloud Build that matters: the build's
- * credentials are served on a network named "cloudbuild", and the sandbox is never attached to it.
- */
-export const CLOUD_RUN_FLAGS = Object.freeze(['--rm', ...SANDBOX_RUN_FLAGS, '--network=bridge'])
-
 /** Placeholder shown by plan() when no real temporary folder exists yet (a dry run). */
 export const TEMP_DIR_PLACEHOLDER = '<temp-dir>'
+
+/**
+ * `docker run` arguments for a cloud sandbox: the local runtime's hardening flags, removed when it
+ * exits, and (for the scan) stdin kept open so the nonce can be written to it.
+ */
+export function sandboxRunArgs({ interactive = false } = {}) {
+  return ['run', '--rm', ...(interactive ? ['--interactive'] : []), ...sandboxFlags(), SANDBOX_IMAGE]
+}
+
+/**
+ * The scanner command. The nonce is NOT an argument: arguments are readable by every process in the
+ * container (/proc/<pid>/cmdline), and the nonce is what keeps anything inside the sandbox from
+ * printing a forged report. The scanner reads it from the first line of stdin instead.
+ */
+export function scannerCommand({ url, ref }) {
+  return ['node', SCANNER_ENTRY, `--url=${url}`, ...(ref ? [`--ref=${ref}`] : []), '--nonce-stdin']
+}
+
+/**
+ * The metadata canary: a few lines of git-bouncer's own JavaScript, run in a sandbox container with
+ * the same flags as the scan, before the scan. It asks the cloud credential endpoints for
+ * credentials and makes the build fail if it gets any (mode "token": any 2xx; mode "any-answer":
+ * any HTTP response at all, for endpoints that are supposed to be blocked). Each probe gives up
+ * after 3 seconds. It prints only host names and HTTP status codes, never a response body.
+ *
+ * Kept on one line, with no "$" (Cloud Build would expand it), no single quote (AWS passes it
+ * inside single quotes) and no "!" (some shells treat it specially).
+ */
+export const CANARY_JS = [
+  'const mode = process.argv[1] || "token";',
+  'const probes = [',
+  '["http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token", true],',
+  '["http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token", true],',
+  '["http://169.254.169.254/latest/meta-data/iam/security-credentials/", false],',
+  '["http://169.254.170.2/v2/credentials/", false]];',
+  'Promise.all(probes.map(([u, google]) => fetch(u, { headers: google ? { "Metadata-Flavor": "Google" } : {}, redirect: "manual", signal: AbortSignal.timeout(3000) })',
+  '.then(r => { if (r.body) r.body.cancel().catch(() => {}); return [u, r.status] }, () => [u, 0])))',
+  '.then(results => { let bad = false;',
+  'for (const [u, s] of results) { console.log("metadata canary: " + new URL(u).host + (s ? " answered HTTP " + s : " is not reachable"));',
+  'if (s && (mode === "any-answer" || (s >= 200 && s < 300))) bad = true }',
+  'if (bad) { console.log("metadata canary: FAILED, the sandbox can reach a cloud credential endpoint, refusing to scan"); process.exit(1) }',
+  'console.log("metadata canary: passed") })',
+].join(' ')
+
+export const CANARY_FAILED = 'metadata canary: FAILED'
+
+export function canaryCommand(mode) {
+  if (/[$'!\n\r]/.test(CANARY_JS)) throw new Error('internal: the canary script must contain no $, \', ! or newline')
+  return ['node', '-e', CANARY_JS, mode]
+}
 
 const HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/
 const SEGMENT = /^[A-Za-z0-9._~-]{1,100}$/
@@ -85,22 +111,16 @@ export function assertSandboxDir(sandboxDir) {
   }
 }
 
-/** The scanner command inside the sandbox container. `--flag=value` binds each value to its flag. */
-export function scannerCommand({ url, ref, nonce }) {
-  return ['node', SCANNER_ENTRY, `--url=${url}`, ...(ref ? [`--ref=${ref}`] : []), `--nonce=${nonce}`]
-}
-
-export const reportEndMarker = nonce => `-----END BOUNCER REPORT ${nonce}-----`
-
-/** True when the text contains both report markers for this nonce, each as a whole line. */
-export function hasCompleteReport(text, nonce) {
-  const lines = String(text).split(/\r?\n/)
-  const begin = lines.indexOf(`-----BEGIN BOUNCER REPORT ${nonce}-----`)
-  return begin !== -1 && lines.indexOf(reportEndMarker(nonce), begin + 1) !== -1
+/**
+ * Has the log got a report the CLI will accept? Same rules as the CLI itself (extractReport in
+ * src/report.js), so a retry loop never stops on a log the CLI would then reject.
+ */
+export function reportReady(text, nonce) {
+  return extractReport(text, nonce).report !== null
 }
 
 /**
- * A short, unguessable id for names we create in the cloud (an S3 prefix, a temp folder). It is
+ * A short, unguessable id for the names we create in the cloud: a build tag, a storage prefix. It is
  * derived from the nonce so plan() can stay a pure function, and it is one-way, so the nonce itself
  * never shows up in a bucket listing.
  */
@@ -184,7 +204,7 @@ export function toYaml(doc, { comments = [] } = {}) {
 // Configuration: environment variables first, then ~/.config/git-bouncer/cloud.json.
 // ---------------------------------------------------------------------------------------------
 
-const CONFIG_KEYS = { gcp: ['project', 'region', 'serviceAccount'], aws: ['project', 'region', 'bucket'] }
+const CONFIG_KEYS = { gcp: ['project', 'region', 'serviceAccount', 'bucket'], aws: ['project', 'region', 'bucket'] }
 const MAX_CONFIG_BYTES = 64 * 1024
 
 /** Where the cloud config file lives: $XDG_CONFIG_HOME/git-bouncer/cloud.json, else ~/.config/... */
@@ -232,27 +252,33 @@ export async function loadCloudConfig(env = process.env) {
 
 const MAX_SANDBOX_FILES = 1000
 const MAX_SANDBOX_BYTES = 25 * 1024 * 1024
+// Plain names only, so a path can be used as an object key without any escaping.
+export const SANDBOX_PATH = /^(?!.*(?:^|\/)\.\.?(?:\/|$))[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/
 
 /**
  * Copy the sandbox folder (Dockerfile + scanner) into `dest`, which must not exist yet. Only plain
  * files and folders are copied: a symlink or anything else makes it stop, because the upload must
  * contain exactly git-bouncer's own files and nothing a link could pull in from elsewhere.
- * @returns {Promise<{files: number, bytes: number}>}
+ * @returns {Promise<{files: number, bytes: number, paths: string[]}>}  paths: relative, with "/"
  */
 export async function copySandbox(src, dest) {
   let files = 0
   let bytes = 0
-  const walk = async (from, to) => {
+  const paths = []
+  const walk = async (from, to, rel) => {
     await mkdir(to, { mode: 0o700 })
     const entries = await readdir(from, { withFileTypes: true })
     entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
     for (const entry of entries) {
       const s = path.join(from, entry.name)
       const d = path.join(to, entry.name)
+      const r = rel ? `${rel}/${entry.name}` : entry.name
       if (entry.isDirectory()) {
-        await walk(s, d)
+        await walk(s, d, r)
       } else if (entry.isFile()) {
+        if (!SANDBOX_PATH.test(r)) throw new Error(`the sandbox folder contains an unexpected file name (${clean(r, { max: 200 })}); refusing to upload it`)
         const content = await readFile(s)
+        paths.push(r)
         files += 1
         bytes += content.length
         if (files > MAX_SANDBOX_FILES || bytes > MAX_SANDBOX_BYTES) throw new Error('the sandbox folder is unexpectedly large; refusing to upload it')
@@ -262,9 +288,9 @@ export async function copySandbox(src, dest) {
       }
     }
   }
-  await walk(src, dest)
+  await walk(src, dest, '')
   if (files === 0) throw new Error('the sandbox folder is empty')
-  return { files, bytes }
+  return { files, bytes, paths }
 }
 
 /** Write plan.files into workDir. Names are our own constants; 'wx' refuses to overwrite anything. */
@@ -279,84 +305,21 @@ export async function writePlanFiles(workDir, files) {
 // Running commands.
 // ---------------------------------------------------------------------------------------------
 
-const MAX_STDOUT = 64 * 1024 * 1024
-const MAX_STDERR = 1024 * 1024
-
 /**
- * Run one program with an argument array: spawn() with shell: false, so nothing in `args` is ever
- * interpreted by a shell. Never rejects; resolves with
- * { code, stdout, stderr, timedOut, aborted, truncated, error }.
- *
- * @param {string} cmd
- * @param {string[]} args
- * @param {{input?: string, timeoutMs?: number, onStdout?: (chunk: string) => void,
- *          env?: Record<string, string>, signal?: AbortSignal}} [opts]
+ * The default `exec` for the cloud runtimes: find the program on an absolute PATH entry (never "."
+ * or ./node_modules/.bin, so a cloned repo can't supply its own `aws`), then run it with
+ * src/proc.js, which uses spawn() with shell: false. On Windows, .cmd and .bat files are refused:
+ * Node can only start them through cmd.exe, whose argument parsing is a shell's.
+ * Resolves (never rejects) with { code, stdout, stderr, timedOut, truncated, error }.
  */
-export function defaultExec(cmd, args, { input, timeoutMs = 60_000, onStdout, env = process.env, signal } = {}) {
-  if (typeof cmd !== 'string' || !Array.isArray(args) || args.some(a => typeof a !== 'string')) {
-    return Promise.reject(new TypeError('exec needs a command name and an array of string arguments'))
-  }
-  return new Promise(resolve => {
-    let stdout = ''
-    let stderr = ''
-    let truncated = false
-    let timedOut = false
-    let aborted = false
-    let settled = false
-    let child
-    const finish = result => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      clearTimeout(killTimer)
-      if (signal) signal.removeEventListener('abort', onAbort)
-      resolve({ stdout, stderr, timedOut, aborted, truncated, ...result })
+export function makeDefaultExec(platform = process.platform) {
+  return async (cmd, args, opts = {}) => {
+    const bin = await which(cmd, opts.env || process.env)
+    if (!bin || (platform === 'win32' && /\.(cmd|bat)$/i.test(bin))) {
+      const error = Object.assign(new Error(`${cmd} not found`), { code: 'ENOENT' })
+      return { code: -1, stdout: '', stderr: error.message, timedOut: false, truncated: false, error }
     }
-    try {
-      child = spawn(cmd, args, { shell: false, windowsHide: true, env, stdio: ['pipe', 'pipe', 'pipe'] })
-    } catch (error) {
-      resolve({ code: -1, stdout: '', stderr: String(error && error.message), timedOut: false, aborted: false, truncated: false, error })
-      return
-    }
-    let killTimer
-    const stop = () => {
-      child.kill('SIGTERM')
-      killTimer = setTimeout(() => child.kill('SIGKILL'), 5000)
-    }
-    const timer = setTimeout(() => { timedOut = true; stop() }, timeoutMs)
-    const onAbort = () => { aborted = true; stop() }
-    if (signal) {
-      if (signal.aborted) onAbort()
-      else signal.addEventListener('abort', onAbort, { once: true })
-    }
-    child.stdout.setEncoding('utf8')
-    child.stderr.setEncoding('utf8')
-    child.stdout.on('data', s => {
-      if (stdout.length + s.length > MAX_STDOUT) { truncated = true; return }
-      stdout += s
-      if (onStdout) onStdout(s)
-    })
-    child.stderr.on('data', s => { if (stderr.length < MAX_STDERR) stderr += s })
-    child.on('error', error => finish({ code: -1, stderr: stderr + String(error && error.message), error }))
-    child.on('close', code => finish({ code: code ?? -1 }))
-    child.stdin.on('error', () => {}) // the program may exit before reading its input
-    child.stdin.end(input)
-  })
-}
-
-/** Turn streamed chunks into sanitized single lines for onLog (untrusted text: the build log). */
-export function lineSink(onLog) {
-  let buf = ''
-  const emit = line => { if (onLog && line.trim()) onLog(clean(line, { max: 500 })) }
-  return {
-    write(chunk) {
-      buf += chunk
-      if (buf.length > 1024 * 1024) buf = buf.slice(-1024 * 1024)
-      const lines = buf.split(/\r?\n/)
-      buf = lines.pop()
-      lines.forEach(emit)
-    },
-    end() { emit(buf); buf = '' },
+    return run(bin, args, opts)
   }
 }
 
@@ -366,24 +329,24 @@ export function errorTail(result, max = 600) {
   return clean(text.split(/\r?\n/).filter(Boolean).slice(-4).join(' | '), { max })
 }
 
-/** Replace placeholders like <build-id> in a planned step with values we have already validated. */
+/**
+ * Replace placeholders like <build-id> in a planned step with values we have already validated.
+ * An argument that is exactly a placeholder whose value is an array becomes that many arguments.
+ */
 export function fillStep(step, vars) {
-  const args = step.args.map(a => a.replace(/<[a-z-]+>/g, m => {
-    if (!(m in vars)) throw new Error(`internal: no value for ${m}`)
-    return vars[m]
-  }))
+  const args = step.args.flatMap(a => {
+    if (a in vars && Array.isArray(vars[a])) return vars[a]
+    return [a.replace(/<[a-z-]+>/g, m => {
+      if (!(m in vars) || Array.isArray(vars[m])) throw new Error(`internal: no value for ${m}`)
+      return vars[m]
+    })]
+  })
   return { cmd: step.cmd, args }
 }
 
-export const sleep = (ms, signal) => new Promise(resolve => {
-  if (signal && signal.aborted) return resolve()
-  const t = setTimeout(done, ms)
-  function done() { clearTimeout(t); if (signal) signal.removeEventListener('abort', done); resolve() }
-  if (signal) signal.addEventListener('abort', done, { once: true })
-})
+export const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
-export function abortError() {
-  const e = new Error('the cloud scan was interrupted')
-  e.name = 'AbortError'
-  return e
+/** Thrown when destroy() has already run for a session: no new cloud work may start after it. */
+export function stoppedError(session) {
+  return Object.assign(new Error('the cloud scan was stopped'), { name: 'AbortError', session })
 }

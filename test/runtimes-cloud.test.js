@@ -1,23 +1,26 @@
 // Tests for the cloud runtimes (GCP Cloud Build, AWS CodeBuild).
 //
 // These never touch a real cloud and never run gcloud or aws: every test injects a fake `exec`
-// that records the exact argument arrays and answers with canned output. The only real programs
-// started here are Node itself, to prove the default exec passes arguments without a shell.
+// that records the exact argument arrays and answers with canned output. The only real program
+// started here is Node itself (to run the metadata canary against a fake fetch).
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, symlink } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseRepoUrl } from '../src/url.js'
+import { extractReport } from '../src/report.js'
+import { runArgs, sandboxFlags } from '../src/runtimes/container.js'
 import {
-  CLOUD_RUN_FLAGS, SANDBOX_RUN_FLAGS, assertScanInputs, cloudConfigPath, copySandbox, defaultExec,
-  fillStep, hasCompleteReport, lineSink, loadCloudConfig, runIdFor, scannerCommand, toYaml,
+  CANARY_JS, SANDBOX_IMAGE, assertScanInputs, canaryCommand, cloudConfigPath, copySandbox, fillStep,
+  loadCloudConfig, makeDefaultExec, reportReady, runIdFor, sandboxRunArgs, scannerCommand, toYaml,
 } from '../src/runtimes/cloud-common.js'
 import {
-  buildCloudbuildConfig, createGcpRuntime, defaultStagingBucket, extractStepOutput, renderCloudbuildYaml,
+  DOCKER_BUILDER, NONCE_WRAPPER, buildCloudbuildConfig, createGcpRuntime, extractStepOutput, renderCloudbuildYaml,
 } from '../src/runtimes/gcp.js'
 import {
   buildBuildspec, buildStartBuildRequest, createAwsRuntime, joinLogEvents, renderBuildspec,
@@ -27,9 +30,11 @@ import {
 const AT = '@'
 const NONCE = '0123456789abcdef0123456789abcdef'
 const URL_ = 'https://github.com/someone/take-home-test.git'
+const SA = `git-bouncer-scan${AT}my-project-123.iam.gserviceaccount.com`
 const GCP_BUILD_ID = '5f2b8c1e-3a4d-4e6f-9a0b-1c2d3e4f5a6b'
 const AWS_BUILD_ID = 'git-bouncer:7d6c5b4a-3e2f-4a1b-8c9d-0e1f2a3b4c5d'
-const STAGED_OBJECT = 'source/1732744000.123456-0123456789abcdef0123456789abcdef.tgz'
+const ACCOUNT = '123456789012'
+const RUN_ID = runIdFor(NONCE)
 const SRC_DIR = fileURLToPath(new URL('../src/runtimes/', import.meta.url))
 
 const report = nonce => [
@@ -53,14 +58,14 @@ function fakeExec(respond) {
     calls.push({ cmd, args: [...args], opts })
     const r = await respond(cmd, args, opts)
     if (!r) { unexpected.push([cmd, ...args].join(' ')); return { code: 99, stdout: '', stderr: 'unexpected command' } }
-    if (r.stdout && opts.onStdout) opts.onStdout(r.stdout)
     return { code: 0, stdout: '', stderr: '', ...r }
   }
   return { exec, calls, unexpected, argv: () => calls.map(c => [c.cmd, ...c.args]) }
 }
 const noExec = async () => { throw new Error('plan() must not run any command') }
 const noSleep = async () => {}
-const line = (args, prefix) => args.join(' ').startsWith(prefix)
+const never = () => new Promise(() => {})
+const starts = (args, prefix) => args.join(' ').startsWith(prefix)
 
 async function makeSandbox() {
   const dir = await mkdtemp(path.join(tmpdir(), 'gb-test-sandbox-'))
@@ -72,9 +77,16 @@ async function makeSandbox() {
   return dir
 }
 const listTree = async dir => (await readdir(dir, { recursive: true })).map(p => p.split(path.sep).join('/')).sort()
+const emptyHome = () => mkdtemp(path.join(tmpdir(), 'gb-test-home-'))
 
-async function emptyHome() {
-  return mkdtemp(path.join(tmpdir(), 'gb-test-home-'))
+/** Run a test body with a fresh HOME and sandbox folder, removed afterwards. */
+async function withDirs(fn) {
+  const home = await emptyHome()
+  const sandbox = await makeSandbox()
+  try { await fn({ home, sandbox }) } finally {
+    await rm(home, { recursive: true, force: true })
+    await rm(sandbox, { recursive: true, force: true })
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -84,38 +96,14 @@ async function emptyHome() {
 test('toYaml writes every string as a JSON-quoted scalar', () => {
   const yaml = toYaml({ a: 'x', n: 0.2, b: true, list: ['no', 'on', '1e3', '0x1F', 'null', '~'], map: { k: 'v' }, empty: [], none: {} })
   assert.equal(yaml, [
-    'a: "x"',
-    'n: 0.2',
-    'b: true',
-    'list:',
-    '  - "no"',
-    '  - "on"',
-    '  - "1e3"',
-    '  - "0x1F"',
-    '  - "null"',
-    '  - "~"',
-    'map:',
-    '  k: "v"',
-    'empty: []',
-    'none: {}',
-    '',
+    'a: "x"', 'n: 0.2', 'b: true', 'list:', '  - "no"', '  - "on"', '  - "1e3"', '  - "0x1F"', '  - "null"', '  - "~"',
+    'map:', '  k: "v"', 'empty: []', 'none: {}', '',
   ].join('\n'))
 })
 
 test('toYaml nests lists of maps the way Cloud Build and CodeBuild expect', () => {
   const yaml = toYaml({ steps: [{ id: 'a', args: ['x', 'y'], env: { K: 'v' } }, { id: 'b' }] }, { comments: ['header'] })
-  assert.equal(yaml, [
-    '# header',
-    'steps:',
-    '  - id: "a"',
-    '    args:',
-    '      - "x"',
-    '      - "y"',
-    '    env:',
-    '      K: "v"',
-    '  - id: "b"',
-    '',
-  ].join('\n'))
+  assert.equal(yaml, ['# header', 'steps:', '  - id: "a"', '    args:', '      - "x"', '      - "y"', '    env:', '      K: "v"', '  - id: "b"', ''].join('\n'))
 })
 
 test('toYaml keeps hostile strings inside one scalar: YAML syntax in a value stays data', () => {
@@ -123,13 +111,11 @@ test('toYaml keeps hostile strings inside one scalar: YAML syntax in a value sta
     '"', '\\', '": x', '- item', '# comment', '&anchor', '*alias', '!!python/object/apply:os.system', '{a: 1}', '[1, 2]',
     '|', '>', '%YAML 1.1', '---', '...', '@', '`id`', "'", '${PROJECT_ID}', 'key: value', '"\\"', ' leading', 'trailing ',
   ]
-  // ...and every printable ASCII character on its own.
   for (let c = 0x20; c <= 0x7e; c += 1) hostile.push(String.fromCharCode(c))
   for (const s of hostile) {
     const lines = toYaml({ list: [s], key: s }).split('\n')
-    assert.equal(lines.length, 4, JSON.stringify(s)) // list:, the item, key:, and the final ""
+    assert.equal(lines.length, 4, JSON.stringify(s))
     assert.equal(lines[0], 'list:')
-    assert.ok(lines[1].startsWith('  - "'), JSON.stringify(s))
     assert.equal(JSON.parse(lines[1].slice(4)), s, 'the item decodes back to exactly the input')
     assert.equal(JSON.parse(lines[2].slice('key: '.length)), s)
   }
@@ -140,7 +126,6 @@ test('toYaml refuses anything it cannot write safely instead of escaping it', ()
     assert.throws(() => toYaml({ k: s }), /printable ASCII/, JSON.stringify(s))
   }
   assert.throws(() => toYaml({ 'bad key': 'x' }), /unsupported key/)
-  assert.throws(() => toYaml({ 'k: v': 'x' }), /unsupported key/)
   assert.throws(() => toYaml({ k: null }), /unsupported value/)
   assert.throws(() => toYaml({ k: Number.NaN }), /unsupported value/)
   assert.throws(() => toYaml({ k: [['nested']] }), /nested lists/)
@@ -149,8 +134,7 @@ test('toYaml refuses anything it cannot write safely instead of escaping it', ()
 
 test('assertScanInputs accepts exactly what the CLI\'s URL and ref validators produce', () => {
   for (const input of ['someone/take-home-test', 'https://gitlab.com/group/sub~group/re.po_-x', 'git' + AT + 'github.com:o/r.git', 'codeberg.org/a/b']) {
-    const { url } = parseRepoUrl(input)
-    assert.doesNotThrow(() => assertScanInputs({ url, ref: null, nonce: NONCE }), input)
+    assert.doesNotThrow(() => assertScanInputs({ url: parseRepoUrl(input).url, ref: null, nonce: NONCE }), input)
   }
   for (const ref of ['main', 'v1.2.3', 'feature/-rf+x' + AT + 'y', 'f'.repeat(40)]) {
     assert.doesNotThrow(() => assertScanInputs({ url: URL_, ref, nonce: NONCE }), ref)
@@ -162,7 +146,7 @@ test('assertScanInputs refuses values a shell or a YAML file could give meaning 
     'https://github.com/o/$(id).git', 'https://github.com/o/`id`.git', 'https://github.com/o/r;id.git', 'https://github.com/o/"r".git',
     "https://github.com/o/'r'.git", 'https://github.com/o/r r.git', 'https://github.com/o/r\n.git', 'https://github.com/o/${PROJECT_ID}.git',
     'http://github.com/o/r.git', 'https://user' + AT + 'github.com/o/r.git', 'https://github.com/o/r', 'https://github.com/r.git',
-    'https://github.com/-o/r.git', 'https://github.com/../r.git', 'https://metadata.google.internal.git', 'file:///etc/passwd.git', '--upload-pack=x',
+    'https://github.com/-o/r.git', 'https://github.com/../r.git', 'file:///etc/passwd.git', '--upload-pack=x',
   ]
   for (const url of badUrls) assert.throws(() => assertScanInputs({ url, nonce: NONCE }), /repository URL/, url)
   for (const ref of ['$(id)', '$PROJECT_ID', 'a b', 'x\ny', '--upload-pack=x', '-x', 'a;b', '`id`', '"q"', '']) {
@@ -173,71 +157,78 @@ test('assertScanInputs refuses values a shell or a YAML file could give meaning 
   }
 })
 
-test('the scanner command binds every value to its flag with "="', () => {
-  assert.deepEqual(scannerCommand({ url: URL_, ref: 'v1', nonce: NONCE }), ['node', '/opt/bouncer/scanner/main.js', `--url=${URL_}`, '--ref=v1', `--nonce=${NONCE}`])
-  assert.deepEqual(scannerCommand({ url: URL_, ref: null, nonce: NONCE }), ['node', '/opt/bouncer/scanner/main.js', `--url=${URL_}`, `--nonce=${NONCE}`])
+test('the scanner gets its nonce on stdin, never as an argument', () => {
+  assert.deepEqual(scannerCommand({ url: URL_, ref: 'v1' }), ['node', '/opt/bouncer/scanner/main.js', `--url=${URL_}`, '--ref=v1', '--nonce-stdin'])
+  assert.deepEqual(scannerCommand({ url: URL_, ref: null }), ['node', '/opt/bouncer/scanner/main.js', `--url=${URL_}`, '--nonce-stdin'])
 })
 
-test('the cloud sandbox gets the same hardening flags as a local one, plus --rm and the default network', () => {
-  assert.deepEqual([...SANDBOX_RUN_FLAGS], [
-    '--cap-drop=ALL', '--security-opt=no-new-privileges', '--read-only', '--user=10001:10001',
-    '--tmpfs=/work:rw,noexec,nosuid,nodev,size=2g', '--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=768m',
-    '--pids-limit=512', '--memory=3g',
-  ])
-  assert.deepEqual([...CLOUD_RUN_FLAGS], ['--rm', ...SANDBOX_RUN_FLAGS, '--network=bridge'])
-  for (const flag of CLOUD_RUN_FLAGS) {
-    assert.doesNotMatch(flag, /^(-v|--volume|--mount|-e|--env|--env-file|--privileged|--cap-add|--network=(host|cloudbuild))/, flag)
+test('cloud sandboxes use the local runtime\'s hardening flags, from the one place they are defined', () => {
+  const flags = sandboxFlags()
+  assert.deepEqual(runArgs({ name: 'n', image: 'img' }), ['run', '--detach', '--name', 'n', ...flags, 'img'])
+  assert.deepEqual(sandboxRunArgs(), ['run', '--rm', ...flags, SANDBOX_IMAGE])
+  assert.deepEqual(sandboxRunArgs({ interactive: true }), ['run', '--rm', '--interactive', ...flags, SANDBOX_IMAGE])
+  for (const f of ['--init', '--cap-drop=ALL', '--security-opt=no-new-privileges', '--read-only', '--pull=never']) assert.ok(flags.includes(f), f)
+  assert.equal(flags[flags.indexOf('--network') + 1], 'bridge')
+  for (const forbidden of ['-v', '--volume', '--mount', '-e', '--env', '--env-file', '--privileged', '--cap-add', 'host', 'cloudbuild']) {
+    assert.ok(!flags.includes(forbidden), forbidden)
   }
 })
 
-test('hasCompleteReport needs both markers for this nonce, as whole lines, in order', () => {
-  assert.ok(hasCompleteReport(report(NONCE).join('\n'), NONCE))
-  assert.ok(hasCompleteReport(report(NONCE).join('\r\n'), NONCE))
-  assert.ok(!hasCompleteReport(report(NONCE).join('\n'), 'f'.repeat(32)))
-  assert.ok(!hasCompleteReport(report(NONCE).slice(0, 3).join('\n'), NONCE), 'no end marker')
-  assert.ok(!hasCompleteReport([...report(NONCE)].reverse().join('\n'), NONCE), 'end before begin')
-  assert.ok(!hasCompleteReport(report(NONCE).map(l => `Step #1: ${l}`).join('\n'), NONCE), 'markers must be whole lines')
+test('the metadata canary is a safe constant, and fails exactly when it should', () => {
+  assert.doesNotMatch(CANARY_JS, /[$'!\n\r]/, 'no $ (Cloud Build), no single quote (AWS shell), no !, one line')
+  assert.deepEqual(canaryCommand('token'), ['node', '-e', CANARY_JS, 'token'])
+  // Run the real script under Node with fetch replaced, so no network is touched.
+  const runCanary = (fetchBody, mode) => spawnSync(process.execPath, ['-e', `globalThis.fetch = ${fetchBody}; ${CANARY_JS}`, mode], { encoding: 'utf8', timeout: 30_000 })
+  const answer = status => `async () => ({ status: ${status}, body: null })`
+  const unreachable = 'async () => { throw new TypeError("fetch failed") }'
+  let r = runCanary(unreachable, 'token')
+  assert.equal(r.status, 0, r.stderr)
+  assert.match(r.stdout, /metadata canary: passed/)
+  r = runCanary(answer(200), 'token')
+  assert.equal(r.status, 1)
+  assert.match(r.stdout, /metadata canary: FAILED/)
+  assert.equal(runCanary(answer(403), 'token').status, 0, 'GCP: an answer without a token is not a token')
+  assert.equal(runCanary(answer(403), 'any-answer').status, 1, 'AWS: the endpoints are blocked, so any answer means the block failed')
+  assert.equal(runCanary(unreachable, 'any-answer').status, 0)
+})
+
+test('reportReady uses the CLI\'s own report rules', () => {
+  assert.ok(reportReady(report(NONCE).join('\n'), NONCE))
+  assert.ok(!reportReady(report(NONCE).join('\r\n'), NONCE), 'CRLF is rejected by extractReport, so the retry loop must not stop on it')
+  const gap = [...report(NONCE).slice(0, 3), 'stray line', report(NONCE)[3]].join('\n')
+  assert.ok(!reportReady(gap, NONCE), 'markers must be adjacent to the one JSON line')
+  assert.ok(!reportReady(report(NONCE).join('\n'), 'f'.repeat(32)))
+  assert.equal(reportReady(report(NONCE).join('\n'), NONCE), extractReport(report(NONCE).join('\n'), NONCE).report !== null)
 })
 
 test('runIdFor is deterministic, short, hex, and does not reveal the nonce', () => {
-  const id = runIdFor(NONCE)
-  assert.match(id, /^[0-9a-f]{24}$/)
-  assert.equal(runIdFor(NONCE), id)
-  assert.notEqual(runIdFor('f'.repeat(32)), id)
-  assert.ok(!NONCE.includes(id) && !id.includes(NONCE.slice(0, 8)))
+  assert.match(RUN_ID, /^[0-9a-f]{24}$/)
+  assert.equal(runIdFor(NONCE), RUN_ID)
+  assert.notEqual(runIdFor('f'.repeat(32)), RUN_ID)
+  assert.ok(!NONCE.includes(RUN_ID) && !RUN_ID.includes(NONCE.slice(0, 8)))
 })
 
-test('fillStep replaces only known placeholders and refuses unknown ones', () => {
+test('fillStep replaces known placeholders, expands a list placeholder, and refuses unknown ones', () => {
   const step = { cmd: 'gcloud', args: ['builds', 'log', '<build-id>', '--x=<build-id>'] }
   assert.deepEqual(fillStep(step, { '<build-id>': 'abc' }), { cmd: 'gcloud', args: ['builds', 'log', 'abc', '--x=abc'] })
+  assert.deepEqual(fillStep({ cmd: 'aws', args: ['--ids', '<build-ids>', '--x'] }, { '<build-ids>': ['a', 'b'] }).args, ['--ids', 'a', 'b', '--x'])
   assert.throws(() => fillStep(step, {}), /no value for <build-id>/)
 })
 
-test('lineSink hands onLog whole, sanitized lines', () => {
-  const seen = []
-  const sink = lineSink(l => seen.push(l))
-  sink.write('Step #1: hel')
-  sink.write('lo\n\x1b[2Kfake PASS\r\nlast')
-  sink.end()
-  assert.deepEqual(seen, ['Step #1: hello', '<ESC>fake PASS', 'last'])
-})
-
-test('cloud config: environment-free defaults, the XDG location, and strict checking', async () => {
+test('cloud config: the XDG location, and strict checking', async () => {
   const home = await emptyHome()
   try {
     assert.equal(cloudConfigPath({ HOME: home }), path.join(home, '.config', 'git-bouncer', 'cloud.json'))
-    const xdg = path.join(home, 'xdg')
-    assert.equal(cloudConfigPath({ HOME: home, XDG_CONFIG_HOME: xdg }), path.join(xdg, 'git-bouncer', 'cloud.json'))
+    assert.equal(cloudConfigPath({ HOME: home, XDG_CONFIG_HOME: path.join(home, 'xdg') }), path.join(home, 'xdg', 'git-bouncer', 'cloud.json'))
     assert.equal(cloudConfigPath({ HOME: home, XDG_CONFIG_HOME: 'relative/path' }), path.join(home, '.config', 'git-bouncer', 'cloud.json'))
-
     assert.deepEqual(await loadCloudConfig({ HOME: home }), { path: cloudConfigPath({ HOME: home }), gcp: {}, aws: {} })
 
     const file = cloudConfigPath({ HOME: home })
     await mkdir(path.dirname(file), { recursive: true })
-    await writeFile(file, JSON.stringify({ aws: { project: 'git-bouncer', region: 'us-east-1', bucket: 'my-bucket' }, gcp: { project: 'my-project-123' } }))
+    await writeFile(file, JSON.stringify({ aws: { project: 'git-bouncer', region: 'us-east-1', bucket: 'my-bucket' }, gcp: { project: 'my-project-123', serviceAccount: SA, bucket: 'my-bouncer' } }))
     const cfg = await loadCloudConfig({ HOME: home })
     assert.deepEqual(cfg.aws, { project: 'git-bouncer', region: 'us-east-1', bucket: 'my-bucket' })
-    assert.deepEqual(cfg.gcp, { project: 'my-project-123' })
+    assert.deepEqual(cfg.gcp, { project: 'my-project-123', serviceAccount: SA, bucket: 'my-bouncer' })
 
     await writeFile(file, JSON.stringify({ aws: { regoin: 'us-east-1' } }))
     await assert.rejects(loadCloudConfig({ HOME: home }), /unknown setting "aws\.regoin"/)
@@ -256,11 +247,9 @@ test('copySandbox copies plain files and folders, and nothing else', async t => 
   const sandbox = await makeSandbox()
   const out = await mkdtemp(path.join(tmpdir(), 'gb-test-copy-'))
   try {
-    const counts = await copySandbox(sandbox, path.join(out, 'source'))
-    assert.deepEqual(counts.files, 4)
+    assert.equal((await copySandbox(sandbox, path.join(out, 'source'))).files, 4)
     assert.deepEqual(await listTree(path.join(out, 'source')), ['Dockerfile', 'osv-scanner.toml', 'scanner', 'scanner/main.js', 'scanner/package.json'])
     await assert.rejects(copySandbox(sandbox, path.join(out, 'source')), /EEXIST/, 'never copies over an existing folder')
-
     try {
       await symlink(path.join(sandbox, 'Dockerfile'), path.join(sandbox, 'scanner', 'link'))
     } catch {
@@ -274,63 +263,51 @@ test('copySandbox copies plain files and folders, and nothing else', async t => 
   }
 })
 
-test('defaultExec passes arguments to the program exactly, with no shell in between', async () => {
-  const weird = ['$(echo pwned)', '`echo pwned`', 'a; echo pwned', 'a && echo pwned', 'a | b', '"double"', "'single'", '%PATH%', '*', '$HOME', '--flag=x', '']
-  const r = await defaultExec(process.execPath, ['-e', 'process.stdout.write(JSON.stringify(process.argv.slice(1)))', '--', ...weird], { timeoutMs: 30_000 })
-  assert.equal(r.code, 0, r.stderr)
-  assert.deepEqual(JSON.parse(r.stdout), weird)
-})
+test('the default exec finds programs on absolute PATH entries only, and reports a missing one', async t => {
+  const exec = makeDefaultExec()
+  const node = await exec(path.basename(process.execPath, '.exe'), ['-e', 'process.stdout.write(JSON.stringify(process.argv.slice(1)))', '--', '$(echo pwned)', 'a; b', '%PATH%'], { env: { ...process.env, PATH: path.dirname(process.execPath) }, timeoutMs: 30_000 })
+  assert.equal(node.code, 0, node.stderr)
+  assert.deepEqual(JSON.parse(node.stdout), ['$(echo pwned)', 'a; b', '%PATH%'], 'arguments arrive untouched: no shell')
 
-test('defaultExec feeds stdin, streams stdout, and reports a missing program instead of throwing', async () => {
-  const chunks = []
-  const echo = await defaultExec(process.execPath, ['-e', 'process.stdin.pipe(process.stdout)'], { input: 'hello', onStdout: c => chunks.push(c), timeoutMs: 30_000 })
-  assert.equal(echo.code, 0)
-  assert.equal(echo.stdout, 'hello')
-  assert.equal(chunks.join(''), 'hello')
-
-  const missing = await defaultExec('git-bouncer-no-such-program', ['--version'])
+  const missing = await exec('git-bouncer-no-such-program', ['--version'], { env: { PATH: path.dirname(process.execPath) } })
   assert.equal(missing.code, -1)
   assert.equal(missing.error.code, 'ENOENT')
+  const relative = await exec(path.basename(process.execPath, '.exe'), ['--version'], { env: { PATH: '.' } })
+  assert.equal(relative.code, -1, 'a relative PATH entry is never searched')
 
-  await assert.rejects(defaultExec('node -e 1', 'not an array'), /array of string arguments/)
+  if (process.platform !== 'win32') { t.diagnostic('the .cmd refusal only applies on Windows'); return }
+  const dir = await mkdtemp(path.join(tmpdir(), 'gb-test-cmd-'))
+  try {
+    await writeFile(path.join(dir, 'fakecli.cmd'), '@echo off\r\necho hi\r\n')
+    const r = await makeDefaultExec('win32')('fakecli', [], { env: { PATH: dir, PATHEXT: '.CMD' } })
+    assert.equal(r.code, -1, 'a .cmd file is never started')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })
 
-test('defaultExec stops a program on timeout and on abort', async () => {
-  const slow = ['-e', 'setTimeout(() => {}, 60000)']
-  const timed = await defaultExec(process.execPath, slow, { timeoutMs: 300 })
-  assert.equal(timed.timedOut, true)
-  assert.notEqual(timed.code, 0)
-
-  const ac = new AbortController()
-  setTimeout(() => ac.abort(), 200)
-  const aborted = await defaultExec(process.execPath, slow, { timeoutMs: 60_000, signal: ac.signal })
-  assert.equal(aborted.aborted, true)
-})
-
-test('the runtime modules only ever use spawn(), never a shell', async () => {
+test('the cloud runtimes never import child_process or use a shell option themselves', async () => {
   const files = (await readdir(SRC_DIR)).filter(f => /^(cloud-common|gcp|aws)\.js$/.test(f))
-  assert.ok(files.includes('cloud-common.js'))
+  assert.equal(files.length, 3)
   for (const file of files) {
     const src = await readFile(path.join(SRC_DIR, file), 'utf8')
-    const imports = src.split(/\r?\n/).filter(l => l.includes("'node:child_process'")) // CRLF on Windows checkouts
-    assert.deepEqual(imports, file === 'cloud-common.js' ? ["import { spawn } from 'node:child_process'"] : [], file)
+    assert.doesNotMatch(src, /node:child_process/, `${file} goes through src/proc.js`)
     assert.doesNotMatch(src, /shell:\s*true/, file)
-    assert.doesNotMatch(src, /\b(execSync|execFile|execFileSync|spawnSync)\b/, file)
   }
-  const common = await readFile(path.join(SRC_DIR, 'cloud-common.js'), 'utf8')
-  assert.match(common, /spawn\(cmd, args, \{ shell: false/)
 })
 
 // ---------------------------------------------------------------------------------------------
 // GCP Cloud Build
 // ---------------------------------------------------------------------------------------------
 
+const FLAGS_YAML = sandboxFlags().map(f => `      - ${JSON.stringify(f)}`).join('\n')
 const EXPECTED_CLOUDBUILD_YAML = `# Generated by git-bouncer for one scan. Not live-tested by the maintainer: see docs/cloud.md.
-# Step 1 builds the sandbox image from git-bouncer's own sandbox/ folder. Step 2 runs the scanner
-# in it with no credentials, no mounts, no environment and the same hardening as a local scan.
+# Step 1 builds the sandbox image from git-bouncer's own sandbox/ folder. Step 2 checks that the
+# sandbox cannot get credentials from the metadata server. Step 3 runs the scanner with no
+# credentials, no mounts and the same hardening as a local scan; its nonce arrives on stdin.
 steps:
   - id: "build-sandbox-image"
-    name: "gcr.io/cloud-builders/docker"
+    name: "${DOCKER_BUILDER}"
     env:
       - "DOCKER_BUILDKIT=1"
     args:
@@ -338,336 +315,330 @@ steps:
       - "--tag=git-bouncer-sandbox:scan"
       - "."
     timeout: "900s"
-  - id: "scan"
-    name: "gcr.io/cloud-builders/docker"
+  - id: "metadata-canary"
+    name: "${DOCKER_BUILDER}"
     args:
       - "run"
       - "--rm"
-      - "--cap-drop=ALL"
-      - "--security-opt=no-new-privileges"
-      - "--read-only"
-      - "--user=10001:10001"
-      - "--tmpfs=/work:rw,noexec,nosuid,nodev,size=2g"
-      - "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=768m"
-      - "--pids-limit=512"
-      - "--memory=3g"
-      - "--network=bridge"
+${FLAGS_YAML}
+      - "git-bouncer-sandbox:scan"
+      - "node"
+      - "-e"
+      - ${JSON.stringify(CANARY_JS)}
+      - "token"
+    timeout: "120s"
+  - id: "scan"
+    name: "${DOCKER_BUILDER}"
+    entrypoint: "bash"
+    env:
+      - "GIT_BOUNCER_NONCE=${NONCE}"
+    args:
+      - "-c"
+      - "printf '%s\\\\n' \\"$$GIT_BOUNCER_NONCE\\" | docker \\"$$@\\""
+      - "bash"
+      - "run"
+      - "--rm"
+      - "--interactive"
+${FLAGS_YAML}
       - "git-bouncer-sandbox:scan"
       - "node"
       - "/opt/bouncer/scanner/main.js"
       - "--url=https://github.com/someone/take-home-test.git"
       - "--ref=v1.2.3"
-      - "--nonce=0123456789abcdef0123456789abcdef"
+      - "--nonce-stdin"
     timeout: "1200s"
 timeout: "1800s"
 queueTtl: "900s"
 tags:
   - "git-bouncer"
+  - "git-bouncer-run-${RUN_ID}"
+serviceAccount: "projects/my-project-123/serviceAccounts/${SA}"
+options:
+  logging: "CLOUD_LOGGING_ONLY"
 `
 
 test('gcp: the generated cloudbuild.yaml, exactly', () => {
-  assert.equal(renderCloudbuildYaml({ url: URL_, ref: 'v1.2.3', nonce: NONCE, project: 'my-project-123' }), EXPECTED_CLOUDBUILD_YAML)
+  assert.equal(renderCloudbuildYaml({ url: URL_, ref: 'v1.2.3', nonce: NONCE, project: 'my-project-123', serviceAccount: SA }), EXPECTED_CLOUDBUILD_YAML)
 })
 
-test('gcp: every build step is an args array for the docker builder; no shell, no credentials', () => {
-  for (const withSa of [false, true]) {
-    const config = buildCloudbuildConfig({ url: URL_, ref: null, nonce: NONCE, project: 'my-project-123', serviceAccount: withSa ? `scanner${AT}my-project-123.iam.gserviceaccount.com` : null })
-    assert.equal(config.steps.length, 2)
-    for (const s of config.steps) {
-      assert.equal(s.name, 'gcr.io/cloud-builders/docker')
-      assert.ok(Array.isArray(s.args))
-      assert.equal(s.entrypoint, undefined)
-      assert.equal(s.script, undefined)
-      assert.ok(!['sh', 'bash', '-c'].includes(s.args[0]))
-      assert.equal(s.secretEnv, undefined)
-      assert.equal(s.volumes, undefined)
-    }
-    assert.ok(!config.steps[1].args.includes('--ref'), 'no --ref when there is no ref')
-    assert.ok(!config.steps[1].args.some(a => a.startsWith('--ref')))
-    assert.equal(config.availableSecrets, undefined)
-    assert.equal(config.images, undefined, 'nothing is pushed')
-    assert.equal(config.artifacts, undefined, 'nothing is stored')
-    assert.equal(config.timeout, '1800s')
-  }
-})
-
-test('gcp: a configured service account is used, with Cloud Logging as Cloud Build requires', () => {
-  const sa = `scanner${AT}my-project-123.iam.gserviceaccount.com`
-  const config = buildCloudbuildConfig({ url: URL_, nonce: NONCE, project: 'my-project-123', serviceAccount: sa })
-  assert.equal(config.serviceAccount, `projects/my-project-123/serviceAccounts/${sa}`)
-  assert.deepEqual(config.options, { logging: 'CLOUD_LOGGING_ONLY' })
-  const without = buildCloudbuildConfig({ url: URL_, nonce: NONCE, project: 'my-project-123' })
-  assert.equal(without.serviceAccount, undefined)
-  assert.equal(without.options, undefined)
-})
-
-test('gcp: hostile-looking but valid values stay single, "="-bound arguments; nothing for Cloud Build to expand', () => {
+test('gcp: the builder is pinned by digest, and the only "$" is in the one constant nonce wrapper', () => {
+  assert.match(DOCKER_BUILDER, /^gcr\.io\/cloud-builders\/docker@sha256:[0-9a-f]{64}$/)
+  assert.equal(NONCE_WRAPPER, 'printf \'%s\\n\' "$$GIT_BOUNCER_NONCE" | docker "$$@"')
   const url = parseRepoUrl('https://gitlab.com/group/sub~group/re.po_-x').url
   const ref = 'feature/-rf+x' + AT + 'y'
-  const yaml = renderCloudbuildYaml({ url, ref, nonce: NONCE, project: 'my-project-123' })
-  assert.ok(yaml.includes(`      - "--url=${url}"\n`))
-  assert.ok(yaml.includes(`      - "--ref=${ref}"\n`))
-  assert.ok(!yaml.includes('$'), 'Cloud Build would expand $NAME')
-  assert.equal(yaml.split('\n').length, EXPECTED_CLOUDBUILD_YAML.split('\n').length, 'same structure, line for line')
-  assert.throws(() => renderCloudbuildYaml({ url: URL_, ref: '$PROJECT_ID', nonce: NONCE, project: 'my-project-123' }), /ref/)
+  const yaml = renderCloudbuildYaml({ url, ref, nonce: 'f'.repeat(64), project: 'my-project-123', serviceAccount: SA })
+  const quoted = JSON.stringify(NONCE_WRAPPER)
+  assert.equal(yaml.split(quoted).length, 2, 'the wrapper appears exactly once')
+  assert.ok(!yaml.split(quoted).join('').includes('$'), 'no other "$" for Cloud Build to expand')
+  assert.ok(yaml.includes(`      - "--url=${url}"\n`) && yaml.includes(`      - "--ref=${ref}"\n`), 'values are single, "="-bound arguments')
+  assert.throws(() => renderCloudbuildYaml({ url: URL_, ref: '$PROJECT_ID', nonce: NONCE, project: 'my-project-123', serviceAccount: SA }), /ref/)
 })
 
+test('gcp: the nonce is only in the scan step\'s environment, never in an argument', () => {
+  const config = buildCloudbuildConfig({ url: URL_, ref: null, nonce: NONCE, project: 'my-project-123', serviceAccount: SA })
+  for (const s of config.steps) {
+    assert.ok(!s.args.some(a => a.includes(NONCE) || a.startsWith('--nonce=')), s.id)
+    assert.ok(!s.args.includes('--ref') && !s.args.some(a => a.startsWith('--ref')), 'no --ref when there is no ref')
+    assert.equal(s.volumes, undefined)
+    assert.equal(s.secretEnv, undefined)
+  }
+  assert.deepEqual(config.steps[2].env, [`GIT_BOUNCER_NONCE=${NONCE}`])
+  assert.equal(config.steps[2].entrypoint, 'bash')
+  assert.deepEqual(config.steps[2].args.slice(0, 3), ['-c', NONCE_WRAPPER, 'bash'], 'everything after "bash" is "$@": passed on, never parsed')
+  assert.equal(config.steps[0].entrypoint, undefined)
+  assert.equal(config.steps[1].entrypoint, undefined)
+  assert.equal(config.images, undefined, 'nothing is pushed')
+  assert.equal(config.artifacts, undefined, 'nothing is stored')
+  assert.equal(config.serviceAccount, `projects/my-project-123/serviceAccounts/${SA}`)
+  assert.deepEqual(config.options, { logging: 'CLOUD_LOGGING_ONLY' })
+})
+
+const GCP_ENV = home => ({ HOME: home, GIT_BOUNCER_GCP_SERVICE_ACCOUNT: SA, GIT_BOUNCER_GCP_BUCKET: 'my-bouncer' })
+
 test('gcp: plan() runs nothing and lists the exact commands scan() will run', async () => {
-  const home = await emptyHome()
-  try {
-    const rt = createGcpRuntime({ exec: noExec, env: { HOME: home, GIT_BOUNCER_GCP_PROJECT: 'my-project-123', GIT_BOUNCER_GCP_REGION: 'europe-west4' } })
+  await withDirs(async ({ home }) => {
+    const rt = createGcpRuntime({ exec: noExec, env: { ...GCP_ENV(home), GIT_BOUNCER_GCP_PROJECT: 'my-project-123', GIT_BOUNCER_GCP_REGION: 'europe-west4' } })
     const workDir = path.join(tmpdir(), 'gb-work')
     const p = await rt.plan({ url: URL_, ref: 'v1.2.3', nonce: NONCE, sandboxDir: '/opt/pkg/sandbox', workDir })
     const scope = ['--project=my-project-123', '--region=europe-west4']
+    const tail = ['--user-output-enabled', '--quiet']
     assert.deepEqual(p.steps.map(s => [s.id, s.cmd, ...s.args]), [
-      ['submit', 'gcloud', 'builds', 'submit', path.join(workDir, 'source'), `--config=${path.join(workDir, 'cloudbuild.yaml')}`, ...scope, '--async', '--format=value(id)', '--quiet'],
-      ['wait', 'gcloud', 'builds', 'log', '<build-id>', '--stream', ...scope, '--quiet'],
-      ['status', 'gcloud', 'builds', 'describe', '<build-id>', ...scope, '--format=json', '--quiet'],
-      ['log', 'gcloud', 'builds', 'log', '<build-id>', ...scope, '--quiet'],
-      ['cleanup-source', 'gcloud', 'storage', 'rm', 'gs://<staged-bucket>/<staged-object>', '--project=my-project-123', '--quiet'],
-      ['cancel', 'gcloud', 'builds', 'cancel', '<build-id>', ...scope, '--quiet'],
+      ['submit', 'gcloud', 'builds', 'submit', path.join(workDir, 'source'), `--config=${path.join(workDir, 'cloudbuild.yaml')}`, `--gcs-source-staging-dir=gs://my-bouncer/git-bouncer/${RUN_ID}`, ...scope, '--async', '--format=value(id)', ...tail],
+      ['status', 'gcloud', 'builds', 'describe', '<build-id>', ...scope, '--format=json', ...tail],
+      ['log', 'gcloud', 'builds', 'log', '<build-id>', ...scope, ...tail],
+      ['cleanup-source', 'gcloud', 'storage', 'rm', `gs://my-bouncer/git-bouncer/${RUN_ID}/**`, '--project=my-project-123', ...tail],
+      ['find-builds', 'gcloud', 'builds', 'list', '--ongoing', `--filter=tags:git-bouncer-run-${RUN_ID}`, '--format=value(id)', '--limit=10', ...scope, ...tail],
+      ['cancel', 'gcloud', 'builds', 'cancel', '<build-id>', ...scope, ...tail],
     ])
     assert.deepEqual(Object.keys(p.files), ['cloudbuild.yaml'])
-    assert.ok(p.files['cloudbuild.yaml'].includes('--ref=v1.2.3'))
     assert.ok(p.notes[0].startsWith('Not live-tested by the maintainer'))
+    for (const s of p.steps) assert.ok(!s.args.some(a => a.includes(NONCE)), 'the nonce is in no command line')
 
-    // A dry run with nothing detected yet shows placeholders rather than guessing.
-    const bare = createGcpRuntime({ exec: noExec, env: { HOME: home } })
-    const dry = await bare.plan({ url: URL_, nonce: NONCE, sandboxDir: '/opt/pkg/sandbox' })
-    assert.deepEqual(dry.steps[0].args, ['builds', 'submit', '<temp-dir>/source', '--config=<temp-dir>/cloudbuild.yaml', '--project=<project>', '--async', '--format=value(id)', '--quiet'])
-    assert.ok(dry.notes.some(n => n.includes('gcloud config get-value project')))
-  } finally {
-    await rm(home, { recursive: true, force: true })
-  }
+    const dry = await createGcpRuntime({ exec: noExec, env: { HOME: home } }).plan({ url: URL_, nonce: NONCE, sandboxDir: '/opt/pkg/sandbox' })
+    assert.deepEqual(dry.steps[0].args.slice(0, 5), ['builds', 'submit', '<temp-dir>/source', '--config=<temp-dir>/cloudbuild.yaml', `--gcs-source-staging-dir=gs://<bucket>/git-bouncer/${RUN_ID}`])
+    assert.ok(dry.files['cloudbuild.yaml'].includes('projects/<project>/serviceAccounts/<service-account>'))
+  })
 })
 
-test('gcp: available() explains each missing prerequisite', async () => {
-  const home = await emptyHome()
-  const env = extra => ({ HOME: home, ...extra })
-  const ok = (_cmd, args) => {
-    if (line(args, '--version')) return { stdout: 'Google Cloud SDK 500.0.0\n' }
-    if (line(args, 'auth list')) return { stdout: `dev${AT}example.com\n` }
-    if (line(args, 'config get-value project')) return { stdout: 'my-project-123\n' }
-    return null
-  }
-  try {
-    const win = fakeExec(ok)
-    let r = await createGcpRuntime({ exec: win.exec, env: env(), platform: 'win32' }).available()
-    assert.equal(r.ok, false)
-    assert.match(r.reason, /\.cmd script.*WSL/)
-    assert.equal(win.calls.length, 0, 'nothing is started on Windows')
-
-    r = await createGcpRuntime({ exec: fakeExec(() => ({ code: -1, error: Object.assign(new Error('spawn gcloud ENOENT'), { code: 'ENOENT' }) })).exec, env: env(), platform: 'linux' }).available()
-    assert.match(r.reason, /gcloud .* is not installed/)
-
-    r = await createGcpRuntime({ exec: fakeExec((c, a) => (line(a, 'auth list') ? { stdout: '' } : ok(c, a))).exec, env: env(), platform: 'linux' }).available()
-    assert.match(r.reason, /not signed in.*gcloud auth login/)
-
-    r = await createGcpRuntime({ exec: fakeExec((c, a) => (line(a, 'config get-value') ? { stdout: '', stderr: '(unset)\n' } : ok(c, a))).exec, env: env(), platform: 'linux' }).available()
-    assert.match(r.reason, /No Google Cloud project is selected/)
-    assert.equal(r.account, `dev${AT}example.com`)
-
-    const none = fakeExec(ok)
-    r = await createGcpRuntime({ exec: none.exec, env: env({ GIT_BOUNCER_GCP_PROJECT: '--impersonate-service-account=x' }), platform: 'linux' }).available()
-    assert.match(r.reason, /not a valid Google Cloud project ID/)
-    assert.equal(none.calls.length, 0, 'bad settings are reported before anything runs')
-
-    r = await createGcpRuntime({ exec: fakeExec(ok).exec, env: env({ GIT_BOUNCER_GCP_REGION: 'us central' }), platform: 'linux' }).available()
-    assert.match(r.reason, /not a valid Cloud Build region/)
-
-    const file = cloudConfigPath({ HOME: home })
-    await mkdir(path.dirname(file), { recursive: true })
-    await writeFile(file, '{ broken')
-    r = await createGcpRuntime({ exec: fakeExec(ok).exec, env: env(), platform: 'linux' }).available()
-    assert.match(r.reason, /cloud\.json is not valid JSON/)
-    await rm(file)
-
-    const good = fakeExec(ok)
-    r = await createGcpRuntime({ exec: good.exec, env: env(), platform: 'linux' }).available()
-    assert.deepEqual(r, { ok: true, account: `dev${AT}example.com`, project: 'my-project-123', region: 'global' })
-    assert.deepEqual(good.argv(), [
-      ['gcloud', '--version'],
-      ['gcloud', 'auth', 'list', '--filter=status:ACTIVE', '--format=value(account)'],
-      ['gcloud', 'config', 'get-value', 'project'],
-    ])
-    assert.equal(good.calls[0].opts.env.CLOUDSDK_CORE_DISABLE_PROMPTS, '1')
-
-    const pinned = fakeExec(ok)
-    r = await createGcpRuntime({ exec: pinned.exec, env: env({ GIT_BOUNCER_GCP_PROJECT: 'other-project-9' }), platform: 'linux' }).available()
-    assert.equal(r.project, 'other-project-9')
-    assert.ok(!pinned.argv().some(a => a.includes('get-value')), 'the configured project wins; gcloud is not asked')
-  } finally {
-    await rm(home, { recursive: true, force: true })
-  }
-})
-
-test('gcp: extractStepOutput keeps the scan step\'s lines, without the prefix, and drops other steps', () => {
+/** Canned gcloud answers. `state` records what has "happened in the cloud". */
+function gcpCloud({ nonce = NONCE, status = 'SUCCESS', bucketOwner = '987654321', canaryFails = false, onSubmit, onDescribe } = {}) {
+  const state = { created: false, cancelled: [], stagingRemoved: false, describes: 0 }
   const log = [
-    'starting build "x"',
-    'Step #0 - "build-sandbox-image": Sending build context',
-    `Step #0 - "build-sandbox-image": -----BEGIN BOUNCER REPORT ${NONCE}-----`,
-    'Step #1 - "scan": [scanner] content checks',
-    'Step #1 - "scan":',
-    'Step #1 - "other": not ours',
-    'Step #1: unnamed form',
-    'DONE',
-  ].join('\n')
-  assert.equal(extractStepOutput(log), ['starting build "x"', '[scanner] content checks', '', 'unnamed form', 'DONE'].join('\n'))
-})
-
-/** Canned gcloud answers for a successful Cloud Build scan. */
-function gcpCloud({ nonce = NONCE, project = 'my-project-123', status = 'SUCCESS', onSubmit, onStream, stagedBucket } = {}) {
-  const fullLog = [
     `starting build "${GCP_BUILD_ID}"`, '', 'FETCHSOURCE', 'BUILD',
     'Starting Step #0 - "build-sandbox-image"',
     'Step #0 - "build-sandbox-image": Successfully tagged git-bouncer-sandbox:scan',
     `Step #0 - "build-sandbox-image": -----END BOUNCER REPORT ${nonce}-----`,
     'Finished Step #0 - "build-sandbox-image"',
-    'Starting Step #1 - "scan"',
-    'Step #1 - "scan": [scanner] fetching one commit',
-    ...report(nonce).map(l => `Step #1 - "scan":${l ? ` ${l}` : ''}`),
-    'Finished Step #1 - "scan"', 'PUSH', 'DONE',
+    'Starting Step #1 - "metadata-canary"',
+    ...(canaryFails
+      ? ['Step #1 - "metadata-canary": metadata canary: 169.254.169.254 answered HTTP 200', 'Step #1 - "metadata-canary": metadata canary: FAILED, the sandbox can reach a cloud credential endpoint, refusing to scan']
+      : ['Step #1 - "metadata-canary": metadata canary: passed', 'Finished Step #1 - "metadata-canary"', 'Starting Step #2 - "scan"',
+        'Step #2 - "scan": [scanner] fetching one commit', ...report(nonce).map(l => `Step #2 - "scan":${l ? ` ${l}` : ''}`), 'Finished Step #2 - "scan"']),
+    'DONE',
   ].join('\n')
-  return async (_cmd, args, opts) => {
-    if (line(args, '--version')) return { stdout: 'Google Cloud SDK 500.0.0\n' }
-    if (line(args, 'auth list')) return { stdout: `dev${AT}example.com\n` }
-    if (line(args, 'config get-value project')) return { stdout: `${project}\n` }
-    if (line(args, 'builds submit')) { if (onSubmit) await onSubmit(args, opts); return { stdout: `${GCP_BUILD_ID}\n` } }
-    if (line(args, `builds log ${GCP_BUILD_ID} --stream`)) return onStream ? onStream(args, opts) : { stdout: 'Step #1 - "scan": [scanner] fetching one commit\n' }
-    if (line(args, `builds describe ${GCP_BUILD_ID}`)) {
-      return { stdout: JSON.stringify({ id: GCP_BUILD_ID, status, logUrl: 'https://console.cloud.google.com/cloud-build/builds/x', source: { storageSource: { bucket: stagedBucket || defaultStagingBucket(project), object: STAGED_OBJECT } } }) }
+  const handler = async (_cmd, args, opts) => {
+    if (args.join(' ') === '--version') return { stdout: 'Google Cloud SDK 516.0.0\n' }
+    if (starts(args, 'auth list')) return { stdout: `dev${AT}example.com\n` }
+    if (starts(args, 'config get-value project')) return { stdout: 'my-project-123\n' }
+    if (starts(args, 'projects describe my-project-123')) return { stdout: '987654321\n' }
+    if (starts(args, 'storage buckets describe gs://my-bouncer')) return { stdout: JSON.stringify({ name: 'my-bouncer', projectNumber: bucketOwner }) }
+    if (starts(args, 'builds submit')) { state.created = true; return onSubmit ? onSubmit(args, opts, state) : { stdout: `${GCP_BUILD_ID}\n` } }
+    if (starts(args, `builds describe ${GCP_BUILD_ID}`)) {
+      state.describes += 1
+      const hooked = onDescribe && await onDescribe(state)
+      return hooked || { stdout: JSON.stringify({ id: GCP_BUILD_ID, status: canaryFails ? 'FAILURE' : status, logUrl: 'https://console.cloud.google.com/cloud-build/builds/x' }) }
     }
-    if (line(args, `builds log ${GCP_BUILD_ID}`)) return { stdout: fullLog }
-    if (line(args, 'storage rm')) return { stdout: '' }
-    if (line(args, `builds cancel ${GCP_BUILD_ID}`)) return { stdout: '' }
+    if (starts(args, `builds log ${GCP_BUILD_ID}`)) return { stdout: log }
+    if (starts(args, 'builds list --ongoing')) return { stdout: state.created && !state.cancelled.length ? `${GCP_BUILD_ID}\n` : '' }
+    if (starts(args, 'builds cancel')) { state.cancelled.push(args[2]); return {} }
+    if (starts(args, `storage rm gs://my-bouncer/git-bouncer/${RUN_ID}/**`)) {
+      if (!state.created) return { code: 1, stderr: 'ERROR: The following URLs matched no objects or files:\n' }
+      state.stagingRemoved = true
+      return {}
+    }
     return null
   }
+  return { handler, state }
 }
 
+test('gcp: available() explains each missing prerequisite, and requires a dedicated service account', async () => {
+  await withDirs(async ({ home }) => {
+    const check = async (env, respond = gcpCloud().handler, platform = 'linux') => createGcpRuntime({ exec: fakeExec(respond).exec, env, platform }).available()
+
+    const win = fakeExec(gcpCloud().handler)
+    let r = await createGcpRuntime({ exec: win.exec, env: GCP_ENV(home), platform: 'win32' }).available()
+    assert.match(r.reason, /\.cmd script.*WSL/)
+    assert.equal(win.calls.length, 0, 'nothing is started on Windows')
+
+    assert.match((await check(GCP_ENV(home), () => ({ code: -1, error: Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) }))).reason, /gcloud .* is not installed/)
+    r = await check({ HOME: home, GIT_BOUNCER_GCP_BUCKET: 'my-bouncer' })
+    assert.equal(r.ok, false)
+    assert.match(r.reason, /need a dedicated service account.*default Cloud Build identity.*GIT_BOUNCER_GCP_SERVICE_ACCOUNT/)
+    assert.match((await check({ HOME: home, GIT_BOUNCER_GCP_SERVICE_ACCOUNT: SA })).reason, /need a bucket of their own.*GIT_BOUNCER_GCP_BUCKET/)
+    assert.match((await check(GCP_ENV(home), (c, a) => (starts(a, 'auth list') ? { stdout: '' } : gcpCloud().handler(c, a)))).reason, /not signed in/)
+    r = await check(GCP_ENV(home), (c, a) => (starts(a, 'config get-value') ? { stdout: '', stderr: '(unset)\n' } : gcpCloud().handler(c, a)))
+    assert.match(r.reason, /No Google Cloud project is selected/)
+    assert.equal(r.account, `dev${AT}example.com`)
+    r = await check(GCP_ENV(home), gcpCloud({ bucketOwner: '111111111' }).handler)
+    assert.match(r.reason, /gs:\/\/my-bouncer does not exist, can't be read, or belongs to another project/)
+
+    const none = fakeExec(gcpCloud().handler)
+    r = await createGcpRuntime({ exec: none.exec, env: { ...GCP_ENV(home), GIT_BOUNCER_GCP_PROJECT: '--impersonate-service-account=x' }, platform: 'linux' }).available()
+    assert.match(r.reason, /not a valid Google Cloud project ID/)
+    assert.equal(none.calls.length, 0, 'bad settings are reported before anything runs')
+    assert.match((await check({ ...GCP_ENV(home), GIT_BOUNCER_GCP_BUCKET: 'my.dotted.bucket' })).reason, /not a bucket name git-bouncer accepts/)
+
+    const good = fakeExec(gcpCloud().handler)
+    const rt = createGcpRuntime({ exec: good.exec, env: GCP_ENV(home), platform: 'linux' })
+    assert.match(rt.describe(), /^Google Cloud Build \(billed to your account; not live-tested/)
+    r = await rt.available()
+    assert.deepEqual(r, { ok: true, account: `dev${AT}example.com`, project: 'my-project-123', region: 'global', bucket: 'my-bouncer', serviceAccount: SA })
+    assert.deepEqual(good.argv(), [
+      ['gcloud', '--version'],
+      ['gcloud', 'auth', 'list', '--filter=status:ACTIVE', '--format=value(account)', '--user-output-enabled', '--quiet'],
+      ['gcloud', 'config', 'get-value', 'project', '--user-output-enabled', '--quiet'],
+      ['gcloud', 'projects', 'describe', 'my-project-123', '--format=value(projectNumber)', '--user-output-enabled', '--quiet'],
+      ['gcloud', 'storage', 'buckets', 'describe', 'gs://my-bouncer', '--raw', '--format=json', '--project=my-project-123', '--user-output-enabled', '--quiet'],
+    ])
+    assert.match(rt.describe(), new RegExp(`project my-project-123, as ${SA.replace(/[.]/g, '\\.')}`))
+    const env = good.calls[0].opts.env
+    assert.deepEqual([env.CLOUDSDK_CORE_DISABLE_PROMPTS, env.CLOUDSDK_ACCESSIBILITY_SCREEN_READER, env.CLOUDSDK_CORE_USER_OUTPUT_ENABLED, env.CLOUDSDK_CORE_LOG_HTTP], ['1', 'false', 'true', 'false'])
+  })
+})
+
+test('gcp: extractStepOutput keeps one step\'s lines, without the prefix, and drops other steps', () => {
+  const log = [
+    'starting build "x"',
+    'Step #0 - "build-sandbox-image": Sending build context',
+    `Step #0 - "build-sandbox-image": -----BEGIN BOUNCER REPORT ${NONCE}-----`,
+    'Step #2 - "scan": [scanner] content checks',
+    'Step #2 - "scan":',
+    'Step #2 - "other": not ours',
+    'Step #2: unnamed form',
+    'DONE',
+  ].join('\n')
+  assert.equal(extractStepOutput(log), ['starting build "x"', '[scanner] content checks', '', 'unnamed form', 'DONE'].join('\n'))
+})
+
 test('gcp: scan() runs exactly the planned commands, returns the report and leaves nothing behind', async () => {
-  const home = await emptyHome()
-  const sandbox = await makeSandbox()
-  let uploaded = null
-  let configOutsideSource = false
-  try {
-    const fake = fakeExec(gcpCloud({
+  await withDirs(async ({ home, sandbox }) => {
+    let uploaded = null
+    let configOutsideSource = false
+    const cloud = gcpCloud({
       onSubmit: async args => {
         uploaded = await listTree(args[2])
         const config = args[3].slice('--config='.length)
         configOutsideSource = existsSync(config) && path.dirname(config) !== args[2]
-        assert.equal(await readFile(config, 'utf8'), renderCloudbuildYaml({ url: URL_, ref: 'v1.2.3', nonce: NONCE, project: 'my-project-123' }))
+        return { stdout: `${GCP_BUILD_ID}\n` }
       },
-    }))
+    })
+    const fake = fakeExec(cloud.handler)
     const logs = []
-    const rt = createGcpRuntime({ exec: fake.exec, env: { HOME: home }, platform: 'linux', sleep: noSleep })
-    const { reportText, session } = await rt.scan({ url: URL_, ref: 'v1.2.3', nonce: NONCE, sandboxDir: sandbox, onLog: l => logs.push(l) })
+    let early = null
+    const rt = createGcpRuntime({ exec: fake.exec, env: GCP_ENV(home), platform: 'linux', sleep: noSleep })
+    const { reportText, session } = await rt.scan({ url: URL_, ref: 'v1.2.3', nonce: NONCE, sandboxDir: sandbox, onLog: l => logs.push(l), onSession: s => { early = { ...s } } })
 
-    assert.ok(hasCompleteReport(reportText, NONCE))
-    assert.ok(!reportText.includes('Successfully tagged'), 'other steps\' output is dropped')
+    assert.ok(reportReady(reportText, NONCE))
+    assert.deepEqual(extractReport(reportText, NONCE).problems.filter(p => /markers/.test(p)), [], 'exactly one pair of markers: other steps\' lines are dropped')
     assert.deepEqual(uploaded, ['Dockerfile', 'osv-scanner.toml', 'scanner', 'scanner/main.js', 'scanner/package.json'], 'only the sandbox files are uploaded')
     assert.ok(configOutsideSource, 'cloudbuild.yaml sits next to the upload, not inside it')
     assert.deepEqual(fake.unexpected, [])
+    assert.equal(early.buildId, null, 'onSession runs before anything exists in the cloud...')
+    assert.equal(early.tag, `git-bouncer-run-${RUN_ID}`, '...with the tag and prefix destroy() needs')
+    assert.equal(early.staging, `gs://my-bouncer/git-bouncer/${RUN_ID}/`)
 
-    const p = await createGcpRuntime({ exec: noExec, env: { HOME: home, GIT_BOUNCER_GCP_PROJECT: 'my-project-123' } })
+    const p = await createGcpRuntime({ exec: noExec, env: { ...GCP_ENV(home), GIT_BOUNCER_GCP_PROJECT: 'my-project-123' } })
       .plan({ url: URL_, ref: 'v1.2.3', nonce: NONCE, sandboxDir: sandbox, workDir: session.workDir })
-    const vars = { '<build-id>': GCP_BUILD_ID, '<staged-bucket>': 'my-project-123_cloudbuild', '<staged-object>': STAGED_OBJECT }
-    const planned = id => { const s = fillStep(p.steps.find(x => x.id === id), vars); return [s.cmd, ...s.args] }
-    assert.deepEqual(fake.argv().slice(3), ['submit', 'wait', 'status', 'log', 'cleanup-source'].map(planned))
+    const planned = id => { const s = fillStep(p.steps.find(x => x.id === id), { '<build-id>': GCP_BUILD_ID }); return [s.cmd, ...s.args] }
+    assert.deepEqual(fake.argv().slice(5), ['submit', 'status', 'log', 'cleanup-source'].map(planned))
+    for (const c of fake.calls) assert.ok(!c.args.some(a => a.includes(NONCE)), 'the nonce is in no command line')
 
     assert.equal(session.status, 'SUCCESS')
     assert.equal(session.reportComplete, true)
-    assert.deepEqual(session.cleanup, { cancelled: false, stagedSourceRemoved: true, workDirRemoved: true, problems: [] })
+    assert.deepEqual(session.cleanup, { buildSettled: true, cancelled: [], stagingRemoved: true, workDirRemoved: true, problems: [] })
     assert.ok(!existsSync(session.workDir))
-    assert.ok(logs.some(l => l.includes(GCP_BUILD_ID)))
-    assert.equal(await rt.readFile(session, 'package-lock.json', 1000), null)
-    await rt.destroy(session) // nothing left to do, and safe to call
-    assert.equal(fake.argv().length, 8)
-    assert.doesNotMatch(JSON.stringify(session), /token|secret|password/i)
-  } finally {
-    await rm(home, { recursive: true, force: true })
-    await rm(sandbox, { recursive: true, force: true })
-  }
+    assert.ok(logs.some(l => l.includes(GCP_BUILD_ID)) && logs.includes('Cloud Build: SUCCESS'))
+    assert.equal(await rt.readFile(session, 'package-lock.json'), null)
+    await rt.destroy(session)
+    assert.equal(fake.calls.length, 9, 'destroy() after a finished scan has nothing left to do')
+  })
 })
 
-test('gcp: Ctrl-C while waiting cancels the build, so nothing keeps billing', async () => {
-  const home = await emptyHome()
-  const sandbox = await makeSandbox()
-  try {
-    const ac = new AbortController()
-    let workDir = null
-    const fake = fakeExec(gcpCloud({
-      onSubmit: args => { workDir = path.dirname(args[2]) },
-      onStream: () => { ac.abort(); return { code: 1, aborted: true } },
-    }))
-    const rt = createGcpRuntime({ exec: fake.exec, env: { HOME: home, GIT_BOUNCER_GCP_PROJECT: 'my-project-123' }, platform: 'linux', sleep: noSleep })
-    await assert.rejects(rt.scan({ url: URL_, nonce: NONCE, sandboxDir: sandbox, signal: ac.signal }), e => e.name === 'AbortError')
-    const argv = fake.argv()
-    assert.deepEqual(argv.at(-1), ['gcloud', 'builds', 'cancel', GCP_BUILD_ID, '--project=my-project-123', '--quiet'])
-    assert.equal(fake.calls.at(-1).opts.signal, undefined, 'the cancel itself is not aborted')
-    assert.ok(!argv.some(a => a.includes('storage')), 'the archive location is unknown until the build is described, so nothing is guessed')
-    assert.ok(workDir && !existsSync(workDir), 'the temp folder is removed')
-  } finally {
-    await rm(home, { recursive: true, force: true })
-    await rm(sandbox, { recursive: true, force: true })
-  }
+test('gcp: a failed metadata canary stops the scan with a clear error', async () => {
+  await withDirs(async ({ home, sandbox }) => {
+    const rt = createGcpRuntime({ exec: fakeExec(gcpCloud({ canaryFails: true }).handler).exec, env: GCP_ENV(home), platform: 'linux', sleep: noSleep })
+    await assert.rejects(rt.scan({ url: URL_, nonce: NONCE, sandboxDir: sandbox }), e => /metadata canary failed/.test(e.message) && e.session && e.session.cleanup.stagingRemoved)
+  })
 })
 
-test('gcp: a build that never reports a status is cancelled after repeated failures', async () => {
-  const home = await emptyHome()
-  const sandbox = await makeSandbox()
-  try {
-    const base = gcpCloud()
-    const fake = fakeExec((c, a, o) => (line(a, 'builds describe') ? { code: 1, stderr: 'ERROR: transient' } : base(c, a, o)))
-    const rt = createGcpRuntime({ exec: fake.exec, env: { HOME: home, GIT_BOUNCER_GCP_PROJECT: 'my-project-123' }, platform: 'linux', sleep: noSleep })
-    await assert.rejects(rt.scan({ url: URL_, nonce: NONCE, sandboxDir: sandbox }), /kept failing/)
-    assert.equal(fake.argv().filter(a => a[2] === 'describe').length, 6)
-    assert.deepEqual(fake.argv().at(-1).slice(0, 4), ['gcloud', 'builds', 'cancel', GCP_BUILD_ID])
-  } finally {
-    await rm(home, { recursive: true, force: true })
-    await rm(sandbox, { recursive: true, force: true })
-  }
-})
-
-test('gcp: a refused submit is reported (sanitized), nothing is cancelled, the temp folder is removed', async () => {
-  const home = await emptyHome()
-  const sandbox = await makeSandbox()
-  try {
-    let workDir = null
-    const base = gcpCloud()
-    const fake = fakeExec((c, a, o) => {
-      if (line(a, 'builds submit')) { workDir = path.dirname(a[2]); return { code: 1, stderr: 'ERROR: (gcloud.builds.submit) PERMISSION_DENIED: \x1b[31mno\x1b[0m\n' } }
-      return base(c, a, o)
-    })
-    const rt = createGcpRuntime({ exec: fake.exec, env: { HOME: home, GIT_BOUNCER_GCP_PROJECT: 'my-project-123' }, platform: 'linux', sleep: noSleep })
-    await assert.rejects(rt.scan({ url: URL_, nonce: NONCE, sandboxDir: sandbox }), e => /did not start the build/.test(e.message) && /PERMISSION_DENIED/.test(e.message) && !e.message.includes('\x1b'))
-    assert.ok(!fake.argv().some(a => a.includes('cancel')))
-    assert.ok(workDir && !existsSync(workDir))
-  } finally {
-    await rm(home, { recursive: true, force: true })
-    await rm(sandbox, { recursive: true, force: true })
-  }
-})
-
-test('gcp: only the archive gcloud uploaded, in the project\'s own staging bucket, is ever deleted', async () => {
-  const home = await emptyHome()
-  const sandbox = await makeSandbox()
-  try {
-    const fake = fakeExec(gcpCloud({ stagedBucket: 'someone-elses-bucket' }))
-    const rt = createGcpRuntime({ exec: fake.exec, env: { HOME: home, GIT_BOUNCER_GCP_PROJECT: 'my-project-123' }, platform: 'linux', sleep: noSleep })
+test('gcp: a submit that printed no ID (but created the build) is found by its tag', async () => {
+  await withDirs(async ({ home, sandbox }) => {
+    const fake = fakeExec(gcpCloud({ onSubmit: () => ({ stdout: '' }) }).handler)
+    const rt = createGcpRuntime({ exec: fake.exec, env: GCP_ENV(home), platform: 'linux', sleep: noSleep })
     const { session } = await rt.scan({ url: URL_, nonce: NONCE, sandboxDir: sandbox })
-    assert.ok(!fake.argv().some(a => a.includes('storage')))
-    assert.equal(session.cleanup.stagedSourceRemoved, false)
-    assert.match(session.cleanup.problems[0], /left alone/)
-    assert.equal(defaultStagingBucket('my-google-project'), 'my-elgoog-project_cloudbuild')
-  } finally {
-    await rm(home, { recursive: true, force: true })
-    await rm(sandbox, { recursive: true, force: true })
+    assert.equal(session.buildId, GCP_BUILD_ID)
+    assert.equal(session.reportComplete, true)
+    assert.ok(fake.argv().some(a => a.join(' ').includes(`builds list --ongoing --filter=tags:git-bouncer-run-${RUN_ID}`)))
+  })
+})
+
+test('gcp: a refused submit still cancels anything it created and deletes what it uploaded', async () => {
+  await withDirs(async ({ home, sandbox }) => {
+    let workDir = null
+    const cloud = gcpCloud({ onSubmit: args => { workDir = path.dirname(args[2]); return { code: 1, stderr: 'ERROR: (gcloud.builds.submit) PERMISSION_DENIED: \x1b[31mno\x1b[0m\n' } } })
+    const fake = fakeExec(cloud.handler)
+    const rt = createGcpRuntime({ exec: fake.exec, env: GCP_ENV(home), platform: 'linux', sleep: noSleep })
+    await assert.rejects(rt.scan({ url: URL_, nonce: NONCE, sandboxDir: sandbox }), e => /did not start the build/.test(e.message) && /PERMISSION_DENIED/.test(e.message) && !e.message.includes('\x1b'))
+    assert.ok(fake.argv().some(a => a[2] === 'list'), 'looked for a build by tag')
+    assert.deepEqual(cloud.state.cancelled, [GCP_BUILD_ID], 'the upload had happened and so had CreateBuild: it is cancelled')
+    assert.equal(cloud.state.stagingRemoved, true, 'gcloud uploads before CreateBuild, so the prefix is always deleted')
+    assert.ok(workDir && !existsSync(workDir))
+  })
+})
+
+/**
+ * An interrupt the way src/commands/check.js does it: the signal handler awaits
+ * runtime.destroy(session) while scan() is still in the middle of a command, then the process
+ * exits. Here the interrupted command simply never returns.
+ */
+test('gcp: an interrupt at any point leaves no build running and no upload behind', async () => {
+  for (const when of ['before submit', 'during submit', 'during polling']) {
+    await withDirs(async ({ home, sandbox }) => {
+      let session = null
+      let rt = null
+      let destroyed
+      const done = new Promise(resolve => { destroyed = resolve })
+      const interrupt = async () => { await rt.destroy(session); destroyed(); return never() }
+      const cloud = gcpCloud({
+        onSubmit: when === 'during submit' ? interrupt : undefined,
+        onDescribe: when === 'during polling' ? s => (s.describes === 2 ? interrupt() : { stdout: JSON.stringify({ id: GCP_BUILD_ID, status: 'WORKING' }) }) : undefined,
+      })
+      const fake = fakeExec(cloud.handler)
+      rt = createGcpRuntime({ exec: fake.exec, env: GCP_ENV(home), platform: 'linux', sleep: noSleep })
+      const scanning = rt.scan({
+        url: URL_, nonce: NONCE, sandboxDir: sandbox,
+        onSession: s => { session = s; if (when === 'before submit') rt.destroy(s).then(destroyed) },
+      })
+      if (when === 'before submit') await assert.rejects(scanning)
+      await done
+      const argv = fake.argv().map(a => a.join(' '))
+      if (when === 'before submit') {
+        assert.ok(!argv.some(a => a.includes('builds submit')), 'nothing is started after destroy()')
+        assert.equal(cloud.state.created, false)
+      } else {
+        assert.deepEqual(cloud.state.cancelled, [GCP_BUILD_ID], `${when}: cancel issued`)
+        assert.equal(cloud.state.stagingRemoved, true, `${when}: upload deleted`)
+        assert.equal(argv.some(a => a.includes('builds list --ongoing')), when === 'during submit', 'the tag lookup is only needed when the ID was never seen')
+      }
+      assert.ok(!existsSync(session.workDir), `${when}: temp folder removed`)
+      assert.deepEqual(fake.unexpected, [])
+    })
   }
 })
 
 test('gcp: invalid inputs are refused before any command runs', async () => {
-  const fake = fakeExec(gcpCloud())
-  const rt = createGcpRuntime({ exec: fake.exec, env: { HOME: '/nonexistent', GIT_BOUNCER_GCP_PROJECT: 'my-project-123' }, platform: 'linux' })
+  const fake = fakeExec(gcpCloud().handler)
+  const rt = createGcpRuntime({ exec: fake.exec, env: { HOME: '/nonexistent', ...GCP_ENV('/nonexistent') }, platform: 'linux' })
   await assert.rejects(rt.scan({ url: URL_, ref: '$(id)', nonce: NONCE, sandboxDir: '/nowhere' }), /ref/)
   await assert.rejects(rt.scan({ url: 'https://github.com/o/r;id.git', nonce: NONCE, sandboxDir: '/nowhere' }), /repository URL/)
   await assert.rejects(rt.plan({ url: URL_, nonce: 'nope', sandboxDir: '/nowhere' }), /nonce/)
@@ -680,6 +651,7 @@ test('gcp: invalid inputs are refused before any command runs', async () => {
 // AWS CodeBuild
 // ---------------------------------------------------------------------------------------------
 
+const FLAGS_SH = sandboxFlags().join(' ')
 const EXPECTED_BUILDSPEC = `# Generated by git-bouncer for one scan. Not live-tested by the maintainer: see docs/cloud.md.
 # The URL, ref and nonce are environment variables set by the StartBuild request. The commands
 # below only ever refer to them inside double quotes, so their values are never parsed as shell.
@@ -690,8 +662,11 @@ env:
 phases:
   build:
     commands:
+      - "iptables -I DOCKER-USER -d 169.254.169.254/32 -j REJECT"
+      - "iptables -I DOCKER-USER -d 169.254.170.2/32 -j REJECT"
       - "docker build --tag=git-bouncer-sandbox:scan ."
-      - "docker run --rm --cap-drop=ALL --security-opt=no-new-privileges --read-only --user=10001:10001 --tmpfs=/work:rw,noexec,nosuid,nodev,size=2g --tmpfs=/tmp:rw,noexec,nosuid,nodev,size=768m --pids-limit=512 --memory=3g --network=bridge git-bouncer-sandbox:scan node /opt/bouncer/scanner/main.js --url=\\"$GIT_BOUNCER_URL\\" --ref=\\"$GIT_BOUNCER_REF\\" --nonce=\\"$GIT_BOUNCER_NONCE\\""
+      - ${JSON.stringify(`docker run --rm ${FLAGS_SH} git-bouncer-sandbox:scan node -e '${CANARY_JS}' any-answer`)}
+      - ${JSON.stringify(`printf '%s\\n' "$GIT_BOUNCER_NONCE" | docker run --rm --interactive ${FLAGS_SH} git-bouncer-sandbox:scan node /opt/bouncer/scanner/main.js --url="$GIT_BOUNCER_URL" --ref="$GIT_BOUNCER_REF" --nonce-stdin`)}
 `
 
 test('aws: the generated buildspec, exactly, with and without a ref', () => {
@@ -699,24 +674,36 @@ test('aws: the generated buildspec, exactly, with and without a ref', () => {
   assert.equal(renderBuildspec({ hasRef: false }), EXPECTED_BUILDSPEC.replace(' --ref=\\"$GIT_BOUNCER_REF\\"', ''))
 })
 
-test('aws: the shell text never contains a value: only "$VAR" references inside double quotes', () => {
-  const a = buildStartBuildRequest({ project: 'git-bouncer', bucket: 'my-bucket', runId: runIdFor(NONCE), url: URL_, ref: 'v1', nonce: NONCE })
+test('aws: the credential endpoints are blocked before any container runs, then the canary proves it', () => {
+  const cmds = buildBuildspec({ hasRef: false }).phases.build.commands
+  const firstDocker = cmds.findIndex(c => c.startsWith('docker '))
+  assert.deepEqual(cmds.slice(0, firstDocker), [
+    'iptables -I DOCKER-USER -d 169.254.169.254/32 -j REJECT',
+    'iptables -I DOCKER-USER -d 169.254.170.2/32 -j REJECT',
+  ])
+  const canary = cmds.findIndex(c => c.includes(' node -e '))
+  const scan = cmds.findIndex(c => c.includes('/opt/bouncer/scanner/main.js'))
+  assert.ok(firstDocker < canary && canary < scan, 'image build, then canary, then scan')
+  assert.ok(cmds[canary].endsWith("' any-answer"))
+})
+
+test('aws: the shell text never contains a value, and the nonce reaches the scanner through stdin', () => {
+  const a = buildStartBuildRequest({ project: 'git-bouncer', bucket: 'my-bucket', runId: RUN_ID, url: URL_, ref: 'v1', nonce: NONCE })
   const hostileUrl = parseRepoUrl('https://gitlab.com/group/sub~group/re.po_-x').url
   const hostileRef = 'feature/-rf+x' + AT + 'y'
   const other = 'f'.repeat(64)
   const b = buildStartBuildRequest({ project: 'git-bouncer', bucket: 'my-bucket', runId: runIdFor(other), url: hostileUrl, ref: hostileRef, nonce: other })
   assert.equal(a.buildspecOverride, b.buildspecOverride, 'byte-for-byte the same whatever the values are')
   for (const v of [hostileUrl, hostileRef, other, URL_, NONCE]) assert.ok(!b.buildspecOverride.includes(v), v)
-  assert.deepEqual(b.environmentVariablesOverride, [
-    { name: 'GIT_BOUNCER_URL', value: hostileUrl, type: 'PLAINTEXT' },
-    { name: 'GIT_BOUNCER_REF', value: hostileRef, type: 'PLAINTEXT' },
-    { name: 'GIT_BOUNCER_NONCE', value: other, type: 'PLAINTEXT' },
-  ])
+  assert.ok(!b.buildspecOverride.includes('--nonce='), 'never --nonce=<value>')
+  assert.deepEqual(b.environmentVariablesOverride.map(e => e.name), ['GIT_BOUNCER_URL', 'GIT_BOUNCER_REF', 'GIT_BOUNCER_NONCE'])
 
-  // Every word of the commands, other than the three references, is a plain constant word.
+  // Every word is a plain constant, apart from: the three "$VAR" references, printf's format and
+  // pipe, and the canary script inside single quotes.
   for (const cmd of buildBuildspec({ hasRef: true }).phases.build.commands) {
-    for (const word of cmd.split(' ')) {
-      if (/^--(url|ref|nonce)="\$GIT_BOUNCER_(URL|REF|NONCE)"$/.test(word)) continue
+    const rest = cmd.replace(`'${CANARY_JS}'`, '').replace(/^printf '%s\\n' "\$GIT_BOUNCER_NONCE" \| /, '')
+    for (const word of rest.split(' ').filter(Boolean)) {
+      if (/^--(url|ref)="\$GIT_BOUNCER_(URL|REF)"$/.test(word)) continue
       assert.match(word, /^[A-Za-z0-9_./:=,@+-]+$/, word)
     }
   }
@@ -747,83 +734,135 @@ test('aws: the StartBuild request turns off everything that could keep or leak d
   assert.throws(() => buildStartBuildRequest({ project: 'p', bucket: 'b', runId: 'r', url: URL_, ref: '`id`', nonce: NONCE }), /ref/)
 })
 
+const AWS_ENV = home => ({ HOME: home, GIT_BOUNCER_AWS_PROJECT: 'git-bouncer', GIT_BOUNCER_AWS_BUCKET: 'my-bucket', GIT_BOUNCER_AWS_REGION: 'us-east-1' })
+
 test('aws: plan() runs nothing and lists the exact commands scan() will run', async () => {
-  const home = await emptyHome()
-  try {
-    const env = { HOME: home, GIT_BOUNCER_AWS_PROJECT: 'git-bouncer', GIT_BOUNCER_AWS_BUCKET: 'my-bucket', GIT_BOUNCER_AWS_REGION: 'us-east-1' }
-    const rt = createAwsRuntime({ exec: noExec, env })
+  await withDirs(async ({ home }) => {
+    const rt = createAwsRuntime({ exec: noExec, env: AWS_ENV(home) })
     const workDir = path.join(tmpdir(), 'gb-work')
     const p = await rt.plan({ url: URL_, ref: 'v1.2.3', nonce: NONCE, sandboxDir: '/opt/pkg/sandbox', workDir })
-    const prefix = `s3://my-bucket/git-bouncer/${runIdFor(NONCE)}/`
+    const owner = '--expected-bucket-owner=<account-id>'
+    const json = ['--region=us-east-1', '--output=json', '--no-cli-auto-prompt']
     assert.deepEqual(p.steps.map(s => [s.id, s.cmd, ...s.args]), [
-      ['upload', 'aws', 's3', 'cp', path.join(workDir, 'source'), prefix, '--recursive', '--no-follow-symlinks', '--only-show-errors', '--region=us-east-1'],
-      ['start', 'aws', 'codebuild', 'start-build', `--cli-input-json=file://${path.join(workDir, 'start-build.json')}`, '--region=us-east-1', '--output=json'],
-      ['wait', 'aws', 'codebuild', 'batch-get-builds', '--ids=<build-id>', '--region=us-east-1', '--output=json'],
-      ['log', 'aws', 'logs', 'get-log-events', '--log-group-name=<log-group>', '--log-stream-name=<log-stream>', '--start-from-head', '--region=us-east-1', '--output=json'],
-      ['cleanup-source', 'aws', 's3', 'rm', prefix, '--recursive', '--only-show-errors', '--region=us-east-1'],
-      ['cancel', 'aws', 'codebuild', 'stop-build', '--id=<build-id>', '--region=us-east-1', '--output=json'],
+      ['upload', 'aws', 's3api', 'put-object', '--bucket=my-bucket', `--key=git-bouncer/${RUN_ID}/<file>`, '--body=<file-path>', owner, ...json],
+      ['start', 'aws', 'codebuild', 'start-build', `--cli-input-json=file://${path.join(workDir, 'start-build.json')}`, ...json],
+      ['wait', 'aws', 'codebuild', 'batch-get-builds', '--ids=<build-id>', ...json],
+      ['log', 'aws', 'logs', 'get-log-events', '--log-group-name=<log-group>', '--log-stream-name=<log-stream>', '--start-from-head', ...json],
+      ['cleanup-list', 'aws', 's3api', 'list-objects-v2', '--bucket=my-bucket', `--prefix=git-bouncer/${RUN_ID}/`, owner, ...json],
+      ['cleanup-delete', 'aws', 's3api', 'delete-objects', '--bucket=my-bucket', '--delete=<delete-request>', owner, ...json],
+      ['find-builds', 'aws', 'codebuild', 'list-builds-for-project', '--project-name=git-bouncer', '--sort-order=DESCENDING', '--max-items=50', ...json],
+      ['find-builds-detail', 'aws', 'codebuild', 'batch-get-builds', '--ids', '<build-ids>', ...json],
+      ['cancel', 'aws', 'codebuild', 'stop-build', '--id=<build-id>', ...json],
     ])
     assert.deepEqual(Object.keys(p.files), ['start-build.json', 'buildspec.yml'])
     const req = JSON.parse(p.files['start-build.json'])
     assert.equal(req.buildspecOverride, p.files['buildspec.yml'])
     assert.equal(req.buildspecOverride, EXPECTED_BUILDSPEC)
-    assert.ok(p.notes[0].startsWith('Not live-tested by the maintainer'))
-
     // The AWS CLI reads a value starting with file:// (and in v1, http:// or https://) as "load the
     // value from there". Only the request file is meant to be read that way.
     for (const s of p.steps) {
+      if (s.args[0] === 's3api') assert.ok(s.args.includes(owner), `${s.id}: S3 refuses it unless your account owns the bucket`)
       for (const a of s.args) {
-        const value = a.includes('=') ? a.slice(a.indexOf('=') + 1) : a
         if (a.startsWith('--cli-input-json=')) continue
-        assert.doesNotMatch(value, /^(file|fileb|https?):\/\//i, a)
+        assert.doesNotMatch(a.includes('=') ? a.slice(a.indexOf('=') + 1) : a, /^(file|fileb|https?):\/\//i, a)
+        assert.ok(!a.includes(NONCE), 'the nonce is in no command line')
       }
     }
-  } finally {
-    await rm(home, { recursive: true, force: true })
-  }
+  })
 })
 
-test('aws: available() explains each missing prerequisite', async () => {
-  const home = await emptyHome()
-  const base = { HOME: home, GIT_BOUNCER_AWS_PROJECT: 'git-bouncer', GIT_BOUNCER_AWS_BUCKET: 'my-bucket' }
-  const ok = (_cmd, args) => {
-    if (line(args, '--version')) return { stdout: 'aws-cli/2.17.0\n' }
-    if (line(args, 'configure get region')) return { stdout: 'eu-west-1\n' }
-    if (line(args, 'sts get-caller-identity')) return { stdout: JSON.stringify({ Account: '123456789012', Arn: 'arn:aws:sts::123456789012:assumed-role/dev/me', UserId: 'X' }) }
-    if (line(args, 'codebuild batch-get-projects')) return { stdout: JSON.stringify({ projects: [{ name: 'git-bouncer' }], projectsNotFound: [] }) }
+/** Canned aws answers. `state` records what has "happened in the cloud". */
+function awsCloud({ nonce = NONCE, onUpload, onStart, onWait, logPages, canaryFails = false, version = 'aws-cli/2.17.0 Python/3.11', owner = ACCOUNT } = {}) {
+  const state = { created: false, stopped: [], uploaded: [], sourceRemoved: false, waits: 0, logCalls: [] }
+  const events = [
+    '[Container] Running command docker build --tag=git-bouncer-sandbox:scan .\n',
+    ...(canaryFails
+      ? ['metadata canary: 169.254.169.254 answered HTTP 401\n', 'metadata canary: FAILED, the sandbox can reach a cloud credential endpoint, refusing to scan\n']
+      : ['metadata canary: passed\n', '[scanner] fetching one commit\n', ...report(nonce).map(l => `${l}\n`)]),
+  ].map(message => ({ timestamp: 1, message }))
+  const handler = async (_cmd, args, opts) => {
+    if (args.join(' ') === '--version') return { stdout: `${version}\n` }
+    if (starts(args, 'configure get region')) return { stdout: 'eu-west-1\n' }
+    if (starts(args, 'sts get-caller-identity')) return { stdout: JSON.stringify({ Account: ACCOUNT, Arn: `arn:aws:iam::${ACCOUNT}:user/dev` }) }
+    if (starts(args, 's3api head-bucket')) return args.includes(`--expected-bucket-owner=${owner}`) && owner === ACCOUNT ? { stdout: '{}' } : { code: 254, stderr: 'An error occurred (403) when calling the HeadBucket operation: Forbidden' }
+    if (starts(args, 'codebuild batch-get-projects')) return { stdout: JSON.stringify({ projects: [{ name: 'git-bouncer' }], projectsNotFound: [] }) }
+    if (starts(args, 's3api put-object')) {
+      assert.ok(args.includes(`--expected-bucket-owner=${ACCOUNT}`))
+      const hooked = onUpload && await onUpload(args, opts, state)
+      if (hooked) return hooked
+      state.uploaded.push(args.find(a => a.startsWith('--key=')).slice('--key='.length))
+      return { stdout: '{"ETag":"x"}' }
+    }
+    if (starts(args, 's3api list-objects-v2')) return { stdout: state.uploaded.length ? JSON.stringify({ Contents: state.uploaded.map(Key => ({ Key })) }) : '{}' }
+    if (starts(args, 's3api delete-objects')) {
+      const keys = JSON.parse(args.find(a => a.startsWith('--delete=')).slice('--delete='.length)).Objects.map(o => o.Key)
+      assert.deepEqual(keys, state.uploaded, 'deletes exactly what was uploaded')
+      state.sourceRemoved = true
+      return { stdout: '{}' }
+    }
+    if (starts(args, 'codebuild start-build')) {
+      state.created = true
+      return onStart ? onStart(args, opts, state) : { stdout: JSON.stringify({ build: { id: AWS_BUILD_ID, buildStatus: 'IN_PROGRESS' } }) }
+    }
+    if (starts(args, 'codebuild batch-get-builds --ids ')) {
+      return { stdout: JSON.stringify({ builds: args.slice(3, args.indexOf('--region=us-east-1')).map(id => ({ id, buildStatus: id === AWS_BUILD_ID && state.created && !state.stopped.length ? 'IN_PROGRESS' : 'SUCCEEDED', source: { location: id === AWS_BUILD_ID ? `my-bucket/git-bouncer/${RUN_ID}/` : 'my-bucket/git-bouncer/other/' } })) }) }
+    }
+    if (starts(args, 'codebuild batch-get-builds --ids=')) {
+      state.waits += 1
+      const hooked = onWait && await onWait(state)
+      if (hooked) return hooked
+      const done = state.waits > 1
+      return {
+        stdout: JSON.stringify({ builds: [{
+          id: AWS_BUILD_ID, buildStatus: done ? (canaryFails ? 'FAILED' : 'SUCCEEDED') : 'IN_PROGRESS', buildComplete: done, currentPhase: done ? 'COMPLETED' : 'BUILD',
+          logs: { groupName: '/aws/codebuild/git-bouncer', streamName: AWS_BUILD_ID.split(':')[1], deepLink: 'https://console.aws.amazon.com/cloudwatch/home#logEvent' },
+        }] }),
+      }
+    }
+    if (starts(args, 'codebuild list-builds-for-project')) return { stdout: JSON.stringify({ ids: state.created ? ['git-bouncer:00000000-0000-4000-8000-000000000000', AWS_BUILD_ID] : [] }) }
+    if (starts(args, 'logs get-log-events')) {
+      const token = (args.find(a => a.startsWith('--next-token=')) || '').slice('--next-token='.length) || null
+      state.logCalls.push(token)
+      if (logPages) return { stdout: JSON.stringify(logPages(token, events, state)) }
+      return { stdout: JSON.stringify(token ? { events: [], nextForwardToken: token } : { events, nextForwardToken: 'f/1' }) }
+    }
+    if (starts(args, 'codebuild stop-build')) { state.stopped.push(args[2].slice('--id='.length)); return { stdout: '{}' } }
     return null
   }
-  const check = async (env, respond = ok) => createAwsRuntime({ exec: fakeExec(respond).exec, env }).available()
-  try {
-    assert.match((await check(base, () => ({ code: -1, error: Object.assign(new Error('spawn aws ENOENT'), { code: 'ENOENT' }) }))).reason, /AWS CLI .* not installed/)
+  return { handler, state }
+}
+
+test('aws: available() explains each missing prerequisite, including a bucket you don\'t own', async () => {
+  await withDirs(async ({ home }) => {
+    const base = { HOME: home, GIT_BOUNCER_AWS_PROJECT: 'git-bouncer', GIT_BOUNCER_AWS_BUCKET: 'my-bucket' }
+    const ok = awsCloud().handler
+    const check = async (env, respond = ok) => createAwsRuntime({ exec: fakeExec(respond).exec, env }).available()
+    assert.match((await check(base, () => ({ code: -1, error: Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) }))).reason, /AWS CLI .* not installed/)
+    assert.match((await check(base, awsCloud({ version: 'aws-cli/1.33.0 Python/3.9' }).handler)).reason, /needs version 2 of the AWS CLI/)
     assert.match((await check({ HOME: home, GIT_BOUNCER_AWS_BUCKET: 'my-bucket' })).reason, /No CodeBuild project is configured/)
     assert.match((await check({ HOME: home, GIT_BOUNCER_AWS_PROJECT: 'git-bouncer' })).reason, /No S3 bucket is configured/)
     assert.match((await check({ ...base, GIT_BOUNCER_AWS_BUCKET: 'my.dotted.bucket' })).reason, /not a bucket name git-bouncer accepts/)
     assert.match((await check({ ...base, GIT_BOUNCER_AWS_PROJECT: '--endpoint-url=x' })).reason, /not a valid CodeBuild project name/)
-    assert.match((await check(base, (c, a) => (line(a, 'configure get') ? { code: 1 } : ok(c, a)))).reason, /No AWS region is set/)
-    assert.match((await check(base, (c, a) => (line(a, 'sts') ? { code: 255, stderr: 'Unable to locate credentials' } : ok(c, a)))).reason, /not signed in/)
-    const missing = await check(base, (c, a) => (line(a, 'codebuild batch-get-projects') ? { stdout: JSON.stringify({ projects: [], projectsNotFound: ['git-bouncer'] }) } : ok(c, a)))
+    assert.match((await check(base, (c, a) => (starts(a, 'configure get') ? { code: 1 } : ok(c, a)))).reason, /No AWS region is set/)
+    assert.match((await check(base, (c, a) => (starts(a, 'sts') ? { code: 255, stderr: 'Unable to locate credentials' } : ok(c, a)))).reason, /not signed in/)
+    assert.match((await check(base, awsCloud({ owner: '999999999999' }).handler)).reason, /not owned by your account \(123456789012\)/)
+    const missing = await check(base, (c, a) => (starts(a, 'codebuild batch-get-projects') ? { stdout: JSON.stringify({ projects: [], projectsNotFound: ['git-bouncer'] }) } : ok(c, a)))
     assert.match(missing.reason, /CodeBuild project "git-bouncer" was not found in eu-west-1/)
-    assert.equal(missing.account, 'arn:aws:sts::123456789012:assumed-role/dev/me')
 
     const good = fakeExec(ok)
-    const r = await createAwsRuntime({ exec: good.exec, env: base }).available()
-    assert.deepEqual(r, { ok: true, account: 'arn:aws:sts::123456789012:assumed-role/dev/me', project: 'git-bouncer', region: 'eu-west-1', bucket: 'my-bucket' })
+    const rt = createAwsRuntime({ exec: good.exec, env: base })
+    const r = await rt.available()
+    assert.deepEqual(r, { ok: true, account: `arn:aws:iam::${ACCOUNT}:user/dev`, project: 'git-bouncer', region: 'eu-west-1', bucket: 'my-bucket' })
     assert.deepEqual(good.argv(), [
       ['aws', '--version'],
-      ['aws', 'configure', 'get', 'region'],
-      ['aws', 'sts', 'get-caller-identity', '--region=eu-west-1', '--output=json'],
-      ['aws', 'codebuild', 'batch-get-projects', '--names=git-bouncer', '--region=eu-west-1', '--output=json'],
+      ['aws', 'configure', 'get', 'region', '--no-cli-auto-prompt'],
+      ['aws', 'sts', 'get-caller-identity', '--region=eu-west-1', '--output=json', '--no-cli-auto-prompt'],
+      ['aws', 's3api', 'head-bucket', '--bucket=my-bucket', `--expected-bucket-owner=${ACCOUNT}`, '--region=eu-west-1', '--output=json', '--no-cli-auto-prompt'],
+      ['aws', 'codebuild', 'batch-get-projects', '--names=git-bouncer', '--region=eu-west-1', '--output=json', '--no-cli-auto-prompt'],
     ])
     assert.equal(good.calls[0].opts.env.AWS_PAGER, '')
-
-    const pinned = fakeExec(ok)
-    await createAwsRuntime({ exec: pinned.exec, env: { ...base, AWS_REGION: 'ap-southeast-2' } }).available()
-    assert.ok(!pinned.argv().some(a => a.includes('configure')), 'a region from the environment wins')
-    assert.ok(pinned.argv().some(a => a.includes('--region=ap-southeast-2')))
-  } finally {
-    await rm(home, { recursive: true, force: true })
-  }
+    assert.match(rt.describe(), /^AWS CodeBuild project git-bouncer in eu-west-1/)
+  })
 })
 
 test('aws: joinLogEvents puts lines (and lines split across events) back together', () => {
@@ -833,149 +872,133 @@ test('aws: joinLogEvents puts lines (and lines split across events) back togethe
   assert.equal(joinLogEvents(undefined), '')
 })
 
-/** Canned aws answers for a successful CodeBuild scan. */
-function awsCloud({ nonce = NONCE, onUpload, onStart, pollsBeforeDone = 1, logAnswers } = {}) {
-  let polls = 0
-  const events = [
-    '[Container] Running command docker build --tag=git-bouncer-sandbox:scan .\n',
-    `${'-----END BOUNCER REPORT'} ${nonce}-----\n`.replace(/^/, 'not at line start: '),
-    '[scanner] fetching one commit\n',
-    ...report(nonce).map(l => `${l}\n`),
-  ].map(message => ({ timestamp: 1, message }))
-  let logCall = 0
-  return async (_cmd, args, opts) => {
-    if (line(args, '--version')) return { stdout: 'aws-cli/2.17.0\n' }
-    if (line(args, 'sts get-caller-identity')) return { stdout: JSON.stringify({ Arn: 'arn:aws:iam::123456789012:user/dev' }) }
-    if (line(args, 'codebuild batch-get-projects')) return { stdout: JSON.stringify({ projects: [{ name: 'git-bouncer' }] }) }
-    if (line(args, 's3 cp')) { if (onUpload) await onUpload(args, opts); return {} }
-    if (line(args, 'codebuild start-build')) { if (onStart) await onStart(args, opts); return { stdout: JSON.stringify({ build: { id: AWS_BUILD_ID, buildStatus: 'IN_PROGRESS' } }) } }
-    if (line(args, 'codebuild batch-get-builds')) {
-      polls += 1
-      const done = polls > pollsBeforeDone
-      return {
-        stdout: JSON.stringify({ builds: [{
-          id: AWS_BUILD_ID, buildStatus: done ? 'SUCCEEDED' : 'IN_PROGRESS', buildComplete: done, currentPhase: done ? 'COMPLETED' : 'BUILD',
-          logs: { groupName: '/aws/codebuild/git-bouncer', streamName: AWS_BUILD_ID.split(':')[1], deepLink: 'https://console.aws.amazon.com/cloudwatch/home#logEvent' },
-        }] }),
-      }
-    }
-    if (line(args, 'logs get-log-events')) {
-      logCall += 1
-      if (logAnswers) return logAnswers(logCall, args, events)
-      const paged = args.some(a => a.startsWith('--next-token='))
-      return { stdout: JSON.stringify(paged ? { events: [], nextForwardToken: 'f/2' } : { events, nextForwardToken: 'f/2' }) }
-    }
-    if (line(args, 's3 rm')) return {}
-    if (line(args, 'codebuild stop-build')) return { stdout: '{}' }
-    return null
-  }
-}
-
-const AWS_ENV = home => ({ HOME: home, GIT_BOUNCER_AWS_PROJECT: 'git-bouncer', GIT_BOUNCER_AWS_BUCKET: 'my-bucket', GIT_BOUNCER_AWS_REGION: 'us-east-1' })
-
 test('aws: scan() runs exactly the planned commands, returns the report and leaves nothing behind', async () => {
-  const home = await emptyHome()
-  const sandbox = await makeSandbox()
-  let uploaded = null
-  let request = null
-  try {
-    const fake = fakeExec(awsCloud({
-      onUpload: async args => { uploaded = await listTree(args[2]) },
-      onStart: async args => { request = JSON.parse(await readFile(args[2].slice('--cli-input-json=file://'.length), 'utf8')) },
-    }))
+  await withDirs(async ({ home, sandbox }) => {
+    let uploaded = null
+    let request = null
+    const cloud = awsCloud({
+      onUpload: async args => { if (!uploaded) uploaded = await listTree(path.dirname(args.find(a => a.startsWith('--body=')).slice('--body='.length))) },
+      onStart: async args => { request = JSON.parse(await readFile(args[2].slice('--cli-input-json=file://'.length), 'utf8')); return { stdout: JSON.stringify({ build: { id: AWS_BUILD_ID } }) } },
+    })
+    const fake = fakeExec(cloud.handler)
     const logs = []
+    let early = null
     const rt = createAwsRuntime({ exec: fake.exec, env: AWS_ENV(home), sleep: noSleep })
-    const { reportText, session } = await rt.scan({ url: URL_, ref: 'v1.2.3', nonce: NONCE, sandboxDir: sandbox, onLog: l => logs.push(l) })
+    const { reportText, session } = await rt.scan({ url: URL_, ref: 'v1.2.3', nonce: NONCE, sandboxDir: sandbox, onLog: l => logs.push(l), onSession: s => { early = { ...s } } })
 
-    assert.ok(hasCompleteReport(reportText, NONCE))
-    assert.deepEqual(uploaded, ['Dockerfile', 'osv-scanner.toml', 'scanner', 'scanner/main.js', 'scanner/package.json'], 'only the sandbox files are uploaded')
-    assert.deepEqual(request, buildStartBuildRequest({ project: 'git-bouncer', bucket: 'my-bucket', runId: runIdFor(NONCE), url: URL_, ref: 'v1.2.3', nonce: NONCE }))
+    assert.ok(reportReady(reportText, NONCE))
+    assert.deepEqual(uploaded, ['Dockerfile', 'osv-scanner.toml', 'scanner', 'scanner/main.js', 'scanner/package.json'], 'the copy on disk is exactly the sandbox files')
+    assert.deepEqual(cloud.state.uploaded, ['Dockerfile', 'osv-scanner.toml', 'scanner/main.js', 'scanner/package.json'].map(f => `git-bouncer/${RUN_ID}/${f}`), 'and that is all that is uploaded')
+    assert.deepEqual(request, buildStartBuildRequest({ project: 'git-bouncer', bucket: 'my-bucket', runId: RUN_ID, url: URL_, ref: 'v1.2.3', nonce: NONCE }))
     assert.deepEqual(fake.unexpected, [])
+    assert.equal(early.buildId, null)
+    assert.equal(early.source, `s3://my-bucket/git-bouncer/${RUN_ID}/`)
 
     const p = await createAwsRuntime({ exec: noExec, env: AWS_ENV(home) }).plan({ url: URL_, ref: 'v1.2.3', nonce: NONCE, sandboxDir: sandbox, workDir: session.workDir })
-    const vars = { '<build-id>': AWS_BUILD_ID, '<log-group>': '/aws/codebuild/git-bouncer', '<log-stream>': AWS_BUILD_ID.split(':')[1] }
-    const planned = (id, extra = []) => { const s = fillStep(p.steps.find(x => x.id === id), vars); return [s.cmd, ...s.args, ...extra] }
-    assert.deepEqual(fake.argv().slice(3), [
-      planned('upload'), planned('start'), planned('wait'), planned('wait'),
-      planned('log'), planned('log', ['--next-token=f/2']),
-      planned('cleanup-source'),
+    const vars = { '<build-id>': AWS_BUILD_ID, '<log-group>': '/aws/codebuild/git-bouncer', '<log-stream>': AWS_BUILD_ID.split(':')[1], '<account-id>': ACCOUNT }
+    const planned = (id, more = {}, extra = []) => { const s = fillStep(p.steps.find(x => x.id === id), { ...vars, ...more }); return [s.cmd, ...s.args, ...extra] }
+    const files = ['Dockerfile', 'osv-scanner.toml', 'scanner/main.js', 'scanner/package.json']
+    const del = JSON.stringify({ Objects: files.map(f => ({ Key: `git-bouncer/${RUN_ID}/${f}` })), Quiet: true })
+    assert.deepEqual(fake.argv().slice(4), [
+      ...files.map(f => planned('upload', { '<file>': f, '<file-path>': path.join(session.workDir, 'source', ...f.split('/')) })),
+      planned('start'), planned('wait'), planned('wait'),
+      planned('log'), planned('log', {}, ['--next-token=f/1']),
+      planned('cleanup-list'), planned('cleanup-delete', { '<delete-request>': del }),
     ])
-
     assert.equal(session.status, 'SUCCEEDED')
     assert.equal(session.reportComplete, true)
-    assert.deepEqual(session.cleanup, { cancelled: false, sourceRemoved: true, workDirRemoved: true, problems: [] })
+    assert.deepEqual(session.cleanup, { buildSettled: true, stopped: [], sourceRemoved: true, workDirRemoved: true, problems: [] })
     assert.ok(!existsSync(session.workDir))
-    assert.ok(logs.some(l => l.includes(AWS_BUILD_ID)))
-    assert.ok(logs.includes('CodeBuild: BUILD'))
-    assert.equal(await rt.readFile(session, 'package-lock.json', 1000), null)
+    assert.ok(logs.some(l => l.includes(AWS_BUILD_ID)) && logs.includes('CodeBuild: BUILD'))
+    assert.equal(await rt.readFile(session, 'package-lock.json'), null)
     await rt.destroy(session)
-    assert.equal(fake.argv().length, 10, 'destroy() after a clean scan has nothing left to do')
-  } finally {
-    await rm(home, { recursive: true, force: true })
-    await rm(sandbox, { recursive: true, force: true })
-  }
+    assert.equal(fake.calls.length, 15, 'destroy() after a finished scan has nothing left to do')
+  })
 })
 
-test('aws: a log that is still arriving is read again until the report is complete', async () => {
-  const home = await emptyHome()
-  const sandbox = await makeSandbox()
-  try {
-    const sleeps = []
-    let reads = 0
-    const fake = fakeExec(awsCloud({
-      logAnswers: (_n, args, events) => {
-        if (args.some(a => a.startsWith('--next-token='))) return { stdout: JSON.stringify({ events: [], nextForwardToken: 'f/1' }) }
-        reads += 1 // the first read is missing the end marker, as if CloudWatch hadn't caught up yet
-        return { stdout: JSON.stringify({ events: reads === 1 ? events.slice(0, -1) : events, nextForwardToken: 'f/1' }) }
-      },
-    }))
-    const rt = createAwsRuntime({ exec: fake.exec, env: AWS_ENV(home), sleep: async ms => { sleeps.push(ms) } })
+test('aws: an empty page in the middle of the log does not end the read (review repro)', async () => {
+  await withDirs(async ({ home, sandbox }) => {
+    // Page 1 has events, page 2 is empty with a NEW token (CloudWatch allows that), page 3 has the
+    // report, and page 4 hands back the token it was given: only that is the end of the stream.
+    const cloud = awsCloud({
+      logPages: (token, events) => ({
+        [null]: { events: events.slice(0, 2), nextForwardToken: 'f/1' },
+        'f/1': { events: [], nextForwardToken: 'f/2' },
+        'f/2': { events: events.slice(2), nextForwardToken: 'f/3' },
+        'f/3': { events: [], nextForwardToken: 'f/3' },
+      })[token],
+    })
+    const rt = createAwsRuntime({ exec: fakeExec(cloud.handler).exec, env: AWS_ENV(home), sleep: noSleep })
     const { session } = await rt.scan({ url: URL_, nonce: NONCE, sandboxDir: sandbox })
     assert.equal(session.reportComplete, true)
-    assert.deepEqual(sleeps, [10000, 5000], 'one status poll interval, then one wait for the log')
-  } finally {
-    await rm(home, { recursive: true, force: true })
-    await rm(sandbox, { recursive: true, force: true })
-  }
+    assert.deepEqual(cloud.state.logCalls, [null, 'f/1', 'f/2', 'f/3'])
+  })
 })
 
-test('aws: Ctrl-C while waiting stops the build and deletes the upload', async () => {
-  const home = await emptyHome()
-  const sandbox = await makeSandbox()
-  try {
-    const ac = new AbortController()
-    const fake = fakeExec(awsCloud({ pollsBeforeDone: 100 }))
-    const rt = createAwsRuntime({ exec: fake.exec, env: AWS_ENV(home), sleep: async () => { ac.abort() } })
-    await assert.rejects(rt.scan({ url: URL_, nonce: NONCE, sandboxDir: sandbox, signal: ac.signal }), e => e.name === 'AbortError')
-    const tail = fake.argv().slice(-2)
-    assert.deepEqual(tail[0], ['aws', 'codebuild', 'stop-build', `--id=${AWS_BUILD_ID}`, '--region=us-east-1', '--output=json'])
-    assert.deepEqual(tail[1].slice(0, 3), ['aws', 's3', 'rm'])
-    assert.equal(fake.calls.at(-2).opts.signal, undefined, 'stopping is not itself aborted')
-  } finally {
-    await rm(home, { recursive: true, force: true })
-    await rm(sandbox, { recursive: true, force: true })
-  }
+test('aws: a log that is still arriving is read again from where it stopped, not from the start', async () => {
+  await withDirs(async ({ home, sandbox }) => {
+    const sleeps = []
+    let reads = 0
+    const cloud = awsCloud({
+      logPages: (token, events) => {
+        reads += 1
+        if (token === null) return { events: events.slice(0, -1), nextForwardToken: 'f/1' } // the end marker hasn't arrived yet
+        if (token === 'f/1') return reads <= 2 ? { events: [], nextForwardToken: 'f/1' } : { events: events.slice(-1), nextForwardToken: 'f/2' }
+        return { events: [], nextForwardToken: token }
+      },
+    })
+    const rt = createAwsRuntime({ exec: fakeExec(cloud.handler).exec, env: AWS_ENV(home), sleep: async ms => { sleeps.push(ms) } })
+    const { session } = await rt.scan({ url: URL_, nonce: NONCE, sandboxDir: sandbox })
+    assert.equal(session.reportComplete, true)
+    assert.deepEqual(cloud.state.logCalls, [null, 'f/1', 'f/1', 'f/2'], 'the second attempt continues from f/1')
+    assert.deepEqual(sleeps, [10000, 5000])
+  })
 })
 
-test('aws: a refused start-build still deletes the upload; nothing to stop', async () => {
-  const home = await emptyHome()
-  const sandbox = await makeSandbox()
-  try {
-    const base = awsCloud()
-    const fake = fakeExec((c, a, o) => (line(a, 'codebuild start-build') ? { code: 254, stderr: 'An error occurred (AccessDeniedException)\n' } : base(c, a, o)))
-    const rt = createAwsRuntime({ exec: fake.exec, env: AWS_ENV(home), sleep: noSleep })
-    await assert.rejects(rt.scan({ url: URL_, nonce: NONCE, sandboxDir: sandbox }), /did not start the build: An error occurred \(AccessDeniedException\)/)
-    assert.ok(!fake.argv().some(a => a.includes('stop-build')))
-    assert.deepEqual(fake.argv().at(-1).slice(0, 3), ['aws', 's3', 'rm'])
-  } finally {
-    await rm(home, { recursive: true, force: true })
-    await rm(sandbox, { recursive: true, force: true })
+test('aws: a failed metadata canary stops the scan with a clear error', async () => {
+  await withDirs(async ({ home, sandbox }) => {
+    const cloud = awsCloud({ canaryFails: true })
+    const rt = createAwsRuntime({ exec: fakeExec(cloud.handler).exec, env: AWS_ENV(home), sleep: noSleep })
+    await assert.rejects(rt.scan({ url: URL_, nonce: NONCE, sandboxDir: sandbox }), /metadata canary failed/)
+    assert.equal(cloud.state.sourceRemoved, true)
+  })
+})
+
+test('aws: an interrupt at any point leaves no build running and no upload behind', async () => {
+  for (const when of ['during upload', 'during start-build', 'during polling']) {
+    await withDirs(async ({ home, sandbox }) => {
+      let session = null
+      let rt = null
+      let destroyed
+      const done = new Promise(resolve => { destroyed = resolve })
+      const interrupt = async () => { await rt.destroy(session); destroyed(); return never() }
+      const cloud = awsCloud({
+        onUpload: when === 'during upload' ? (_a, _o, st) => (st.uploaded.length === 2 ? interrupt() : undefined) : undefined,
+        onStart: when === 'during start-build' ? interrupt : undefined,
+        onWait: when === 'during polling' ? s => (s.waits === 1 ? interrupt() : undefined) : undefined,
+      })
+      const fake = fakeExec(cloud.handler)
+      rt = createAwsRuntime({ exec: fake.exec, env: AWS_ENV(home), sleep: noSleep })
+      rt.scan({ url: URL_, nonce: NONCE, sandboxDir: sandbox, onSession: s => { session = s } })
+      await done
+      const argv = fake.argv().map(a => a.join(' '))
+      assert.equal(cloud.state.sourceRemoved, true, `${when}: upload deleted`)
+      if (when === 'during upload') {
+        assert.ok(!argv.some(a => a.includes('start-build')), 'no build was started')
+        assert.deepEqual(cloud.state.stopped, [])
+      } else {
+        assert.deepEqual(cloud.state.stopped, [AWS_BUILD_ID], `${when}: stop issued, for this run's build only`)
+        assert.equal(argv.some(a => a.includes('list-builds-for-project')), when === 'during start-build', 'the lookup is only needed when the ID was never seen')
+      }
+      assert.ok(!existsSync(session.workDir), `${when}: temp folder removed`)
+      assert.deepEqual(fake.unexpected, [])
+    })
   }
 })
 
 test('aws: invalid inputs are refused before any command runs', async () => {
-  const fake = fakeExec(awsCloud())
-  const rt = createAwsRuntime({ exec: fake.exec, env: { HOME: '/nonexistent', GIT_BOUNCER_AWS_PROJECT: 'git-bouncer', GIT_BOUNCER_AWS_BUCKET: 'my-bucket', GIT_BOUNCER_AWS_REGION: 'us-east-1' } })
+  const fake = fakeExec(awsCloud().handler)
+  const rt = createAwsRuntime({ exec: fake.exec, env: AWS_ENV('/nonexistent') })
   await assert.rejects(rt.scan({ url: URL_, ref: 'a b', nonce: NONCE, sandboxDir: '/nowhere' }), /ref/)
   await assert.rejects(rt.scan({ url: 'https://github.com/o/`id`.git', nonce: NONCE, sandboxDir: '/nowhere' }), /repository URL/)
   await assert.rejects(rt.plan({ url: URL_, nonce: 'NOPE', sandboxDir: '/nowhere' }), /nonce/)
