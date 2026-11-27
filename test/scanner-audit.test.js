@@ -39,3 +39,17 @@ test('[audit 11] known vulnerabilities are low, with the counts kept in the titl
   assert.equal(vuln.severity, 'low')
   assert.match(vuln.title, /1 known vulnerability in 1 package\(s\) \(1 critical, 0 high\)/)
 })
+
+// --- 8: a pom.xml <repositories> URL steered osv-scanner at the host's 127.0.0.1 ------------------
+
+test('[audit 8] osv-scanner never resolves transitive dependencies (no fetching from repo-chosen servers)', { skip: posix }, async () => {
+  const pom = '<project><modelVersion>4.0.0</modelVersion><groupId>x</groupId><artifactId>y</artifactId><version>1</version>' +
+    '<repositories><repository><id>r</id><url>https://repo.example.invalid/maven/</url></repository></repositories></project>'
+  const { calls } = await depsWithOsv({ 'pom.xml': pom, 'package.json': '{}', 'package-lock.json': LOCK })
+  assert.equal(calls.length, 2, JSON.stringify(calls))
+  for (const args of calls) {
+    assert.ok(args.includes('--no-resolve'), `every osv-scanner run needs --no-resolve: ${args.join(' ')}`)
+    assert.equal(args[args.indexOf('--config') + 1], 'bouncer-osv.toml', 'and always our own config, never the repo\'s')
+  }
+  assert.deepEqual(calls.map(a => a[a.indexOf('-L') + 1]).sort(), ['package-lock.json', 'pom.xml'])
+})

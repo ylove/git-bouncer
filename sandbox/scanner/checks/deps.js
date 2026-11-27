@@ -258,6 +258,12 @@ function cvssBucket(score) {
 
 const MAX_OSV_LOCKFILES = 25
 
+// --no-resolve: never resolve transitive dependencies of manifest-only files (pom.xml, requirements.txt, ...).
+// Resolution downloads metadata from wherever the manifest says (a pom.xml <repositories> URL, a parent
+// POM), so the repo could steer the sandbox at any server it likes, including the host's own 127.0.0.1
+// through host.docker.internal. Manifests are matched on the versions they declare instead.
+export const OSV_ARGS = (osvConfig, lockfile) => ['scan', 'source', '--format', 'json', '--no-resolve', '--config', osvConfig, '-L', lockfile]
+
 /** osv-scanner, one lockfile per run (one bad file can't sink the rest), always with OUR config file. */
 async function osvChecks(root, lockfiles, findings, { osvBin, osvConfig }) {
   if (!lockfiles.length) return { ran: false, reason: 'no lockfiles or manifests found' }
@@ -267,7 +273,7 @@ async function osvChecks(root, lockfiles, findings, { osvBin, osvConfig }) {
   let ok = 0
   const failed = []
   for (const l of lockfiles.slice(0, MAX_OSV_LOCKFILES)) {
-    const r = await run(osvBin, ['scan', 'source', '--format', 'json', '--config', osvConfig, '-L', l], { cwd: root, timeoutMs: 5 * 60 * 1000 })
+    const r = await run(osvBin, OSV_ARGS(osvConfig, l), { cwd: root, timeoutMs: 5 * 60 * 1000 })
     let data = null
     if (r.code === 0 || r.code === 1) { try { data = JSON.parse(r.stdout) } catch { data = null } }
     if (r.code === 128) { ok++; continue } // "no packages found" in this file

@@ -76,6 +76,8 @@ The **ID check** (look-alike owners, account age and more) runs on your machine 
 
 ## Dependencies
 
+Known-malware and known-vulnerability lookups use [osv-scanner](https://github.com/google/osv-scanner) with git-bouncer's own config file and `--no-resolve`. Lockfiles (`package-lock.json`, `yarn.lock`, `Cargo.lock`, `poetry.lock`, ...) list the full tree, so nothing is lost. Manifest-only ecosystems (`pom.xml`, `requirements.txt` without pins, `build.gradle`) are matched on the versions they **declare**: transitive dependencies are not resolved, because resolving them means downloading metadata from wherever the manifest says (a `pom.xml` `<repositories>` URL or parent POM), which would let the repo steer the sandbox at a server of its choosing.
+
 | ID | Severity | What it means |
 |---|---|---|
 | `DEP-MALWARE` | critical | A dependency version is in the OSV malicious-packages database. |
