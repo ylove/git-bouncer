@@ -85,7 +85,9 @@ test('which() never resolves a program through a relative PATH entry', async () 
     process.chdir(dir)
     try {
       assert.equal(await which('fakegit', { PATH: `.${path.delimiter}./node_modules/.bin`, PATHEXT: '.CMD' }), null)
-      assert.equal(await which('fakegit', { PATH: dir, PATHEXT: '.CMD' }), path.join(dir, name))
+      const found = await which('fakegit', { PATH: dir, PATHEXT: '.CMD' })
+      // Windows file names are case-insensitive: fakegit.CMD and fakegit.cmd are the same file.
+      assert.equal(process.platform === 'win32' ? found?.toLowerCase() : found, process.platform === 'win32' ? path.join(dir, name).toLowerCase() : path.join(dir, name))
     } finally { process.chdir(cwd) }
   } finally { await rm(dir, { recursive: true, force: true }) }
 })

@@ -96,12 +96,13 @@ export function createContainerRuntime(engine, { exec = run, onLog = () => {} } 
     async ensureImage(version) {
       const tag = `git-bouncer-sandbox:${version}-${await sandboxHash()}`
       const inspect = await cli(['image', 'inspect', '--format', '{{.Id}}', tag], { timeoutMs: 30_000 })
-      if (inspect.code === 0 && /^sha256:[0-9a-f]{64}$/.test(inspect.stdout.trim())) return inspect.stdout.trim()
+      // Docker prints "sha256:<hex>", Podman prints just "<hex>"; both start a container by ID.
+      if (inspect.code === 0 && /^(sha256:)?[0-9a-f]{64}$/.test(inspect.stdout.trim())) return inspect.stdout.trim()
       onLog('Building the sandbox image (first run only, about a minute)...')
       const b = await cli(['build', '--tag', tag, '--label', LABEL, SANDBOX_DIR], { timeoutMs: 20 * 60_000, onStderr: s => onLog(s.trimEnd()) })
       if (b.code !== 0) throw new Error(`could not build the sandbox image: ${(b.stderr || b.stdout).trim().split('\n').slice(-3).join(' ')}`)
       const id = (await cli(['image', 'inspect', '--format', '{{.Id}}', tag], { timeoutMs: 30_000 })).stdout.trim()
-      if (!/^sha256:[0-9a-f]{64}$/.test(id)) throw new Error('could not read the sandbox image ID after building it')
+      if (!/^(sha256:)?[0-9a-f]{64}$/.test(id)) throw new Error('could not read the sandbox image ID after building it')
       return id
     },
 
