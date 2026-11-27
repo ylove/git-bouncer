@@ -22,3 +22,12 @@ updates:
       # One PR for every action, so steps that must share a version (CodeQL init/analyze/upload-sarif) move together.
       github-actions:
         patterns: ["*"]
+
+  # The sandbox image's base is pinned by digest; this proposes updates (after the same cooldown).
+  - package-ecosystem: docker
+    directory: /sandbox
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    labels: [dependencies]

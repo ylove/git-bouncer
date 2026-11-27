@@ -6,6 +6,8 @@ import { readFileSync } from 'node:fs'
 import { parseRepoUrl, validateRef, UsageError } from './url.js'
 import { EXIT } from './verdict.js'
 import { clean } from './ui/sanitize.js'
+import { createOutput } from './ui/output.js'
+import { createPrompter } from './ui/prompt.js'
 
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
 export const VERSION = pkg.version
@@ -139,7 +141,7 @@ export function validateDir(dir) {
 }
 
 /** Run the CLI. Returns the process exit code instead of exiting, so it's testable. */
-export async function main(argv, { asGitSubcommand = false, stdout = process.stdout, stderr = process.stderr } = {}) {
+export async function main(argv, { asGitSubcommand = false, stdout = process.stdout, stderr = process.stderr, ...deps } = {}) {
   let cmd
   try {
     cmd = parseCommand(argv, { asGitSubcommand })
@@ -159,8 +161,20 @@ export async function main(argv, { asGitSubcommand = false, stdout = process.std
     case 'version':
       stdout.write(`${VERSION}\n`)
       return EXIT.PASS
+    case 'scan':
+    case 'clone': {
+      const { check } = await import('./commands/check.js')
+      const out = createOutput(stderr)
+      // --json is for scripts: never ask questions, never install anything.
+      const prompter = cmd.options.json ? createPrompter({ interactive: false }) : (deps.prompter ?? createPrompter())
+      return check(cmd, { out, prompter, stdout, version: VERSION, ...deps })
+    }
+    case 'doctor': {
+      const { doctor } = await import('./commands/doctor.js')
+      return doctor({ out: createOutput(stdout) })
+    }
     default:
-      // The commands themselves arrive in the following pull requests (see the issue tracker).
+      // The remaining commands arrive in the following pull requests (see the issue tracker).
       stderr.write(`bouncer: "${cmd.command}" is not implemented yet. Follow https://github.com/ylove/git-bouncer/issues\n`)
       return EXIT.ERROR
   }
