@@ -6,18 +6,35 @@ import { detectContainerRuntime, createContainerRuntime } from '../runtimes/cont
 import { extractReport } from '../report.js'
 import { computeVerdict, EXIT } from '../verdict.js'
 import { handoff, HandoffError } from '../handoff.js'
+import { idCheck as realIdCheck } from '../idcheck/index.js'
 import { snykReady, snykTest } from '../snyk.js'
 import { clean } from '../ui/sanitize.js'
 import { has } from '../proc.js'
 
 // Findings that mean "a check didn't run to the end". The result is then INCOMPLETE, not a WARN.
 const COVERAGE_GAPS = new Set(['SCAN-TRUNCATED', 'SCAN-INCOMPLETE', 'DEP-OSV-UNAVAILABLE', 'DEP-OSV-PARTIAL', 'DEP-INSTALL-FAILED',
-  'DEP-INSTALL-SKIPPED', 'LOCK-OUT-OF-SYNC', 'LOCK-UNPARSABLE', 'DEP-SIGNATURES-UNCHECKED'])
+  'DEP-INSTALL-SKIPPED', 'LOCK-OUT-OF-SYNC', 'LOCK-UNPARSABLE', 'DEP-SIGNATURES-UNCHECKED', 'ID-API-UNAVAILABLE', 'ID-IOC-UNAVAILABLE'])
 
-/** Placeholder until the ID check (#2) is wired in: offline checks only. */
+/** The ID check (src/idcheck): look-alikes, known-bad repos and reputation, before anything downloads. */
 async function runIdCheck(target, deps) {
-  if (deps.idCheck) return deps.idCheck(target)
-  return { findings: [], facts: {}, complete: true }
+  try {
+    const r = await (deps.idCheck ?? realIdCheck)(target)
+    return { findings: r.findings ?? [], facts: r.facts ?? {}, complete: r.complete === true }
+  } catch (e) {
+    // Never let an ID-check bug turn into a pass: report it as an incomplete check.
+    return { findings: [{ id: 'ID-API-UNAVAILABLE', severity: 'low', title: 'The ID check could not run', detail: String(e && e.message ? e.message : e).slice(0, 300) }], facts: {}, complete: false }
+  }
+}
+
+/** One line about the publisher, from public GitHub metadata (all values are re-sanitized on print). */
+function describePublisher(facts) {
+  const parts = []
+  if (facts.ownerType) parts.push(facts.ownerType === 'Organization' ? 'organization' : 'personal account')
+  if (facts.ownerCreatedAt) parts.push(`since ${String(facts.ownerCreatedAt).slice(0, 10)}`)
+  if (facts.verifiedOrg && facts.orgWebsite) parts.push(`verified domain ${facts.orgWebsite}`)
+  if (Number.isFinite(facts.stars)) parts.push(`${facts.stars} stars`)
+  if (facts.latestRelease) parts.push(`latest release ${facts.latestRelease}`)
+  return parts.join(', ')
 }
 
 async function pickRuntime(options, deps) {
@@ -63,6 +80,8 @@ export async function check(cmd, deps) {
     out.step('ID check: who published this, and is it who it claims to be?')
     const id = await runIdCheck({ ...target, ref: options.ref }, deps)
     all.push(...id.findings)
+    const who = describePublisher(id.facts)
+    if (who) out.note(clean(who, { max: 200 }))
     if (id.findings.length) out.findings(id.findings)
     else out.note('no problems with the publisher found')
     const early = computeVerdict(id.findings, { complete: true })
