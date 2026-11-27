@@ -43,7 +43,7 @@ Why the split: the **ID check** needs nothing from the repo, so it runs on your 
 
 ## Sandbox runtimes
 
-1. **Docker or Podman** (local). The image is built on first use from the Dockerfile inside the npm package. Containers run with:
+1. **Docker or Podman** (local). The image (Debian trixie `node:24-trixie-slim` pinned by digest, git 2.47, osv-scanner pinned by SHA256, no curl or wget) is built on first use from the Dockerfile inside the npm package, and tagged with a hash of the sandbox folder, so changing the scanner rebuilds it. Containers run with:
    `--cap-drop=ALL --security-opt=no-new-privileges --read-only --user 10001:10001`
    `--tmpfs /work:noexec,nosuid,nodev,size=…` `--tmpfs /tmp:noexec,nosuid,nodev`
    `--pids-limit --memory --cpus`, and no mounts, no Docker socket, no inherited environment.

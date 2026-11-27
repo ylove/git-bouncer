@@ -18,7 +18,7 @@ This document says what it protects, what it assumes, what it does about each th
 - **A compromised legitimate repository.** A real project whose maintainer was phished, so the history and reputation look fine but recent commits don't.
 - **Look-alike identities.** `micr0s0ft/vscode`, `expresss`, `cross-env` vs `crossenv`.
 
-Out of scope: an attacker who already controls your machine, your network path to GitHub/npm (TLS is trusted), the container runtime, GitHub/npm/OSV themselves, or the npm package you installed git-bouncer from (see "Trusting git-bouncer itself" below).
+Out of scope: an attacker who already controls your machine, your DNS or your network path to GitHub/npm (TLS is trusted), the container runtime, GitHub/npm/OSV themselves, or the npm package you installed git-bouncer from (see "Trusting git-bouncer itself" below).
 
 ## Trust boundaries
 
@@ -118,5 +118,6 @@ A security tool you install from npm is itself a supply-chain risk, so:
 - **npm gets the deepest dependency checks.** yarn, pnpm, bun, Python, NuGet and others get lockfile parsing and OSV matching, but not install-time checksum verification inside the sandbox.
 - **Private repositories aren't supported in v1**, because that would mean putting credentials in the sandbox.
 - **Network egress from the sandbox is allowed** (git, the npm registry and OSV need it). No repo code runs there, but a container on your network is still a container on your network.
+- **Hosts are an allowlist, but DNS isn't checked.** Only github.com, gitlab.com, bitbucket.org, codeberg.org and hosts you name with `--allow-host` are accepted, and internal or wildcard-DNS names are always refused. git-bouncer doesn't verify what an allowed name *resolves* to, so an attacker who controls your DNS is out of scope.
 - **The cloud runtimes (GCP Cloud Build, AWS CodeBuild) are not live-tested by the maintainer**, because they cost money. They're documented as a starting point for your own configuration.
 - **You're the last check.** A WARN asks you to look. If you don't understand why something was flagged, don't install it on your daily machine.
