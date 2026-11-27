@@ -123,14 +123,17 @@ test('a project .npmrc that redirects the registry is flagged, and npm still use
   assert.equal(report.packageManager.installed, true, 'npm ci should have succeeded against the official registry')
 })
 
+const sandboxNames = async () => new Set((await run(engine, ['ps', '-a', '--filter', `label=${LABEL}`, '--format', '{{.Names}}'])).stdout.split('\n').filter(n => /^git-bouncer-[0-9a-f]{12}$/.test(n)))
+
 test('end to end: `bouncer scan` lets a clean public repo in, and leaves no sandbox behind', { skip }, async () => {
+  const before = await sandboxNames() // other runs on the same machine may have their own sandboxes
   const out = { text: '', write(s) { this.text += s } }
   const code = await main(['scan', 'https://github.com/octocat/Hello-World', '--json', '--no-snyk', '--runtime', engine], { stdout: out, stderr: { write() {} } })
   const result = JSON.parse(out.text.trim().split('\n').pop())
   assert.equal(result.verdict, 'pass', JSON.stringify(result))
   assert.equal(code, 0)
-  const left = await run(engine, ['ps', '-a', '--filter', `label=${LABEL}`, '--filter', 'name=git-bouncer-[0-9a-f]', '--format', '{{.Names}}'])
-  assert.equal(left.stdout.split('\n').filter(n => /^git-bouncer-[0-9a-f]{12}$/.test(n)).length, 0)
+  const left = [...await sandboxNames()].filter(n => !before.has(n))
+  assert.deepEqual(left, [], 'this scan must not leave its sandbox behind')
 })
 
 test('end to end: `bouncer clone` brings over exactly the scanned commit', { skip }, async () => {

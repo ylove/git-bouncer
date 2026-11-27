@@ -115,8 +115,10 @@ export async function which(cmd, env = process.env, { cwd, home, exts } = {}) {
   return null
 }
 
-/** Is `cmd` runnable? (Runs `<cmd> --version`; nothing else.) */
+/** Is `cmd` installed on a trusted PATH entry, and does `<cmd> --version` run? */
 export async function has(cmd) {
-  const r = await run(cmd, ['--version'], { timeoutMs: 10_000 })
+  const bin = await which(cmd)
+  if (!bin) return false
+  const r = await run(bin, ['--version'], { timeoutMs: 10_000 })
   return r.code === 0
 }
