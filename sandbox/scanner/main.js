@@ -5,8 +5,11 @@
 // exactly one JSON report between two marker lines that contain a nonce chosen by the host. Logs
 // go to stderr. Nothing from the scanned repository is ever executed.
 //
-//   node main.js --url https://github.com/o/r.git [--ref <ref>] --nonce <hex> [--dir /work/repo]
-//   node main.js --no-clone --dir <path> --nonce <hex>       (scan an existing folder; used by tests)
+//   echo <nonce> | node main.js --url https://github.com/o/r.git [--ref <ref>] --nonce-stdin [--dir /work/repo]
+//   echo <nonce> | node main.js --no-clone --dir <path> --nonce-stdin      (scan an existing folder; tests)
+//
+// The nonce arrives on stdin, not as an argument: arguments are readable by every process in the
+// container through /proc/<pid>/cmdline, stdin isn't.
 
 import { parseArgs } from 'node:util'
 import { readFileSync } from 'node:fs'
@@ -26,6 +29,7 @@ const { values } = parseArgs({
     url: { type: 'string' },
     ref: { type: 'string' },
     nonce: { type: 'string' },
+    'nonce-stdin': { type: 'boolean', default: false },
     dir: { type: 'string', default: '/work/repo' },
     'no-clone': { type: 'boolean', default: false },
     'skip-install': { type: 'boolean', default: false },
@@ -35,8 +39,17 @@ const { values } = parseArgs({
   strict: true,
 })
 
+async function readNonce() {
+  let data = ''
+  for await (const chunk of process.stdin) {
+    data += chunk
+    if (data.includes('\n') || data.length > 200) break
+  }
+  return data.split('\n')[0].trim()
+}
+if (values['nonce-stdin']) values.nonce = await readNonce()
 if (!/^[0-9a-f]{32,64}$/.test(values.nonce || '')) {
-  process.stderr.write('scanner: --nonce must be 32-64 lowercase hex characters\n')
+  process.stderr.write('scanner: the nonce (on stdin with --nonce-stdin, or --nonce) must be 32-64 lowercase hex characters\n')
   process.exit(2)
 }
 

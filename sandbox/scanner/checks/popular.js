@@ -33,4 +33,6 @@ async bluebird p-limit p-queue eventemitter3 events buffer process util path-bro
 crypto-js node-forge bn.js ethers web3 viem
 http-proxy http-proxy-middleware serve-static express-rate-limit
 open execa shelljs cross-spawn which
+color colors colorette prompt prompts jsdoc tslint sqlite sqlite3 vue-demi mime mime-types send serve express-validator
+node-sass sass-loader css-loader style-loader file-loader url-loader ts-loader ts-jest tsconfig-paths
 `.trim().split(/\s+/))

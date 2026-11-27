@@ -8,7 +8,7 @@ Every finding has a stable ID, a severity and a plain-language explanation in th
 | medium | **warning** (WARN) | A person should look before trusting it |
 | low, info | **let in** (PASS) | Context. Never blocks on its own |
 
-All of these run inside the sandbox. None of them executes code from the repository. The repository cannot configure, silence or skip any of them: no ignore files or settings are read from it.
+All of these run inside the sandbox. None of them executes code from the repository. The repository can't configure the scanner: no ignore files or settings are read from it. It can still try to *evade* the checks (see the limitations in [THREAT_MODEL.md](../THREAT_MODEL.md)), which is why the most important ones are written to be hard to dodge and are covered by regression tests for every bypass found in review.
 
 The **ID check** (look-alike owners, account age and more) runs on your machine before anything is downloaded. Its findings are documented with that feature in [#2](https://github.com/ylove/git-bouncer/issues/2).
 
@@ -25,6 +25,7 @@ The **ID check** (look-alike owners, account age and more) runs on your machine 
 | `GIT-SUBMODULE-URL` | medium | A submodule uses a non-https URL. |
 | `GIT-SUBMODULES` | low | Submodules exist and were not fetched or scanned. |
 | `GIT-SYMLINKS` | info | Symlinks exist (checked out as plain files in the sandbox). |
+| `GIT-SYMLINKS-RESOLVED` | info | In-repo symlinks were replaced with copies of their targets for scanning, because tools on your machine would follow them (`package.json -> tools/manifest.json`). |
 
 ## Runs when you open the folder or start an AI agent
 
@@ -39,6 +40,7 @@ The **ID check** (look-alike owners, account age and more) runs on your machine 
 | `AUTORUN-AGENT-INSTRUCTIONS` | medium | `AGENTS.md`, `CLAUDE.md` or similar tells the agent to download and run something. |
 | `AUTORUN-VSCODE-SETTINGS` | medium | Workspace settings choose which programs the editor runs (`typescript.tsdk`, interpreter paths, terminal profiles). |
 | `AUTORUN-DEVCONTAINER` | low / medium | Dev container lifecycle commands (run inside the container or Codespace). |
+| `AUTORUN-CONFIG-UNPARSABLE` | medium | An editor or agent config couldn't be parsed strictly. Editors are lenient, so it was checked with text matching too. |
 | `CONFIG-EXEC` | medium / high | A build or dev config (`next.config.js`, `vite.config.ts`, `eslint.config.js`, …) spawns processes, uses the network, or reads home-directory secrets. High when it does two of those. |
 
 ## Hidden code and hidden text
@@ -56,6 +58,8 @@ The **ID check** (look-alike owners, account age and more) runs on your machine 
 | `C2-NODE-REPL` | high | Spawns an interactive `node -i`, a live interpreter for remote commands. |
 | `PY-IMPORT-TIME-LOADER` | high | `conftest.py`, `setup.py`, `__init__.py` or `sitecustomize.py` that downloads and executes. |
 | `PY-PTH-EXEC` | medium | A `.pth` file with an import line (runs on every Python start once installed). |
+| `PY-CODEC-DECLARATION` | high | A Python file declares a source encoding like UTF-7, which hides statements from anyone reading it as UTF-8. |
+| `MSBUILD-RESPONSE-FILE` | medium | `Directory.Build.rsp` adds options (including loggers, which are DLLs) to every `dotnet build`. |
 | `MSBUILD-EXEC` | medium / high | MSBuild `<Exec>`/`<UsingTask>` runs on `dotnet build`. High if it downloads an executable. |
 | `IOC-MATCH` | critical | A wallet address, C2 IP, campaign marker, file name, or package/repo name from public reporting on an active campaign (dated snapshot, sources cited in `sandbox/scanner/checks/iocs.js`). |
 
@@ -66,7 +70,9 @@ The **ID check** (look-alike owners, account age and more) runs on your machine 
 | `FILETYPE-FAKE-FONT` | high | A font file (`.woff2`, `.ttf`, `.llf`, …) that is actually text, as with PolinRider's fake Font Awesome files. |
 | `FILETYPE-MISMATCH` | medium / high | An image, font, archive or wasm file whose bytes don't match its format. High if it's text. |
 | `BIN-EXECUTABLE` | medium / high | A compiled program is committed. High if it hides under a non-program extension. |
-| `REPO-COMMITTED-NODE-MODULES` | medium | `node_modules` is committed, bypassing every lockfile and registry check. |
+| `REPO-COMMITTED-NODE-MODULES` | medium | `node_modules` is committed (anywhere in the tree), bypassing every lockfile and registry check. It is still scanned. |
+| `LFS-CODE` | high | A code or config file is stored in Git LFS: its real contents weren't scanned and the commit hash doesn't vouch for them. |
+| `LFS-POINTERS` | info | Other files (images, data) are stored in Git LFS and weren't downloaded. |
 
 ## Dependencies
 
@@ -75,24 +81,29 @@ The **ID check** (look-alike owners, account age and more) runs on your machine 
 | `DEP-MALWARE` | critical | A dependency version is in the OSV malicious-packages database. |
 | `DEP-INTEGRITY-MISMATCH` | critical | `npm ci` found a package whose sha512 doesn't match the lockfile (`EINTEGRITY`). |
 | `DEP-SIGNATURE-INVALID` | critical | `npm audit signatures` found an invalid registry signature. |
-| `NPMRC-OVERRIDE` | high | A project `.npmrc`/`.yarnrc.yml` redirects the registry or sets `git`, `script-shell`, `node-options` and similar. It's moved aside in the sandbox, but would apply on your machine. |
+| `NPMRC-OVERRIDE` | high | A project `.npmrc`/`.yarnrc.yml` redirects the registry or sets `git`, `node-gyp`, `script-shell`, `node-options`, a proxy and similar. It's moved aside in the sandbox, but would apply on your machine. |
+| `NPMRC-ENV-EXFIL` | high | `.npmrc` would send one of your environment variables (like `${GITHUB_TOKEN}`) to a server other than the npm registry. |
+| `PNPMFILE` | medium / high | `.pnpmfile.cjs` runs on every pnpm install, even with `--ignore-scripts`. |
 | `SCRIPT-ROOT-DANGEROUS` | high | The repo's own `preinstall`/`install`/`postinstall`/`prepare` downloads or decodes something and runs it. |
 | `DEP-INSTALL-SCRIPT-DANGEROUS` | high | A dependency's install script downloads or decodes something and runs it. |
 | `LOCK-RESOLVED-INSECURE` | high | A lockfile entry downloads over plain http. |
 | `DEP-SPEC-URL` | high (http) / low | A dependency is installed from a URL instead of the registry. |
-| `SCRIPT-ROOT-LIFECYCLE` | medium / low | The repo has an install-time script (low for well-known ones like `husky`). |
-| `DEP-INSTALL-SCRIPT` | medium | A dependency not on the well-known list has an install script. |
+| `SCRIPT-ROOT-LIFECYCLE` | medium / low | The repo (or a workspace in it) has an install-time script, including `dependencies` and the implicit `node-gyp rebuild` from a `binding.gyp`. `npm run x` references are expanded one level. Low for well-known ones like `husky` or `svelte-kit sync`. |
+| `DEP-INSTALL-SCRIPT` | medium | A dependency not on the well-known list (or not from the npm registry) has an install script. Taken from the lockfile's `hasInstallScript`, so packages the Linux sandbox didn't install (macOS- or Windows-only) are listed too. |
 | `SCRIPT-RUN-DANGEROUS` | medium | `npm run dev/start/test/build` downloads or decodes something and runs it. |
-| `DEP-TYPOSQUAT` | medium | A direct dependency's name is one edit away from a popular package (`expresss`, `crossenv`). |
+| `DEP-TYPOSQUAT` | medium | A direct dependency's name (or an `npm:` alias's real name) is one edit away from a popular package (`expresss`, `crossenv`). Siblings in the same scope are not compared. |
 | `LOCK-RESOLVED-NONREGISTRY` | medium | Lockfile entries come from servers other than the npm registry. |
 | `LOCK-MISSING-INTEGRITY` | medium | Lockfile entries have no integrity hash. |
 | `LOCK-OUT-OF-SYNC` | medium | `package.json` and the lockfile disagree, so the exact tree couldn't be verified. |
 | `LOCK-UNPARSABLE`, `LOCK-RESOLVED-ODD` | medium | The lockfile is broken or points somewhere unusual. |
-| `YARN-PATH` | medium | `.yarnrc.yml` makes yarn run the repo's own copy of Yarn. |
+| `YARN-PATH` | low / medium / high | Yarn would run a JavaScript file from the repo: low for Berry's standard `.yarn/releases/yarn-x.y.z.cjs`, medium for anything else, high for classic `.yarnrc` `yarn-path`. |
+| `NPMRC-SCOPED-REGISTRY` | medium | Some scopes come from a third-party registry (common for paid packages like Font Awesome Pro). |
+| `BUNFIG-PRELOAD` | medium | `bunfig.toml` preloads scripts before your code runs. |
 | `PY-INDEX-OVERRIDE` | medium | A requirements file adds or replaces the Python package index (dependency confusion). |
 | `DEP-VULN` | medium | Known vulnerabilities (CVEs) in dependencies. A warning, not a fail: they make the app vulnerable, not your machine at install time. |
 | `NPMRC-TOKEN` | medium | An npm auth token is committed (poor hygiene, possibly stolen). |
-| `DEP-INSTALL-FAILED`, `DEP-OSV-UNAVAILABLE`, `DEP-SIGNATURES-UNCHECKED` | medium / low | A dependency check couldn't complete, so the result is incomplete. |
+| `DEP-INSTALL-FAILED`, `DEP-INSTALL-SKIPPED`, `DEP-OSV-UNAVAILABLE`, `DEP-OSV-PARTIAL`, `DEP-SIGNATURES-UNCHECKED` | medium / low | A dependency check couldn't complete (or was deliberately skipped, because the lockfile points at servers the sandbox shouldn't contact), so the result is incomplete. |
+| `DEP-PLATFORM-RESTRICTED` | low | The project refuses to install on Linux; the sandbox installed it anyway to check the dependencies. |
 | `LOCK-RESOLVED-GIT`, `LOCK-WEAK-INTEGRITY` | low | Git dependencies (no registry signatures) or SHA-1-only integrity. |
 | `DEP-INSTALL-SCRIPT-KNOWN` | info | Well-known packages with install scripts (esbuild, sharp, …). |
 
