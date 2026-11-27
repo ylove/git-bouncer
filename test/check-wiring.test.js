@@ -48,3 +48,24 @@ function frame(nonce) {
     packageManager: { kind: 'none' }, timings: { clone: 1, git: 1, content: 1, autorun: 1, dependencies: 1 }, findings: [] }
   return `-----BEGIN BOUNCER REPORT ${nonce}-----\n${JSON.stringify(report)}\n-----END BOUNCER REPORT ${nonce}-----\n`
 }
+
+test('--dry-run prints the cloud plan as JSON and runs nothing', async () => {
+  const idCheck = async () => ({ findings: [], facts: {}, complete: true })
+  const r = await run(['scan', 'owner/repo', '--runtime', 'gcp', '--dry-run', '--no-snyk'], { idCheck })
+  assert.equal(r.code, EXIT.PASS)
+  const plan = JSON.parse(r.out)
+  assert.equal(plan.runtime, 'gcp')
+  assert.ok(plan.steps.length > 0 && plan.steps.every(s => typeof s.cmd === 'string' && Array.isArray(s.args)))
+})
+
+test('--dry-run without a cloud runtime is a usage error', async () => {
+  const idCheck = async () => ({ findings: [], facts: {}, complete: true })
+  const r = await run(['scan', 'owner/repo', '--dry-run', '--no-snyk'], { idCheck })
+  assert.equal(r.code, EXIT.ERROR)
+})
+
+test('`bouncer shell-init bash` prints a snippet that never calls git for --bouncer', async () => {
+  const r = await run(['shell-init', 'bash'], {})
+  assert.equal(r.code, EXIT.PASS)
+  assert.match(r.out, /git-bouncer clone/)
+})
