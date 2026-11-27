@@ -5,13 +5,16 @@
 // repository is ever passed as the command itself — only as data arguments after "--".
 
 import { spawn } from 'node:child_process'
+import path from 'node:path'
 
 const MAX_OUTPUT = 32 * 1024 * 1024 // 32 MiB: npm/osv JSON for big trees can be large
 
 /** A deliberately small environment: no tokens, no proxies we didn't choose, no user config. */
 export function cleanEnv(extra = {}) {
   return {
-    PATH: '/usr/local/bin:/usr/bin:/bin',
+    // The folder of the node running the scanner comes first, so npm is found wherever Node was
+    // installed (in the sandbox image that's /usr/local/bin; in a Codespace it's under nvm).
+    PATH: `${path.dirname(process.execPath)}:/usr/local/bin:/usr/bin:/bin`,
     HOME: '/tmp',
     LANG: 'C.UTF-8',
     TMPDIR: '/tmp',
