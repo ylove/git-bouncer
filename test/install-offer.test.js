@@ -1,8 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import {
   planInstall, offerInstall, explainChoices, parseOsRelease, findProgram, knownLocations, runInstaller, LINKS, WINGET_IDS,
 } from '../src/runtimes/install-offer.js'
@@ -43,6 +45,8 @@ function session(opts = {}) {
     run: () => offerInstall({
       home: HOME,
       env: { PATH: '/usr/bin' },
+      interactive: true,
+      isTTY: { stdin: true, stderr: true },
       resolve: async cmd => found[cmd] ?? null,
       out: text => { log.out += `${text}\n` },
       choose: async (question, options) => { log.questions.push(question); log.choices = options; return pick },
@@ -201,13 +205,32 @@ test('non-interactive: nothing is offered, asked or run', async () => {
   assert.equal(noPrompts.reason, 'non-interactive')
   assert.ok(noPrompts.nextSteps.some(s => s.includes(LINKS.podman)))
 
-  // Even with prompts available, interactive: false wins.
-  const s = session({ platform: 'darwin', ...MAC, interactive: false, answers: [true, true, true], exec })
-  const r = await s.run()
-  assert.equal(r.reason, 'non-interactive')
-  assert.equal(s.log.questions.length, 0)
-  assert.equal(s.log.confirms.length, 0)
+  // A caller with prompts that always say yes still gets nothing unless every condition holds:
+  // it said interactive: true, stdin and stderr are terminals, and CI isn't set.
+  for (const [why, io] of [
+    ['interactive defaults to false', { interactive: undefined }],
+    ['interactive: false', { interactive: false }],
+    ['stdin is not a terminal', { isTTY: { stdin: false, stderr: true } }],
+    ['stderr is not a terminal', { isTTY: { stdin: true, stderr: undefined } }],
+    ['CI is set', { env: { PATH: '/usr/bin', CI: 'true' } }],
+  ]) {
+    const s = session({ platform: 'darwin', ...MAC, answers: [true, true, true], exec, ...io })
+    const r = await s.run()
+    assert.equal(r.reason, 'non-interactive', why)
+    assert.equal(s.log.questions.length + s.log.confirms.length, 0, why)
+  }
   assert.equal(touched, false)
+})
+
+test('the explanation goes to stderr, next to the prompts, so "> log.txt" can\'t hide it', () => {
+  const mod = JSON.stringify(pathToFileURL(path.join(import.meta.dirname, '..', 'src', 'runtimes', 'install-offer.js')).href)
+  const script = `import { offerInstall } from ${mod}
+await offerInstall({ platform: 'linux', interactive: true, isTTY: { stdin: true, stderr: true }, env: {}, readOsRelease: () => null,
+  resolve: async () => null, confirm: async () => false, choose: async () => 'cancel' })`
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' })
+  assert.equal(r.status, 0, r.stderr)
+  assert.equal(r.stdout, '')
+  assert.match(r.stderr, /Podman \(recommended\)/)
 })
 
 test('macOS, yes to everything: the three commands run by absolute path, in order, from your home folder', async () => {
@@ -220,7 +243,7 @@ test('macOS, yes to everything: the three commands run by absolute path, in orde
     `Run "${PODMAN} machine init" now?`,
     `Run "${PODMAN} machine start" now?`,
   ])
-  assert.ok(s.log.confirms.every(c => c.opts.default === false))
+  assert.ok(s.log.confirms.every(c => c.opts.defaultYes === false && c.opts.safeAnswer === false)) // ui/prompt.js's options
   assert.ok(s.log.execs.every(e => e.cwd === HOME), 'installers never start in the current folder')
   assert.deepEqual(s.log.choices.map(c => c.key), ['podman', 'docker', 'cancel'])
   assert.equal(r.installed, true)

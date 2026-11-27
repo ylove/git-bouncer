@@ -10,8 +10,9 @@
 //     `true` counts as yes; anything else (a typo, "y" as a string, an error) counts as no.
 //  3. Never escalate. Nothing here runs sudo. On Linux, where installing needs root, the commands
 //     are printed so the person can read them and run them themselves.
-//  4. Never in non-interactive mode. In CI, with --json, or with no terminal, nothing is offered
-//     and nothing runs; the caller gets the manual instructions to print instead.
+//  4. Never without a person at a terminal. It only asks when the caller says it may
+//     (interactive: true), stdin and stderr are both terminals, and CI isn't set. Otherwise nothing
+//     is offered and nothing runs; the caller gets the manual instructions to print instead.
 //
 // Everything that touches the outside world (finding programs, asking questions, running
 // commands, printing) is passed in, so the tests drive every path without installing anything.
@@ -258,15 +259,17 @@ function manualSummary(platform) {
  * @param {string} [io.platform]  defaults to process.platform
  * @param {(cmd: string) => Promise<string|null>} [io.resolve]  a program's absolute path, or null
  *   (default: findProgram, which checks known install locations, then trusted PATH folders)
- * @param {(question: string, opts: {default: boolean}) => Promise<boolean>} [io.confirm]  yes/no prompt
+ * @param {(question: string, opts: {defaultYes: boolean, safeAnswer: boolean}) => Promise<boolean>} [io.confirm]
+ *   yes/no prompt, same shape as ui/prompt.js
  * @param {(question: string, options: {key: string, label: string}[]) => Promise<string>} [io.choose]
  * @param {(file: string, args: string[], opts: {cwd: string, env: object}) => Promise<{code: number|null, signal?: string|null, error?: Error|string}>} [io.exec]
  *   run an absolute path with stdio inherited (default: runInstaller)
- * @param {(text: string) => void} [io.out]  print
+ * @param {(text: string) => void} [io.out]  print (default: stderr, where the prompts are)
  * @param {() => string|null} [io.readOsRelease]  the text of /etc/os-release, or null
  * @param {Record<string, string|undefined>} [io.env]  the environment installers run with
  * @param {string} [io.home]  installers start in this folder (default: your home folder)
- * @param {boolean} [io.interactive]  false (or no confirm/choose) means: offer nothing, run nothing
+ * @param {boolean} [io.interactive]  the caller's go-ahead to ask. Default false: offer nothing, run nothing
+ * @param {{stdin?: boolean, stderr?: boolean}} [io.isTTY]  are these terminals? (default: process.*.isTTY)
  * @returns {Promise<{installed: boolean, runtime?: 'podman'|'docker', reason: string, nextSteps: string[]}>}
  *   installed: an install command ran and succeeded during this call.
  *   reason: 'installed' | 'non-interactive' | 'cancelled' | 'manual' | 'already-installed' |
@@ -281,11 +284,15 @@ export async function offerInstall({
   confirm,
   choose,
   exec = runInstaller,
-  out = text => process.stdout.write(`${text}\n`),
+  out = text => process.stderr.write(`${text}\n`),
   readOsRelease: read = readOsRelease,
-  interactive = true,
+  interactive = false,
+  isTTY = { stdin: process.stdin.isTTY, stderr: process.stderr.isTTY },
 } = {}) {
-  if (interactive !== true || typeof confirm !== 'function' || typeof choose !== 'function') {
+  // Checked here, not left to the caller: a forgotten flag or an auto-answering prompter must not
+  // be able to install anything in CI or with nobody at the keyboard.
+  const someoneIsThere = interactive === true && isTTY.stdin === true && isTTY.stderr === true && !env.CI
+  if (!someoneIsThere || typeof confirm !== 'function' || typeof choose !== 'function') {
     return { installed: false, reason: 'non-interactive', nextSteps: manualSummary(platform) }
   }
   const found = new Map()
@@ -325,7 +332,7 @@ export async function offerInstall({
     }
     const cmd = show([clean(file), ...step.argv.slice(1)])
     out(`\nStep ${i + 1} of ${total}: ${cmd}\n  ${step.what}`)
-    if (await confirm(`Run "${cmd}" now?`, { default: false }) !== true) {
+    if (await confirm(`Run "${cmd}" now?`, ASK) !== true) {
       out('Skipped. Nothing else was run.')
       return { installed, runtime, reason: 'declined', nextSteps: [...rest, ...opt.after] }
     }
@@ -347,6 +354,9 @@ export async function offerInstall({
   out(`\n${opt.name} is installed.`)
   return { installed, runtime, reason: 'installed', nextSteps: opt.after }
 }
+
+// The answer for Enter alone, and for nobody-there, is always no.
+const ASK = Object.freeze({ defaultYes: false, safeAnswer: false })
 
 function failure(result) {
   if (result && result.signal) return `stopped by ${clean(result.signal)}`
