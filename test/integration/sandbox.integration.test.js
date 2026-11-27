@@ -85,8 +85,12 @@ test('the sandbox is locked down: non-root, no capabilities, read-only root, noe
   assert.doesNotMatch(noexec.stdout, /ran/)
   const env = (await exec(name, ['env'])).stdout
   assert.doesNotMatch(env, /host-secret-must-not-leak|GITHUB_TOKEN|GH_TOKEN|SNYK_TOKEN|AWS_|NPM_TOKEN/)
+  // No bind mounts or volumes at all, according to the engine itself. (/proc/mounts can't be used for
+  // this: rootless Podman's own overlay storage lives under the runner's home directory.)
+  const declared = JSON.parse((await run(engine, ['inspect', '--format', '{{json .Mounts}}', name])).stdout.trim() || '[]')
+  assert.deepEqual(declared, [])
   const mounts = (await exec(name, ['cat', '/proc/mounts'])).stdout
-  assert.doesNotMatch(mounts, /docker\.sock|\/Users|\/home\/runner/)
+  assert.doesNotMatch(mounts, /docker\.sock|podman\.sock/)
 })
 
 test('a lockfile whose checksum does not match the registry is turned away (EINTEGRITY)', { skip }, async () => {
