@@ -1,0 +1,7 @@
+{
+  "name": "git-bouncer-scanner",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Runs inside the git-bouncer sandbox. Never on the host.",
+  "type": "module"
+}
