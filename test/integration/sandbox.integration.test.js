@@ -47,7 +47,7 @@ async function scanFixture(files) {
   try {
     await copyIn(name, fx.dir)
     const nonce = randomBytes(16).toString('hex')
-    const r = await exec(name, ['node', '/opt/bouncer/scanner/main.js', '--no-clone', '--dir', '/work/repo', '--nonce', nonce])
+    const r = await run(engine, ['exec', '--interactive', name, 'node', '/opt/bouncer/scanner/main.js', '--no-clone', '--dir', '/work/repo', '--nonce-stdin'], { timeoutMs: 15 * 60_000, input: `${nonce}\n` })
     const { report } = extractReport(r.stdout, nonce)
     assert.ok(report, `no report: ${r.stderr.slice(-500)}`)
     return report
@@ -135,12 +135,14 @@ test('end to end: `bouncer clone` brings over exactly the scanned commit', { ski
   try {
     process.chdir(dir)
     const yes = { interactive: true, confirm: async () => true }
-    const code = await main(['clone', 'https://github.com/octocat/Hello-World', 'hello', '--no-snyk', '--runtime', engine], { stdout: { write() {} }, stderr: { write() {} }, prompter: yes })
+    let log = ''
+    const code = await main(['clone', 'https://github.com/octocat/Hello-World', 'hello', '--no-snyk', '--runtime', engine], { stdout: { write() {} }, stderr: { write(s) { log += s } }, prompter: yes })
     assert.equal(code, 0)
+    const scanned = (log.match(/scanned commit ([0-9a-f]{40})/) || [])[1]
     const readme = await readFile(path.join(dir, 'hello', 'README'), 'utf8')
     assert.match(readme, /Hello World/)
     const head = (await run('git', ['-C', path.join(dir, 'hello'), 'rev-parse', 'HEAD'])).stdout.trim()
-    assert.match(head, /^[0-9a-f]{40}$/)
+    assert.equal(head, scanned, 'the clone must be exactly the commit the sandbox scanned')
     // A second clone into the same folder is refused rather than writing into it.
     const again = await main(['clone', 'https://github.com/octocat/Hello-World', 'hello', '--no-snyk', '--runtime', engine], { stdout: { write() {} }, stderr: { write() {} }, prompter: yes })
     assert.equal(again, 2)
