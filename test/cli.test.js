@@ -111,3 +111,10 @@ test('verdict policy: malformed severities fail closed and are counted as unknow
   }
   assert.equal(computeVerdict('not an array', { complete: true }).verdict, 'fail')
 })
+
+test('-v with a command is an error, not a silent exit 0 (it would look like a check passed)', async () => {
+  assert.throws(() => parseCommand(['clone', '-v', 'owner/repo']), /can't be combined/)
+  assert.equal(parseCommand(['-v']).command, 'version')
+  const r = runBin('bouncer.js', ['clone', '-v', 'https://github.com/a/b'])
+  assert.equal(r.status, EXIT.ERROR)
+})
