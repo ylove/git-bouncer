@@ -98,7 +98,7 @@ Known-malware and known-vulnerability lookups use [osv-scanner](https://github.c
 | `LOCK-MISSING-INTEGRITY` | medium | Lockfile entries have no integrity hash. |
 | `LOCK-OUT-OF-SYNC` | medium | `package.json` and the lockfile disagree, so the exact tree couldn't be verified. |
 | `LOCK-UNPARSABLE`, `LOCK-RESOLVED-ODD` | medium | The lockfile is broken or points somewhere unusual. |
-| `YARN-PATH` | low / medium / high | Yarn would run a JavaScript file from the repo: low for Berry's standard `.yarn/releases/yarn-x.y.z.cjs`, medium for anything else, high for classic `.yarnrc` `yarn-path`. |
+| `YARN-PATH` | medium / high | Yarn would run a JavaScript file from the repo on every command. Medium for Berry's `yarnPath`, including the standard `.yarn/releases/yarn-x.y.z.cjs`: that file is repo-controlled code, not checked against a real Yarn release. High for classic `.yarnrc` `yarn-path`. |
 | `NPMRC-SCOPED-REGISTRY` | medium | Some scopes come from a third-party registry (common for paid packages like Font Awesome Pro). |
 | `BUNFIG-PRELOAD` | medium | `bunfig.toml` preloads scripts before your code runs. |
 | `PY-INDEX-OVERRIDE` | medium | A requirements file adds or replaces the Python package index (dependency confusion). |

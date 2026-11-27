@@ -53,3 +53,16 @@ test('[audit 8] osv-scanner never resolves transitive dependencies (no fetching 
   }
   assert.deepEqual(calls.map(a => a[a.indexOf('-L') + 1]).sort(), ['package-lock.json', 'pom.xml'])
 })
+
+// --- 5: a repo-shipped .yarn/releases/yarn-*.cjs is repo code that every yarn command runs ---------
+
+test('[audit 5] yarnPath is a warning even at the standard .yarn/releases path', async () => {
+  const fx = await fixture({ '.yarnrc.yml': 'yarnPath: .yarn/releases/yarn-4.5.0.cjs\n' })
+  try {
+    const f = new Findings()
+    await dependencyChecks(fx.dir, f, { skipInstall: true, osvBin: 'osv-scanner-not-installed-in-unit-tests' })
+    const y = f.toJSON().find(x => x.id === 'YARN-PATH')
+    assert.equal(y?.severity, 'medium', ids(f.toJSON()))
+    assert.match(y.detail, /repo-controlled code/)
+  } finally { await fx.cleanup() }
+})

@@ -397,10 +397,11 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
     if (lower === '.yarnrc.yml') {
       const yp = text.match(/^\s*yarnPath:\s*["']?([^"'\n]+)/m)
       if (yp) {
-        const official = /^\.yarn\/releases\/yarn-[\d.]+(-[\w.]+)?\.c?js$/.test(yp[1].trim())
-        findings.add({ id: 'YARN-PATH', severity: official ? 'low' : 'medium', file: rc, evidence: yp[1].trim().slice(0, 120),
+        // Medium even for the standard .yarn/releases/yarn-x.y.z.cjs path: the file at that path is whatever
+        // the repo committed, and nothing checks it against a real Yarn release.
+        findings.add({ id: 'YARN-PATH', severity: 'medium', file: rc, evidence: yp[1].trim().slice(0, 120),
           title: 'Running yarn here executes a JavaScript file from the repo',
-          detail: '`yarnPath` makes every yarn command run the repo\'s own copy of Yarn. That\'s normal for Yarn Berry, but it means the repo controls the program that installs your dependencies.' })
+          detail: '`yarnPath` makes every yarn command (even `yarn --version`) run this file from the repo instead of the Yarn you installed. Yarn Berry projects commonly ship one at .yarn/releases/yarn-x.y.z.cjs, but the path proves nothing: the file is repo-controlled code, it was not compared with a real Yarn release, and it runs with your permissions the moment you type `yarn`.' })
       }
       const reg = text.match(/^\s*npmRegistryServer:\s*["']?([^"'\s]+)/m)
       if (reg && !isRegistryUrl(reg[1])) findings.add({ id: 'NPMRC-OVERRIDE', severity: 'high', file: rc, evidence: `npmRegistryServer: ${reg[1].slice(0, 100)}`,
