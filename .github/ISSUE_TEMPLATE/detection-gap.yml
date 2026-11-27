@@ -1,0 +1,21 @@
+name: Detection gap
+description: A malicious technique git-bouncer doesn't catch yet
+labels: [detection]
+body:
+  - type: textarea
+    id: technique
+    attributes:
+      label: Technique
+      description: What does the malicious repo do, and how would someone trigger it (open, install, build, run)?
+    validations:
+      required: true
+  - type: input
+    id: source
+    attributes:
+      label: Public write-up
+      description: A link to research or reporting describing the technique.
+  - type: textarea
+    id: example
+    attributes:
+      label: Minimal, inert example
+      description: The smallest harmless file or config that shows the pattern. Please don't paste live malware or working payloads.

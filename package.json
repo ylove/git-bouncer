@@ -4,6 +4,20 @@
   "private": true,
   "description": "Don't just git clone. A door check for repos you didn't write: ID check, sandboxed pat-down, then a verdict before anything touches your machine.",
   "type": "module",
+  "bin": {
+    "bouncer": "bin/bouncer.js",
+    "git-bouncer": "bin/git-bouncer.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "sandbox/",
+    "LICENSE",
+    "NOTICE",
+    "README.md",
+    "SECURITY.md",
+    "THREAT_MODEL.md"
+  ],
   "engines": {
     "node": ">=22"
   },

@@ -1,0 +1,22 @@
+name: False positive
+description: A legitimate repository was flagged
+labels: [bug]
+body:
+  - type: input
+    id: repo
+    attributes:
+      label: Repository
+      description: Public URL of the repository that was flagged.
+    validations:
+      required: true
+  - type: input
+    id: finding
+    attributes:
+      label: Finding ID
+      description: For example AUTORUN-VSCODE-FOLDEROPEN.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it's legitimate

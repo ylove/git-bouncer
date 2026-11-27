@@ -5,12 +5,18 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Wait a week before adopting a brand-new release. Hijacked package versions are usually
+    # caught and pulled within days, so a cooldown keeps them from landing here automatically.
+    cooldown:
+      default-days: 7
     labels: [dependencies]
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     labels: [dependencies]
     groups:
       # One PR for every action, so steps that must share a version (CodeQL init/analyze/upload-sarif) move together.
