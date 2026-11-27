@@ -94,7 +94,7 @@ test('lockfile entries over http, from odd hosts, from git, or without integrity
   const fx = await fixture({ 'package-lock.json': JSON.stringify(lock) })
   try {
     const f = new Findings()
-    const names = await lockfileChecks(fx.dir, f)
+    const { names } = await lockfileChecks(fx.dir, f)
     const r = f.toJSON()
     for (const [id, sev] of [['LOCK-RESOLVED-INSECURE', 'high'], ['LOCK-RESOLVED-NONREGISTRY', 'medium'], ['LOCK-RESOLVED-GIT', 'low'], ['LOCK-MISSING-INTEGRITY', 'medium'], ['LOCK-WEAK-INTEGRITY', 'low']]) {
       assert.ok(r.some(x => x.id === id && x.severity === sev), `${id} in ${ids(r)}`)
@@ -122,7 +122,9 @@ test('requirements.txt with --extra-index-url (dependency confusion) is a warnin
   assert.ok(r.some(f => f.id === 'PY-INDEX-OVERRIDE'), ids(r))
 })
 
-test('yarnPath is reported, because yarn would run the repo\'s own copy of Yarn', async () => {
-  const r = await deps({ '.yarnrc.yml': 'yarnPath: .yarn/releases/yarn-4.5.0.cjs\n' })
-  assert.ok(r.some(f => f.id === 'YARN-PATH' && f.severity === 'medium'), ids(r))
+test('yarnPath is reported: low for the standard release path, a warning anywhere else', async () => {
+  const std = await deps({ '.yarnrc.yml': 'yarnPath: .yarn/releases/yarn-4.5.0.cjs\n' })
+  assert.ok(std.some(f => f.id === 'YARN-PATH' && f.severity === 'low'), ids(std))
+  const odd = await deps({ '.yarnrc.yml': 'yarnPath: scripts/setup.js\n' })
+  assert.ok(odd.some(f => f.id === 'YARN-PATH' && f.severity === 'medium'), ids(odd))
 })
