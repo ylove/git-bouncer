@@ -35,9 +35,9 @@ export const KNOWN_OWNERS = Object.freeze([
   // Python
   'python', 'psf', 'pypa', 'pallets', 'django', 'tiangolo', 'fastapi', 'pydantic', 'astral-sh', 'numpy',
   'pandas-dev', 'scikit-learn', 'jupyter', 'pytorch', 'tensorflow', 'keras-team', 'huggingface', 'ansible',
-  'home-assistant', 'streamlit',
+  'home-assistant', 'streamlit', 'fastai',
   // Go and cloud native
-  'golang', 'kubernetes', 'kubernetes-sigs', 'prometheus', 'helm', 'istio', 'containerd', 'moby', 'spf13',
+  'golang', 'kubernetes', 'kubernetes-sigs', 'prometheus', 'helm', 'istio', 'containerd', 'containers', 'moby', 'spf13',
   'gohugoio', 'traefik', 'minio', 'open-telemetry',
   // Rust
   'rust-lang', 'tokio-rs', 'tauri-apps', 'bevyengine', 'burntsushi', 'zed-industries',
