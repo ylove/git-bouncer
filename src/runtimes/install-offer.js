@@ -1,0 +1,232 @@
+// No container runtime? Offer to install one, asking first at every step.
+//
+// git-bouncer runs its checks inside a throwaway container, so it needs Podman or Docker. When it
+// finds neither, "command not found" leaves people stuck. But installing software on someone's
+// machine is a big deal, so this module follows four rules:
+//
+//  1. Explain the choice first, in plain language, and let the person pick one or cancel.
+//  2. Show the exact command, then run it only after an explicit yes. One yes per command: saying
+//     yes to "install Podman" is not saying yes to "create a virtual machine". Only the boolean
+//     `true` counts as yes; anything else (a typo, "y" as a string, an error) counts as no.
+//  3. Never escalate. Nothing here runs sudo. On Linux, where installing needs root, the commands
+//     are printed so the person can read them and run them themselves.
+//  4. Never in non-interactive mode. In CI, with --json, or with no terminal, nothing is offered
+//     and nothing runs; the caller gets the manual instructions to print instead.
+//
+// Everything that touches the outside world (finding programs, asking questions, running
+// commands, printing) is passed in, so the tests drive every path without installing anything.
+
+import { clean } from '../ui/sanitize.js'
+
+// Official pages only. Docker's terms change, so we link them instead of quoting numbers.
+export const LINKS = Object.freeze({
+  podman: 'https://podman.io/docs/installation',
+  dockerDesktop: 'https://www.docker.com/products/docker-desktop/',
+  dockerTerms: 'https://docs.docker.com/subscription/desktop-license/',
+  dockerEngine: 'https://docs.docker.com/engine/install/',
+  colima: 'https://github.com/abiosoft/colima',
+})
+
+// winget package IDs, checked against the manifests in github.com/microsoft/winget-pkgs: both
+// download their installers from the publisher's own release URLs. `--source winget` pins the
+// lookup to that repository, and `-e` (exact) stops a similarly named package from matching.
+export const WINGET_IDS = Object.freeze({ podman: 'RedHat.Podman', docker: 'Docker.DockerDesktop' })
+
+// From https://podman.io/docs/installation. Printed, never run: they need root.
+const LINUX_PODMAN = Object.freeze({
+  apt: ['sudo apt-get update', 'sudo apt-get -y install podman'],
+  dnf: ['sudo dnf -y install podman'],
+  pacman: ['sudo pacman -S podman'],
+  zypper: ['sudo zypper install podman'],
+  apk: ['sudo apk add podman'],
+})
+
+// os-release ID / ID_LIKE values -> package manager. Derivatives (Mint, Pop!_OS, Rocky, Manjaro,
+// openSUSE Tumbleweed...) name their parent in ID_LIKE, so the parents are enough here.
+const LINUX_FAMILIES = [
+  ['apt', ['debian', 'ubuntu']],
+  ['dnf', ['fedora', 'rhel', 'centos']],
+  ['pacman', ['arch']],
+  ['zypper', ['suse', 'opensuse', 'sles']],
+  ['apk', ['alpine']],
+]
+// Used only when os-release is missing or unfamiliar: is the package manager itself on PATH?
+const PM_PROGRAMS = [['apt', 'apt-get'], ['dnf', 'dnf'], ['pacman', 'pacman'], ['zypper', 'zypper'], ['apk', 'apk']]
+
+const show = argv => argv.join(' ') // every argv here is a constant from this file
+const DOCTOR = 'Then run "bouncer doctor" to check that git-bouncer can use it.'
+
+/**
+ * Read the fields we need from /etc/os-release text. Unknown or malformed lines are ignored.
+ * @param {string|null} text
+ * @returns {{id: string|null, idLike: string[], name: string|null}}
+ */
+export function parseOsRelease(text) {
+  const fields = new Map()
+  if (typeof text === 'string') {
+    for (const raw of text.slice(0, 64 * 1024).split(/\r?\n/)) {
+      const m = /^([A-Z0-9_]+)=(.*)$/.exec(raw.trim())
+      if (!m) continue
+      let value = m[2].trim()
+      if (value.length >= 2 && (value[0] === '"' || value[0] === "'") && value.at(-1) === value[0]) value = value.slice(1, -1)
+      fields.set(m[1], value)
+    }
+  }
+  const words = v => (v ?? '').toLowerCase().split(/\s+/).filter(Boolean)
+  return { id: words(fields.get('ID'))[0] ?? null, idLike: words(fields.get('ID_LIKE')), name: fields.get('PRETTY_NAME') || fields.get('NAME') || null }
+}
+
+function linuxPackageManager(osRelease, has) {
+  const { id, idLike } = parseOsRelease(osRelease)
+  for (const candidate of [id, ...idLike]) {
+    for (const [pm, ids] of LINUX_FAMILIES) if (candidate && ids.includes(candidate)) return pm
+  }
+  for (const [pm, program] of PM_PROGRAMS) if (has(program) === true) return pm
+  return null
+}
+
+/**
+ * Work out what can be offered on this machine. Pure: it runs nothing and reads nothing itself.
+ *
+ * Each option has:
+ *   steps   commands git-bouncer may run, each only after its own yes ([] when it won't run anything)
+ *   manual  what to do yourself instead (always present)
+ *   after   what's left to do once every step has succeeded
+ *   notes   shown before the steps
+ *
+ * @param {{platform?: string, has: (cmd: string) => boolean, osRelease?: string|null}} opts
+ *   has: is this program on PATH?  osRelease: the text of /etc/os-release (Linux only)
+ */
+export function planInstall({ platform = process.platform, has, osRelease = null } = {}) {
+  if (typeof has !== 'function') throw new TypeError('planInstall needs has(cmd), which says whether a program is on PATH.')
+  const present = { podman: has('podman') === true, docker: has('docker') === true }
+  let packageManager = null
+  let distro = null
+  let podman
+  let docker
+
+  if (platform === 'darwin') {
+    packageManager = has('brew') === true ? 'brew' : null
+    podman = option('podman', 'Podman', {
+      notes: packageManager ? [`Podman's own docs recommend their installer (${LINKS.podman}). The Homebrew package used here is maintained by the Homebrew community.`] : [],
+      steps: packageManager ? [
+        { argv: ['brew', 'install', 'podman'], installs: true, what: 'Installs Podman with Homebrew.' },
+        { argv: ['podman', 'machine', 'init'], what: 'Creates the small Linux virtual machine that Podman runs containers in. It downloads a disk image, so it can take a few minutes.' },
+        { argv: ['podman', 'machine', 'start'], what: 'Starts that virtual machine.' },
+      ] : [],
+      manual: [`Download the Podman installer for macOS: ${LINKS.podman}`, 'Then run: podman machine init', 'Then run: podman machine start'],
+      after: [DOCTOR],
+    })
+    docker = option('docker', 'Docker Desktop', {
+      steps: packageManager ? [
+        { argv: ['brew', 'install', '--cask', 'docker-desktop'], installs: true, what: 'Installs Docker Desktop with Homebrew. Homebrew may ask for your Mac password to finish.' },
+      ] : [],
+      manual: [`Download Docker Desktop for Mac: ${LINKS.dockerDesktop}`, 'Open Docker Desktop once. It asks you to accept Docker\'s terms, then starts its engine.'],
+      after: ['Open Docker Desktop from your Applications folder once. It asks you to accept Docker\'s terms, then starts its engine.', DOCTOR],
+    })
+  } else if (platform === 'win32') {
+    packageManager = has('winget') === true ? 'winget' : null
+    podman = option('podman', 'Podman', {
+      notes: ['Podman on Windows needs Windows 11 or later. It runs containers in WSL 2 (or Hyper-V).'],
+      steps: packageManager ? [
+        { argv: ['winget', 'install', '-e', '--id', WINGET_IDS.podman, '--source', 'winget'], installs: true, what: 'Installs Podman with winget. Windows may ask you to allow the installer to make changes.' },
+      ] : [],
+      manual: [`Download the Podman installer for Windows: ${LINKS.podman}`, 'Then, in a new terminal, run: podman machine init', 'Then run: podman machine start'],
+      // A new terminal, because the installer's PATH change doesn't reach terminals that are already open.
+      after: ['Open a new terminal, so that podman is on your PATH.', 'Then run: podman machine init', 'Then run: podman machine start', DOCTOR],
+    })
+    docker = option('docker', 'Docker Desktop', {
+      steps: packageManager ? [
+        { argv: ['winget', 'install', '-e', '--id', WINGET_IDS.docker, '--source', 'winget'], installs: true, what: 'Installs Docker Desktop with winget. Windows may ask you to allow the installer to make changes.' },
+      ] : [],
+      manual: [`Download Docker Desktop for Windows: ${LINKS.dockerDesktop}`, 'Start Docker Desktop once. It asks you to accept Docker\'s terms, then starts its engine.'],
+      after: ['Start Docker Desktop from the Start menu. It asks you to accept Docker\'s terms, and may ask you to sign out or restart.', DOCTOR],
+    })
+  } else if (platform === 'linux') {
+    packageManager = linuxPackageManager(osRelease, has)
+    const name = parseOsRelease(osRelease).name
+    distro = name ? clean(name, { max: 80 }) : null // os-release is local, but it's still text we didn't write
+    podman = option('podman', 'Podman', {
+      notes: ['Installing needs administrator rights (sudo), so git-bouncer prints the commands instead of running them. Read them, then run them yourself.'],
+      steps: [],
+      manual: [
+        ...(packageManager ? LINUX_PODMAN[packageManager].map(c => `Run: ${c}`) : []),
+        packageManager ? `Other distributions and details: ${LINKS.podman}` : `Find the command for your distribution: ${LINKS.podman}`,
+        DOCTOR,
+      ],
+      after: [DOCTOR],
+    })
+    docker = option('docker', 'Docker Engine', {
+      steps: [],
+      manual: [
+        `Install Docker Engine with Docker's instructions for your distribution: ${LINKS.dockerEngine}`,
+        'Those instructions also offer to add you to the "docker" group. Know that being in that group is equivalent to root access on this machine.',
+        DOCTOR,
+      ],
+      after: [DOCTOR],
+    })
+  } else {
+    podman = option('podman', 'Podman', { steps: [], manual: [`Install Podman: ${LINKS.podman}`, DOCTOR], after: [DOCTOR] })
+    docker = option('docker', 'Docker', { steps: [], manual: [`Install Docker: ${LINKS.dockerEngine}`, DOCTOR], after: [DOCTOR] })
+  }
+
+  // Already there (just not usable right now)? Then installing it again is the wrong advice.
+  const vm = platform === 'darwin' || platform === 'win32'
+  if (present.podman) {
+    podman = option('podman', podman.name, {
+      installed: true, steps: [],
+      manual: vm
+        ? ['Podman is already installed. If git-bouncer can\'t use it, its virtual machine is probably not running.', 'Run: podman machine start', 'If you have never created one, run this first: podman machine init', DOCTOR]
+        : ['Podman is already installed.', 'Run "bouncer doctor" to see why git-bouncer can\'t use it.'],
+    })
+  }
+  if (present.docker) {
+    docker = option('docker', docker.name, {
+      installed: true, steps: [],
+      manual: ['Docker is already installed. Make sure Docker Desktop (or the Docker engine) is running.', DOCTOR],
+    })
+  }
+  return { platform, packageManager, distro, options: { podman, docker } }
+}
+
+function option(key, name, { installed = false, notes = [], steps = [], manual = [], after = [] }) {
+  return { key, name, installed, notes, steps, manual, after }
+}
+
+/** The one screen that explains the choice. */
+export function explainChoices(plan) {
+  const vm = plan.platform === 'darwin' || plan.platform === 'win32'
+  const lines = [
+    'git-bouncer checks repositories inside a throwaway container, so it needs Podman or Docker,',
+    'and it couldn\'t find either one. It can help you install one now.',
+    'Nothing is installed unless you say yes, and you can cancel at any step.',
+    '',
+    '  Podman (recommended)',
+    '    Free and open source. No account or sign-up needed.',
+    '    Daemonless: no background service running as root. On Linux, containers run as your own user.',
+  ]
+  if (vm) lines.push('    On macOS and Windows it runs containers inside a small Linux virtual machine.')
+  lines.push('')
+  if (plan.platform === 'linux') {
+    lines.push(
+      '  Docker Engine',
+      '    Open source on Linux. (Docker Desktop, Docker\'s separate desktop app, has its own license terms:',
+      `    ${LINKS.dockerTerms})`,
+    )
+  } else {
+    lines.push(
+      '  Docker Desktop',
+      '    Free for personal use, education, non-commercial open source projects and small businesses.',
+      '    Larger companies and government organizations need a paid subscription.',
+      `    Check Docker's current terms before you use it for work: ${LINKS.dockerTerms}`,
+    )
+  }
+  lines.push('', '  Cancel', '    Install nothing now. You can install either one yourself later.')
+  if (plan.platform === 'darwin') {
+    lines.push('', `Also open source, on a Mac: Colima runs the Docker engine without Docker Desktop (${LINKS.colima}).`)
+  }
+  if (plan.platform === 'linux' && plan.distro) {
+    lines.push('', `This looks like ${plan.distro}${plan.packageManager ? ` (${plan.packageManager})` : ''}.`)
+  }
+  return lines.join('\n')
+}
