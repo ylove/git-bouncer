@@ -16,6 +16,9 @@
 // Everything that touches the outside world (finding programs, asking questions, running
 // commands, printing) is passed in, so the tests drive every path without installing anything.
 
+import { spawn } from 'node:child_process'
+import { accessSync, constants, lstatSync, readFileSync, statSync } from 'node:fs'
+import path from 'node:path'
 import { clean } from '../ui/sanitize.js'
 
 // Official pages only. Docker's terms change, so we link them instead of quoting numbers.
@@ -247,10 +250,10 @@ function manualSummary(plan) {
  *
  * @param {object} io
  * @param {string} [io.platform]  defaults to process.platform
- * @param {(cmd: string) => boolean} io.has  is a program on PATH
+ * @param {(cmd: string) => boolean} [io.has]  is a program on PATH (defaults to a real PATH lookup)
  * @param {(question: string, opts: {default: boolean}) => Promise<boolean>} [io.confirm]  yes/no prompt
  * @param {(question: string, options: {key: string, label: string}[]) => Promise<string>} [io.choose]
- * @param {(cmd: string, args: string[]) => Promise<{code: number|null}>} io.exec  run a program, stdio inherited
+ * @param {(cmd: string, args: string[]) => Promise<{code: number|null}>} [io.exec]  run a program, stdio inherited
  * @param {(text: string) => void} [io.out]  print
  * @param {() => string|null} [io.readOsRelease]  the text of /etc/os-release, or null
  * @param {boolean} [io.interactive]  false (or no confirm/choose) means: offer nothing, run nothing
@@ -261,12 +264,12 @@ function manualSummary(plan) {
  */
 export async function offerInstall({
   platform = process.platform,
-  has,
+  has = onPath,
   confirm,
   choose,
-  exec,
+  exec = runCommand,
   out = text => process.stdout.write(`${text}\n`),
-  readOsRelease: read = () => null,
+  readOsRelease: read = readOsRelease,
   interactive = true,
 } = {}) {
   const plan = planInstall({ platform, has, osRelease: platform === 'linux' ? read() : null })
@@ -320,4 +323,78 @@ export async function offerInstall({
   }
   out(`\n${opt.name} is installed.`)
   return { installed, runtime, reason: 'installed', nextSteps: opt.after }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The real implementations of `has` and `exec`, used when the caller doesn't pass its own.
+
+/** The text of /etc/os-release (or /usr/lib/os-release), or null. */
+export function readOsRelease() {
+  for (const file of ['/etc/os-release', '/usr/lib/os-release']) {
+    try { return readFileSync(file, 'utf8').slice(0, 64 * 1024) } catch { /* try the next one */ }
+  }
+  return null
+}
+
+/**
+ * Find a program on PATH and return its absolute path, or null.
+ *
+ * Relative PATH entries ("", ".", "bin") are skipped: they mean "the current folder", and the
+ * current folder may be a repository you're about to check. On Windows only .com and .exe are
+ * considered, because those are the only files a process can be started from without a shell.
+ */
+export function findOnPath(cmd, { env = process.env, platform = process.platform } = {}) {
+  if (typeof cmd !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(cmd)) return null
+  const win = platform === 'win32'
+  const p = win ? path.win32 : path.posix
+  const value = (win ? env.PATH ?? env.Path ?? env.path : env.PATH) ?? ''
+  const names = win ? (/\.(com|exe)$/i.test(cmd) ? [cmd] : [`${cmd}.com`, `${cmd}.exe`]) : [cmd]
+  for (const entry of value.split(win ? ';' : ':')) {
+    const dir = win ? entry.replace(/^"(.*)"$/, '$1') : entry
+    if (!dir || !p.isAbsolute(dir)) continue
+    for (const name of names) {
+      const file = p.join(dir, name)
+      if (isProgram(file, win)) return file
+    }
+  }
+  return null
+}
+
+/** Is a program on PATH? (The default `has`.) */
+export function onPath(cmd, opts) {
+  return findOnPath(cmd, opts) !== null
+}
+
+function isProgram(file, win) {
+  try {
+    if (!statSync(file).isFile()) return false
+    if (!win) accessSync(file, constants.X_OK)
+    return true
+  } catch {
+    // stat can fail on Windows "app execution aliases" (how winget.exe is installed); they still run.
+    if (!win) return false
+    try { lstatSync(file); return true } catch { return false }
+  }
+}
+
+/**
+ * Run a program with the terminal attached, so the person sees the installer's own output and
+ * prompts. An argument array and no shell, so nothing is ever re-parsed. The program is resolved
+ * to an absolute path first: on Windows, starting a bare name looks in the current folder before
+ * PATH, so a "winget.exe" sitting in the current folder would otherwise run instead of the real one.
+ * @returns {Promise<{code: number|null, signal?: string|null, error?: string}>}
+ */
+export function runCommand(cmd, args, { env = process.env, platform = process.platform } = {}) {
+  return new Promise(resolve => {
+    const file = path.isAbsolute(cmd) ? cmd : findOnPath(cmd, { env, platform })
+    if (!file) return resolve({ code: null, error: `${cmd} was not found on your PATH` })
+    let child
+    try {
+      child = spawn(file, args, { stdio: 'inherit', shell: false })
+    } catch (e) {
+      return resolve({ code: null, error: e.message })
+    }
+    child.on('error', e => resolve({ code: null, error: e.message }))
+    child.on('close', (code, signal) => resolve({ code, signal }))
+  })
 }

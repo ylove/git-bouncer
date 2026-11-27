@@ -1,6 +1,15 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { planInstall, offerInstall, explainChoices, parseOsRelease, LINKS, WINGET_IDS } from '../src/runtimes/install-offer.js'
+import { spawnSync } from 'node:child_process'
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import {
+  planInstall, offerInstall, explainChoices, parseOsRelease, findOnPath, onPath, runCommand, LINKS, WINGET_IDS,
+} from '../src/runtimes/install-offer.js'
+
+const moduleFile = fileURLToPath(new URL('../src/runtimes/install-offer.js', import.meta.url))
 
 // A fake machine: `programs` is what's "on PATH". Nothing in these tests installs or runs an installer.
 const hasOnly = (...programs) => cmd => programs.includes(cmd)
@@ -282,4 +291,38 @@ test('already installed: says so, runs nothing', async () => {
   const r = await s.run()
   assert.equal(r.reason, 'already-installed')
   assert.deepEqual(s.log.execs, [])
+})
+
+// --- the real `has` and `exec` (no installers involved) -----------------------------------------
+
+test('findOnPath finds programs in absolute PATH entries and ignores relative ones', t => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'bouncer-path-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const win = process.platform === 'win32'
+  const file = path.join(dir, win ? 'fake-tool.exe' : 'fake-tool')
+  writeFileSync(file, '')
+  if (!win) chmodSync(file, 0o755)
+  const sep = path.delimiter
+  assert.equal(findOnPath('fake-tool', { env: { PATH: `${dir}${sep}` } }), file)
+  assert.equal(onPath('fake-tool', { env: { PATH: dir } }), true)
+  // Run from inside that folder, PATH entries meaning "the current folder" must not find it.
+  const lookup = `import { findOnPath } from ${JSON.stringify(pathToFileURL(moduleFile).href)}
+for (const PATH of ['.', '', '${sep}', '.${sep}x']) console.log(findOnPath('fake-tool', { env: { PATH } }))`
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', lookup], { cwd: dir, encoding: 'utf8' })
+  assert.equal(child.status, 0, child.stderr)
+  assert.deepEqual(child.stdout.trim().split(/\r?\n/), ['null', 'null', 'null', 'null'])
+  // Only plain program names are looked up.
+  for (const name of ['../fake-tool', 'a/b', '-x', '', 'fake tool']) assert.equal(findOnPath(name, { env: { PATH: dir } }), null, name)
+  if (!win) {
+    chmodSync(file, 0o644) // not executable
+    assert.equal(findOnPath('fake-tool', { env: { PATH: dir } }), null)
+  }
+})
+
+test('runCommand passes an argument array (no shell) and reports the exit code', async () => {
+  const r = await runCommand(process.execPath, ['-e', 'process.exit(process.argv[1] === "a b; c" ? 7 : 1)', 'a b; c'])
+  assert.equal(r.code, 7)
+  const missing = await runCommand('no-such-program-for-bouncer-tests', [], { env: { PATH: '' } })
+  assert.equal(missing.code, null)
+  assert.match(missing.error, /not found/)
 })
