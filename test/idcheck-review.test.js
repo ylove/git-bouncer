@@ -215,7 +215,9 @@ test('review 8: gh is only found on absolute PATH entries, so a planted ./gh is 
     writeFileSync(planted, '#!/bin/sh\necho planted\n')
     chmodSync(planted, 0o755)
     assert.equal(await which('gh', { PATH: ['', '.', 'relative/bin'].join(delimiter), PATHEXT: '.EXE' }), null)
-    assert.equal(await which('gh', { PATH: dir, PATHEXT: '.EXE' }), planted, 'the same file is found from an absolute entry')
+    const found = await which('gh', { PATH: dir, PATHEXT: '.EXE' })
+    // Windows file names ignore case, and which() reports the extension as PATHEXT spells it.
+    assert.equal(found?.toLowerCase(), planted.toLowerCase(), 'the same file is found from an absolute entry')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
