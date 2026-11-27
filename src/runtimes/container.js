@@ -32,9 +32,18 @@ const MINIMAL_ENV = () => {
 
 /** The exact `run` flags. Exported so tests (and curious readers) can see them in one place. */
 export function runArgs({ name, image, workSize = '3g' }) {
+  return ['run', '--detach', '--name', name, ...sandboxFlags({ workSize }), image]
+}
+
+/**
+ * The hardening every sandbox gets, local or in the cloud (src/runtimes/gcp.js and aws.js use this
+ * too), so the two can't drift apart. `--init` makes a tiny init process PID 1: it reaps orphaned
+ * processes, and keeps the scanner's own command line out of the fixed, well-known /proc/1/cmdline.
+ * `--pull=never` means a missing image is an error, never a download of a look-alike name.
+ */
+export function sandboxFlags({ workSize = '3g' } = {}) {
   return [
-    'run', '--detach', '--init',
-    '--name', name,
+    '--init',
     '--label', LABEL,
     '--cap-drop=ALL',
     '--security-opt=no-new-privileges',
@@ -48,7 +57,6 @@ export function runArgs({ name, image, workSize = '3g' }) {
     '--cpus', '2',
     '--network', 'bridge',
     '--pull=never',
-    image,
   ]
 }
 
