@@ -4,7 +4,7 @@
 >
 > These runtimes are built and unit-tested: every generated build file and every command line has a test, and no test talks to a real cloud. The exact `docker run` command lines they generate have also been run against a locally built sandbox image. But nobody has run them against a real Google Cloud project or AWS account. Treat them as a careful starting point for your own setup, read what they would do with `--dry-run` first, and please [open an issue](https://github.com/ylove/git-bouncer/issues) if something doesn't work.
 
-Most people should use the local sandbox (Docker or Podman) or the Codespaces fallback. The cloud runtimes are for people who would rather run the check in their own cloud account, signed in with `gcloud` or `aws`. They are opt-in only: git-bouncer never picks them unless you pass `--runtime gcp` or `--runtime aws`.
+Most people should use the local sandbox (Docker or Podman). The cloud runtimes are for people who would rather run the check in their own cloud account, signed in with `gcloud` or `aws`. They are opt-in: git-bouncer uses them when you pass `--runtime gcp` or `--runtime aws`, or, when no local engine exists and you're signed in to one of them, it asks first (default No) because a build costs money.
 
 ## What they do
 
