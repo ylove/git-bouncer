@@ -1,0 +1,18 @@
+version: 2
+updates:
+  # git-bouncer has zero runtime dependencies, but this keeps any dev tooling honest if added.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    labels: [dependencies]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels: [dependencies]
+    groups:
+      # One PR for every action, so steps that must share a version (CodeQL init/analyze/upload-sarif) move together.
+      github-actions:
+        patterns: ["*"]

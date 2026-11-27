@@ -1,0 +1,9 @@
+name: git-bouncer CodeQL config
+queries:
+  - uses: security-extended
+
+# The tests build malicious-looking fixtures on purpose (fake droppers, hostile file names) to prove
+# the scanner catches them. Scanning them only produces noise that hides real alerts.
+# Everything that ships (bin/, src/, sandbox/) is scanned.
+paths-ignore:
+  - test

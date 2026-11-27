@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One run per branch or PR; a newer push to the same PR cancels the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read # read the code; nothing in CI writes to the repo
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
+
+      # Zero dependencies, so there is nothing to install: the tests run straight from the checkout.
+      - run: npm test
+
+  # Fails if the repo leaks things a public repo never should: absolute home-directory paths,
+  # email addresses, or leftover merge conflicts. The brackets stop these patterns matching this file.
+  hygiene:
+    name: hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: No absolute user paths
+        run: "! git grep -nIE '/U[s]ers/[A-Za-z]|/h[o]me/[a-z][a-z0-9_-]+/|C:\\\\U[s]ers\\\\' -- . ':!LICENSE'"
+
+      - name: No email addresses
+        run: "! git grep -nIE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[a-z]{2,}' -- . ':!LICENSE' ':!NOTICE' | grep -vE 'noreply@|@users\\.noreply\\.github\\.com|example\\.(com|org)|git@github\\.com'"
+
+      - name: No merge conflict markers
+        run: "! git grep -nE '^(<{7}|>{7}) ' -- ."

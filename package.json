@@ -1,0 +1,23 @@
+{
+  "name": "git-bouncer",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Don't just git clone. A door check for repos you didn't write: ID check, sandboxed pat-down, then a verdict before anything touches your machine.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "author": "Yitz Jordan (https://github.com/ylove)",
+  "homepage": "https://ylove.github.io/git-bouncer/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ylove/git-bouncer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ylove/git-bouncer/issues"
+  },
+  "license": "Apache-2.0"
+}
