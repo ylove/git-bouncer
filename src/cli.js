@@ -68,6 +68,10 @@ export function parseCommand(argv, { asGitSubcommand = false } = {}) {
   }
   const { values, positionals } = parsed
   if (values.help) return { command: 'help' }
+  // `--version` means "print the version" only on its own. With a command it's almost certainly a git
+  // option passed through a wrapper (`git clone -v <url> --bouncer`), and exiting 0 there would look
+  // like a successful check that never happened.
+  if (values.version && positionals.length) throw new UsageError('-v/--version can\'t be combined with a command.', 'bouncer clone takes no -v option; run "bouncer --help" for its options.')
   if (values.version) return { command: 'version' }
 
   let [command, ...rest] = positionals
