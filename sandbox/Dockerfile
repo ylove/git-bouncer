@@ -1,9 +1,11 @@
 # git-bouncer sandbox image.
 #
 # Built locally on first use from the copy of this file inside the npm package, so you're not
-# trusting a prebuilt image from anyone. Everything that comes from the internet is pinned:
+# trusting a prebuilt image from anyone. What's pinned:
 #   - the base image by digest (Dependabot proposes updates)
 #   - osv-scanner by version + the SHA256 published in its release's SHA256SUMS
+# What isn't: Debian packages (git, ca-certificates, and curl in the first stage) come from the
+# distribution's signed repositories at build time, so they track Debian's security updates.
 # The final image has no curl/wget, and runs as an unprivileged user.
 
 # ---- stage 1: fetch and verify osv-scanner -----------------------------------------------------

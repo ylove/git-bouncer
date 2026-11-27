@@ -41,7 +41,8 @@ export function runArgs({ name, image, workSize = '3g' }) {
     '--read-only',
     '--user', '10001:10001',
     '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=768m',
-    '--tmpfs', `/work:rw,nosuid,nodev,noexec,size=${workSize},uid=10001,gid=10001,mode=0700`,
+    // mode=1777 rather than uid=/gid= options, which Podman rejects. There is only one user in the box.
+    '--tmpfs', `/work:rw,nosuid,nodev,noexec,size=${workSize},mode=1777`,
     '--pids-limit', '512',
     '--memory', '4g',
     '--cpus', '2',
@@ -91,25 +92,45 @@ export function createContainerRuntime(engine, { exec = run, onLog = () => {} } 
         : 'docker is installed but the Docker engine is not running (start Docker Desktop, Colima or the docker service)' }
     },
 
+    /** Build (or reuse) the image and return its content ID; containers are started by ID, not by tag. */
     async ensureImage(version) {
       const tag = `git-bouncer-sandbox:${version}-${await sandboxHash()}`
       const inspect = await cli(['image', 'inspect', '--format', '{{.Id}}', tag], { timeoutMs: 30_000 })
-      if (inspect.code === 0) return tag
+      if (inspect.code === 0 && /^sha256:[0-9a-f]{64}$/.test(inspect.stdout.trim())) return inspect.stdout.trim()
       onLog('Building the sandbox image (first run only, about a minute)...')
       const b = await cli(['build', '--tag', tag, '--label', LABEL, SANDBOX_DIR], { timeoutMs: 20 * 60_000, onStderr: s => onLog(s.trimEnd()) })
       if (b.code !== 0) throw new Error(`could not build the sandbox image: ${(b.stderr || b.stdout).trim().split('\n').slice(-3).join(' ')}`)
-      return tag
+      const id = (await cli(['image', 'inspect', '--format', '{{.Id}}', tag], { timeoutMs: 30_000 })).stdout.trim()
+      if (!/^sha256:[0-9a-f]{64}$/.test(id)) throw new Error('could not read the sandbox image ID after building it')
+      return id
+    },
+
+    /** Remove sandboxes left behind by a crashed or killed run (older than two hours, ours only). */
+    async sweepStale(now = Date.now()) {
+      const ls = await cli(['ps', '--all', '--filter', `label=${LABEL}`, '--format', '{{.Names}}\t{{.CreatedAt}}'], { timeoutMs: 30_000 })
+      if (ls.code !== 0) return 0
+      let n = 0
+      for (const line of ls.stdout.split('\n').filter(Boolean)) {
+        const [name, created] = line.split('\t')
+        const t = Date.parse((created || '').replace(/ [A-Z]{2,5}$/, '').replace(' +0000', 'Z'))
+        if (/^git-bouncer-[0-9a-f]{12}$/.test(name) && Number.isFinite(t) && now - t > 2 * 3600_000) {
+          await cli(['rm', '--force', '--volumes', name], { timeoutMs: 60_000 }); n++
+        }
+      }
+      return n
     },
 
     /** Start the sandbox, run the scanner, return its raw output plus a session for later steps. */
-    async scan({ url, ref, nonce, image }) {
+    async scan({ url, ref, nonce, image, onSession = () => {} }) {
       const name = `git-bouncer-${randomBytes(6).toString('hex')}`
-      const started = await cli(runArgs({ name, image }), { timeoutMs: 60_000 })
-      if (started.code !== 0) throw new Error(`could not start the sandbox: ${started.stderr.trim().split('\n').pop()}`)
       const session = { engine, name }
-      const scanArgs = ['exec', name, 'node', '/opt/bouncer/scanner/main.js', '--url', url, '--nonce', nonce]
+      onSession(session) // known before the container exists, so an interrupt can always remove it
+      const started = await cli(runArgs({ name, image }), { timeoutMs: 60_000 })
+      if (started.code !== 0) throw Object.assign(new Error(`could not start the sandbox: ${started.stderr.trim().split('\n').pop()}`), { session })
+      // The nonce goes in on stdin: arguments are visible to every process in the container (/proc/*/cmdline).
+      const scanArgs = ['exec', '--interactive', name, 'node', '/opt/bouncer/scanner/main.js', '--url', url, '--nonce-stdin']
       if (ref) scanArgs.push('--ref', ref)
-      const r = await cli(scanArgs, { timeoutMs: 30 * 60_000, onStderr: s => onLog(s.trimEnd()) })
+      const r = await cli(scanArgs, { timeoutMs: 30 * 60_000, input: `${nonce}\n`, onStderr: s => onLog(s.trimEnd()) })
       return { reportText: r.stdout, exitCode: r.code, timedOut: r.timedOut, session }
     },
 
