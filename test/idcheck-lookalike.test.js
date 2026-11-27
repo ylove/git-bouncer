@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { skeleton, loose, editDistance, createMatcher } from '../src/idcheck/lookalike.js'
+import { skeleton, loose, stem, editDistance, createMatcher } from '../src/idcheck/lookalike.js'
 
 test('skeleton: look-alike characters and separators collapse to the same name', () => {
   for (const name of ['microsoft', 'Microsoft', 'micr0s0ft', 'rnicrosoft', 'mlcrosoft', 'm1crosoft', 'micro-soft', 'MICRO_SOFT']) {
@@ -111,4 +111,42 @@ test('handles empty and non-string input without throwing', () => {
   assert.equal(find(''), null)
   assert.equal(find(undefined), null)
   assert.equal(find(42), null)
+})
+
+test('an all-digit name is a number, not a disguise', () => {
+  const f = createMatcher(['babel', 'google'])
+  assert.equal(f('8483'), null) // would fold to "babe", one letter from babel
+  assert.equal(f('6006'), null)
+  assert.deepEqual(f('g00gle'), { match: 'google', kind: 'characters' }, 'digits inside a word still count')
+})
+
+test('stem: brand-wrapping words come off, but only while five letters are left', () => {
+  assert.equal(stem('microsoft-official'), 'microsoft')
+  assert.equal(stem('the-uniswap-labs'), 'uniswap')
+  assert.equal(stem('official-metamask-dev'), 'metamask')
+  assert.equal(stem('mistralai'), 'mistralai', 'a suspect name keeps its glued words')
+  assert.equal(stem('mistralai', { glued: true }), 'mistral', 'a well-known name loses them')
+  assert.equal(stem('openai', { glued: true }), 'openai', '"open" would be too short')
+  assert.equal(stem('nodejs', { glued: true }), 'nodejs')
+  assert.equal(stem('vue-js'), 'vuejs')
+})
+
+test('the brand plus a company word, or the bare brand of a suffixed name, is a stem match', () => {
+  const f = createMatcher(['microsoft', 'uniswap', 'openai', 'mistralai', 'unslothai', 'deepseek-ai', 'python', 'jupyter', 'postgres', 'nginx'])
+  for (const [name, match] of [['microsoft-official', 'microsoft'], ['uniswap-labs', 'uniswap'], ['openai-labs', 'openai'], ['real-python', 'python'],
+    ['mistral', 'mistralai'], ['unsloth', 'unslothai'], ['deepseek', 'deepseek-ai']]) {
+    assert.deepEqual(f(name), { match, kind: 'stem' }, name)
+  }
+  assert.deepEqual(f('m1crosoft-official'), { match: 'microsoft', kind: 'characters' }, 'a disguised brand plus a word is a disguise')
+  // Real, unrelated projects glue words onto a brand: these were false alarms when glued words counted.
+  for (const name of ['realpython', 'jupyterlab', 'postgresapp', 'nginxinc']) assert.equal(f(name), null, name)
+})
+
+test('a letter-pair disguise plus a typo, and two typos in a long name, are caught', () => {
+  const f = createMatcher(['microsoft', 'mongodb', 'modelcontextprotocol', 'vercel', 'golang'])
+  assert.deepEqual(f('rnicrosft'), { match: 'microsoft', kind: 'missing' })
+  assert.deepEqual(f('rnongodbs'), { match: 'mongodb', kind: 'extra' })
+  assert.deepEqual(f('modelcontextptorocol'), { match: 'modelcontextprotocol', kind: 'two-edits' })
+  assert.equal(f('vercxll'), null, 'two edits only count in names of 12 or more letters')
+  assert.equal(f('golangci'), null, 'a real org: "ci" must not fold into "d" for typos')
 })

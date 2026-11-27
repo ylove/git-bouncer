@@ -21,21 +21,23 @@ Severities mean the same as everywhere else in git-bouncer ([`src/verdict.js`](.
 |---|---|---|
 | `ID-IOC-REPO` | critical | This exact repo is named in public reporting about a malware campaign. Don't clone it, open it, or run anything from it. |
 | `ID-IOC-OWNER` | high | The same account published a repo that's named in malware reporting. Accounts like that usually exist only to spread malware. |
-| `ID-LOOKALIKE-OWNER` | high | The owner's name is a disguised or misspelled version of a well-known account (`micr0s0ft`, `rnicrosoft`, `face-book`, `vercell`). |
+| `ID-OWNER-CHANGED-HANDS` | high | The owner's name is on the well-known list, but GitHub says a different account holds it now (its account ID doesn't match). Names can be given up and registered again by anyone. |
+| `ID-LOOKALIKE-OWNER` | high or medium | The owner's name is a disguised or misspelled version of a well-known account. **High** for disguised characters (`micr0s0ft`, `rnicrosoft`, `face-book`), and for a typo (`vercell`) on an account younger than 90 days or when GitHub can't say how old it is. **Medium** for a typo on an older account (`androidx`), for the brand with a word added or left off (`microsoft-official`, `mistral` for `mistralai`), and for an account named after a famous project (`nextjs`). |
 | `ID-LOOKALIKE-REPO` | high | The repo's name is a famous project's name written with look-alike characters (`vsc0de`). Nobody types it that way by accident. |
 | `ID-NOT-FOUND` | high | There's no public repo at that address: it's private, deleted, or never existed. git-bouncer only checks public repos. |
 | `ID-BLOCKED` | high | GitHub itself has blocked or disabled the repo, which happens for legal takedowns and for malware. |
 | `ID-IMPERSONATION` | medium | The repo has a famous project's name, but it isn't that project and isn't a GitHub fork of it. Fine for a practice repo, but don't trust it because of its name. |
+| `ID-MOVED` | medium or info | GitHub redirects this address to another repo, and git will follow it. **Medium** when the repo moved to a different account that git-bouncer doesn't know; **info** for a rename, or a move to a well-known account confirmed by its account ID (`facebook/react` -> `react/react`). The other checks run on where it leads. |
+| `ID-FORK-OF-FAMOUS` | low or medium | Someone else's fork of a famous project. GitHub shows "forked from ..." under it, but that's not an endorsement: the fork can contain any code. **Medium** when the fork or its account is younger than 90 days. |
 | `ID-NEW-OWNER` | medium | The owner's account is less than 30 days old. |
 | `ID-NEW-REPO` | medium | The repo is less than 14 days old. |
 | `ID-SIMILAR-REPO` | low | The repo's name is one typo from a famous project's name (`vscodee`). Often honest (`flasky`, `transformer`), so it's context only. |
 | `ID-ARCHIVED` | low | The repo is read-only and no longer maintained. |
 | `ID-STARS-UNUSUAL` | low | Lots of stars, almost no forks, on a young repo. A weak sign the stars were bought. |
-| `ID-API-UNAVAILABLE` | low | Part of the check couldn't run (rate limit, network error, GitHub error). The finding lists exactly what wasn't checked. |
-| `ID-IOC-UNAVAILABLE` | low | The known-bad repo list is missing from this install, so the repo wasn't compared against it. |
-| `ID-MOVED` | info | GitHub redirects this address to another repo (it was renamed or moved). git follows the redirect, and the other checks are about where it leads. |
+| `ID-API-UNAVAILABLE` | low | Part of the check couldn't run (rate limit, network error, GitHub error). The finding lists exactly what wasn't checked, and the ID check is **incomplete**, so the verdict can't be a pass. |
+| `ID-IOC-UNAVAILABLE` | low | The known-bad repo list is missing from this install, so the repo wasn't compared against it. The ID check is **incomplete**. |
 | `ID-FORK` | info | The repo is a fork, and the finding names the original. A fork doesn't inherit the original's reputation; its owner can change anything. |
-| `ID-VERIFIED-ORG` | info | The organization has proved to GitHub that it controls its website's domain. A good sign, but any organization can verify a domain it owns. |
+| `ID-VERIFIED-ORG` | info | The organization has proved to GitHub that it controls a domain. The finding shows its listed website and links its GitHub page, where the verified domain is shown. It says who runs the account, not whether to trust it, and it's left out when the name borrows a brand the account doesn't own (`openai-labs`). |
 | `ID-LATEST-RELEASE` | info | The newest release's tag, so you can compare it with the version you were told to use. |
 | `ID-REDUCED` | info | The host isn't GitHub, so only the name checks ran. |
 

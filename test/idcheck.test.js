@@ -6,76 +6,9 @@ import { tmpdir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { idCheck } from '../src/idcheck/index.js'
 import { loadIocs, indexIocRepos, IOC_MODULE } from '../src/idcheck/known-bad.js'
-import { parseRepoUrl } from '../src/url.js'
-import { computeVerdict, SEVERITIES } from '../src/verdict.js'
+import { NOW, daysAgo, ESC, RLO, ok, NOT_FOUND, RATE_LIMITED, owned, repoJson, accountJson, healthy, check, sev } from './helpers/idcheck-stubs.js'
 
-// Unit tests never touch the network. Every GitHub API answer below is a stub, and if anything tried
-// the real API anyway, this makes it fail loudly instead of quietly depending on the internet.
-globalThis.fetch = () => { throw new Error('unit tests must not use the network') }
-
-const NOW = Date.parse('2026-11-27T12:00:00Z')
-const DAY = 24 * 60 * 60 * 1000
-const daysAgo = days => new Date(NOW - days * DAY).toISOString()
-
-const ok = json => ({ status: 200, json })
-const NOT_FOUND = { status: 404, json: { message: 'Not Found', status: '404' } }
-const RATE_LIMITED = { status: 403, json: { message: 'API rate limit exceeded for 203.0.113.7. (But here\'s the good news: Authenticated requests get a higher rate limit.)' } }
-
-const repoJson = (fullName, extra = {}) => ({
-  full_name: fullName, name: fullName.split('/')[1], private: false, visibility: 'public', fork: false, archived: false,
-  disabled: false, created_at: daysAgo(3000), stargazers_count: 5000, forks_count: 900, default_branch: 'main',
-  owner: { login: fullName.split('/')[0], type: 'Organization' }, ...extra,
-})
-const accountJson = (login, extra = {}) => ({ login, type: 'Organization', created_at: daysAgo(4000), ...extra })
-
-// A stub for the GitHub API: a map from request path to answer. An answer that is an Error is thrown,
-// like a network failure. Requests for paths that aren't listed are recorded so the test can fail on them.
-function stubApi(routes) {
-  const calls = []
-  const unexpected = []
-  const api = async path => {
-    calls.push(path)
-    if (!(path in routes)) {
-      unexpected.push(path)
-      return NOT_FOUND
-    }
-    const answer = routes[path]
-    if (answer instanceof Error) throw answer
-    return answer
-  }
-  return { api, calls, unexpected }
-}
-
-// The usual answers for a healthy, well-known GitHub repo.
-function healthy(fullName, { repo = {}, owner = {}, org = {}, release = ok({ tag_name: 'v1.2.3', published_at: daysAgo(10) }) } = {}) {
-  const [login] = fullName.split('/')
-  return {
-    [`/repos/${fullName}`]: ok(repoJson(fullName, repo)),
-    [`/users/${login}`]: ok(accountJson(login, owner)),
-    [`/orgs/${login}`]: ok({ login, is_verified: false, ...org }),
-    [`/repos/${fullName}/releases/latest`]: release,
-  }
-}
-
-/** Parse the URL like the CLI does, run the ID check with stubbed API answers, and check the output's shape. */
-async function check(url, routes = {}, opts = {}) {
-  const stub = stubApi(routes)
-  const result = await idCheck(parseRepoUrl(url), { api: stub.api, now: NOW, iocs: [], ...opts })
-  for (const f of result.findings) {
-    assert.match(f.id, /^ID-[A-Z-]+$/)
-    assert.ok(SEVERITIES.includes(f.severity), `${f.id} has severity ${f.severity}`)
-    assert.equal(typeof f.title, 'string')
-    assert.equal(typeof f.detail, 'string')
-    assert.ok(f.detail.length > 20, `${f.id} explains itself`)
-    assert.ok(!('evidence' in f) || typeof f.evidence === 'string', `${f.id} evidence is a string when present`)
-  }
-  assert.deepEqual(stub.unexpected, [], 'no unexpected GitHub API requests')
-  const ids = result.findings.map(f => f.id)
-  const byId = Object.fromEntries(result.findings.map(f => [f.id, f]))
-  return { ...result, ids, byId, calls: stub.calls, verdict: computeVerdict(result.findings, { complete: true }).verdict }
-}
-
-const sev = (result, id) => result.byId[id]?.severity
+// Unit tests never touch the network: every GitHub API answer is a stub (see helpers/idcheck-stubs.js).
 
 // --- The acceptance criteria from issue #2 -----------------------------------------------------------
 
@@ -86,22 +19,28 @@ test('micr0s0ft/vscode is turned away at the ID check, even though the repo does
   assert.match(r.byId['ID-LOOKALIKE-OWNER'].title, /"micr0s0ft" looks like "microsoft"/)
   assert.match(r.byId['ID-LOOKALIKE-OWNER'].detail, /impersonation of github\.com\/microsoft\/vscode/)
   assert.equal(sev(r, 'ID-NOT-FOUND'), 'high')
+  assert.equal(r.complete, true, 'nothing more applies to a repo that does not exist')
   assert.deepEqual(r.calls, ['/repos/micr0s0ft/vscode'], 'stops asking once the repo is known not to exist')
 })
 
 test('the look-alike check needs no network: it still turns the repo away when GitHub is unreachable', async () => {
   const r = await check('github.com/micr0s0ft/vscode', { '/repos/micr0s0ft/vscode': new Error('getaddrinfo ENOTFOUND api.github.com') })
   assert.equal(r.verdict, 'fail')
-  assert.equal(r.ids[0], 'ID-LOOKALIKE-OWNER', 'the offline check runs first')
+  assert.equal(r.complete, false)
+  assert.equal(r.ids[0], 'ID-LOOKALIKE-OWNER', 'the name checks come first')
   assert.equal(sev(r, 'ID-API-UNAVAILABLE'), 'low')
   assert.match(r.byId['ID-API-UNAVAILABLE'].detail, /couldn't reach the GitHub API/)
 })
 
 test('microsoft/vscode passes', async () => {
-  const r = await check('github.com/microsoft/vscode', healthy('microsoft/vscode', { org: { is_verified: true }, release: ok({ tag_name: '1.148.0', published_at: daysAgo(2) }) }))
+  const r = await check('github.com/microsoft/vscode', healthy('microsoft/vscode', {
+    org: { is_verified: true, blog: 'https://opensource.microsoft.com' }, release: ok({ tag_name: '1.148.0', published_at: daysAgo(2) }),
+  }))
   assert.equal(r.verdict, 'pass')
+  assert.equal(r.complete, true)
   assert.deepEqual(r.ids, ['ID-VERIFIED-ORG', 'ID-LATEST-RELEASE'])
   assert.equal(r.facts.verifiedOrg, true)
+  assert.equal(r.facts.orgWebsite, 'https://opensource.microsoft.com')
   assert.equal(r.facts.latestRelease, '1.148.0')
   assert.equal(r.facts.ownerType, 'Organization')
   assert.equal(r.facts.stars, 5000)
@@ -112,7 +51,7 @@ test('microsoft/vscode passes', async () => {
 test('facebook/react passes: GitHub redirects it to react/react, and the new "facebook" account is never consulted', async () => {
   // Real situation when this was written: the old "facebook" org is now "meta", React moved to the
   // "react" org, and a brand-new account holds the name "facebook". The redirect target is what you'd
-  // clone, so its owner is the account whose age matters.
+  // clone, so its owner is the account that matters.
   const routes = {
     '/repos/facebook/react': ok(repoJson('react/react', { created_at: '2013-05-24T16:15:54Z' })),
     '/users/react': ok(accountJson('react', { created_at: '2009-07-08T09:38:38Z' })),
@@ -122,6 +61,7 @@ test('facebook/react passes: GitHub redirects it to react/react, and the new "fa
   const r = await check('github.com/facebook/react', routes)
   assert.equal(r.verdict, 'pass')
   assert.deepEqual(r.ids, ['ID-MOVED', 'ID-LATEST-RELEASE'])
+  assert.equal(sev(r, 'ID-MOVED'), 'info', 'moved to an account git-bouncer knows, confirmed by its ID')
   assert.equal(r.facts.fullName, 'react/react')
   assert.ok(!r.calls.includes('/users/facebook'))
 })
@@ -139,7 +79,7 @@ test('a repo named in IOC reporting is critical, ignoring case', async () => {
   }
 })
 
-test("another repo from an account named in IOC reporting is high", async () => {
+test('another repo from an account named in IOC reporting is high', async () => {
   const r = await check('github.com/stevenleedig-ux/WinUI3_Home_Assessment', { '/repos/stevenleedig-ux/WinUI3_Home_Assessment': NOT_FOUND }, { iocs: [CAMPAIGN] })
   assert.equal(sev(r, 'ID-IOC-OWNER'), 'high')
   assert.ok(!r.ids.includes('ID-IOC-REPO'))
@@ -150,9 +90,11 @@ test('IOC repo names are github.com repos, so the same path on another host is n
   assert.ok(!r.ids.includes('ID-IOC-REPO'))
 })
 
-test('if the IOC snapshot is missing, the result says it was not checked', async () => {
+test('if the IOC snapshot is missing, the ID check is incomplete and says why', async () => {
   const r = await check('github.com/microsoft/vscode', healthy('microsoft/vscode'), { iocs: null })
   assert.equal(sev(r, 'ID-IOC-UNAVAILABLE'), 'low')
+  assert.equal(r.complete, false)
+  assert.equal(r.verdict, 'incomplete')
 })
 
 test('loadIocs returns null for a missing snapshot and loads a real module', async () => {
@@ -171,13 +113,24 @@ test('loadIocs returns null for a missing snapshot and loads a real module', asy
   }
 })
 
-test('the sandbox IOC snapshot is used by default', { skip: !existsSync(fileURLToPath(IOC_MODULE)) && 'the snapshot arrives with the sandbox scanner (#15)' }, async () => {
+test('the sandbox IOC snapshot is used by default', async () => {
+  assert.ok(existsSync(fileURLToPath(IOC_MODULE)), 'sandbox/scanner/checks/iocs.js ships with git-bouncer')
   const snapshot = await loadIocs()
   const { repos } = indexIocRepos(snapshot.campaigns)
   const [first] = repos.values()
   const [owner, name] = first.repo.split('/')
   const r = await check(`github.com/${owner}/${name}`, { [`/repos/${owner}/${name}`]: NOT_FOUND }, { iocs: undefined })
   assert.equal(sev(r, 'ID-IOC-REPO'), 'critical')
+  assert.equal(r.complete, true)
+})
+
+test('the IOC snapshot the host imports stays pure data: no imports, no I/O, no process access', () => {
+  // The host executes this sandbox file (see the note at its top), so it must not grow side effects.
+  const source = readFileSync(IOC_MODULE, 'utf8')
+  const code = source.split('\n').filter(line => !line.trimStart().startsWith('//')).join('\n')
+  for (const forbidden of [/^\s*import\b/m, /\bimport\s*\(/, /\brequire\s*\(/, /\bprocess\./, /\bglobalThis\b/, /\bfetch\s*\(/, /\beval\s*\(/, /\bFunction\s*\(/]) {
+    assert.doesNotMatch(code, forbidden, `iocs.js must not use ${forbidden}`)
+  }
 })
 
 // --- Impersonation and look-alike repo names --------------------------------------------------------------
@@ -192,21 +145,27 @@ test('a famous name under an unrelated owner, not a fork, is a warning', async (
   assert.equal(sev(s, 'ID-IMPERSONATION'), 'medium')
 })
 
-test('a GitHub fork of the real project is not impersonation, including forks of forks and old names', async () => {
-  for (const [parent, source] of [['react/react', 'react/react'], ['facebook/react', 'facebook/react'], ['someone-else/react', 'react/react']]) {
+test("a stranger's fork of the real project isn't impersonation, but it isn't the project either", async () => {
+  for (const [parent, source] of [['react/react', 'react/react'], ['someone-else/react', 'react/react']]) {
     const r = await check('github.com/someone/react', healthy('someone/react', {
-      repo: { fork: true, parent: { full_name: parent }, source: { full_name: source } }, owner: { type: 'User' },
+      repo: { fork: true, parent: owned(parent), source: owned(source) }, owner: { type: 'User' },
     }))
     assert.ok(!r.ids.includes('ID-IMPERSONATION'), `${parent} / ${source}`)
-    assert.equal(sev(r, 'ID-FORK'), 'info')
-    assert.match(r.byId['ID-FORK'].title, new RegExp(parent))
+    assert.ok(!r.ids.includes('ID-FORK'), 'reported once, as a fork of a famous project')
+    assert.equal(sev(r, 'ID-FORK-OF-FAMOUS'), 'low', 'an old account and an old fork')
     assert.equal(r.facts.forkParent, parent)
   }
 })
 
-test("a fork of something else with a famous name is still impersonation", async () => {
+test('a fork whose "parent" only has the right name, not the right account ID, is impersonation', async () => {
+  const fakeParent = { full_name: 'react/react', owner: { login: 'react', id: 1 } }
+  const r = await check('github.com/someone/react', healthy('someone/react', { repo: { fork: true, parent: fakeParent, source: fakeParent }, owner: { type: 'User' } }))
+  assert.equal(sev(r, 'ID-IMPERSONATION'), 'medium')
+})
+
+test('a fork of something else with a famous name is still impersonation', async () => {
   const r = await check('github.com/someone/vscode', healthy('someone/vscode', {
-    repo: { fork: true, parent: { full_name: 'attacker/vscode' }, source: { full_name: 'attacker/vscode' } }, owner: { type: 'User' },
+    repo: { fork: true, parent: owned('attacker/vscode'), source: owned('attacker/vscode') }, owner: { type: 'User' },
   }))
   assert.equal(sev(r, 'ID-IMPERSONATION'), 'medium')
 })
@@ -221,6 +180,7 @@ test('impersonation is still reported when GitHub cannot say whether it is a for
   assert.equal(sev(r, 'ID-IMPERSONATION'), 'medium')
   assert.match(r.byId['ID-IMPERSONATION'].detail, /could not ask GitHub whether it is a fork/)
   assert.match(r.byId['ID-API-UNAVAILABLE'].detail, /whether it is a fork of the original/)
+  assert.equal(r.verdict, 'incomplete')
 })
 
 test('a famous repo name disguised with look-alike characters is turned away', async () => {
@@ -275,7 +235,7 @@ test('age thresholds: owner under 30 days, repo under 14 days', async () => {
 })
 
 test('archived and forked repos are reported as context', async () => {
-  const r = await check('github.com/acme/old-tool', healthy('acme/old-tool', { repo: { archived: true, fork: true, parent: { full_name: 'upstream/old-tool' } } }))
+  const r = await check('github.com/acme/old-tool', healthy('acme/old-tool', { repo: { archived: true, fork: true, parent: owned('upstream/old-tool') } }))
   assert.equal(sev(r, 'ID-ARCHIVED'), 'low')
   assert.equal(sev(r, 'ID-FORK'), 'info')
   assert.match(r.byId['ID-FORK'].title, /upstream\/old-tool/)
@@ -312,7 +272,7 @@ test('a repo GitHub has blocked or disabled is turned away, not mistaken for a r
   }
 })
 
-test('rate limits, server errors and network failures are a coverage gap, not a crash', async () => {
+test('rate limits, server errors and network failures make the ID check incomplete, never a pass', async () => {
   for (const [answer, says] of [
     [RATE_LIMITED, /rate-limiting.*gh auth login/],
     [{ status: 429, json: null }, /rate-limiting/],
@@ -326,6 +286,8 @@ test('rate limits, server errors and network failures are a coverage gap, not a 
     assert.equal(sev(r, 'ID-API-UNAVAILABLE'), 'low')
     assert.match(r.byId['ID-API-UNAVAILABLE'].detail, says)
     assert.match(r.byId['ID-API-UNAVAILABLE'].detail, /whether the repo exists/)
+    assert.equal(r.complete, false)
+    assert.equal(r.verdict, 'incomplete')
   }
 })
 
@@ -337,6 +299,7 @@ test('if only the follow-up requests fail, the result lists exactly what was ski
   const r = await check('github.com/acme/tool', routes)
   assert.deepEqual(r.ids, ['ID-API-UNAVAILABLE'])
   assert.match(r.byId['ID-API-UNAVAILABLE'].detail, /how old the owner account is; the latest release/)
+  assert.equal(r.verdict, 'incomplete')
 })
 
 // --- Other hosts and untrusted text ---------------------------------------------------------------------
@@ -345,6 +308,7 @@ test('other hosts get the name checks only, and the result says so', async () =>
   const plain = await check('codeberg.org/someone/tool')
   assert.deepEqual(plain.ids, ['ID-REDUCED'])
   assert.equal(plain.verdict, 'pass')
+  assert.equal(plain.complete, true, 'the reduced scope is stated, not a failure someone can cause')
   assert.equal(plain.calls.length, 0, 'the GitHub API is never asked about another host')
 
   const famous = await check('gitlab.com/torvalds/linux')
@@ -357,16 +321,18 @@ test('other hosts get the name checks only, and the result says so', async () =>
 })
 
 test('text that comes from the API is cleaned before it reaches a finding or a fact', async () => {
-  const ESC = '\u001B'
   const r = await check('github.com/acme/tool', healthy('acme/tool', {
-    repo: { default_branch: `main${ESC}[2K`, fork: true, parent: { full_name: `up${ESC}]8;;https://evil.example/${ESC}\\stream/tool` } },
-    release: ok({ tag_name: `v1.0${ESC}[1A\u202E`, published_at: daysAgo(1) }),
+    repo: { default_branch: `main${ESC}[2K`, fork: true, parent: owned(`up${ESC}]8;;https://evil.example/${ESC}\\stream/tool`) },
+    release: ok({ tag_name: `v1.0${ESC}[1A${RLO}`, published_at: daysAgo(1) }),
+    org: { is_verified: true, blog: `https://acme.example${ESC}[2J` },
   }))
+  const unsafe = new RegExp(`[${String.fromCharCode(0)}-${String.fromCharCode(0x1f)}${String.fromCharCode(0x7f)}-${String.fromCharCode(0x9f)}${RLO}]`)
   const strings = [...r.findings.flatMap(f => Object.values(f)), ...Object.values(r.facts)].filter(v => typeof v === 'string')
-  for (const text of strings) assert.doesNotMatch(text, /[\u0000-\u001F\u007F-\u009F\u202E]/, text)
+  for (const text of strings) assert.doesNotMatch(text, unsafe, text)
   assert.match(r.byId['ID-FORK'].title, /up<ESC>stream\/tool/)
   assert.equal(r.facts.defaultBranch, 'main<ESC>')
   assert.equal(r.facts.latestRelease, 'v1.0<ESC><U+202E>')
+  assert.equal(r.facts.orgWebsite, 'https://acme.example<ESC>')
 })
 
 test('a malformed target is a programming error', async () => {
@@ -378,6 +344,6 @@ test('every finding ID the ID check can produce is documented in docs/id-check.m
   const source = readFileSync(new URL('../src/idcheck/index.js', import.meta.url), 'utf8')
   const docs = readFileSync(new URL('../docs/id-check.md', import.meta.url), 'utf8')
   const ids = new Set(source.match(/'ID-[A-Z-]+'/g).map(s => s.slice(1, -1)))
-  assert.ok(ids.size >= 19)
+  assert.ok(ids.size >= 21)
   for (const id of ids) assert.match(docs, new RegExp(`\\| \`${id}\` \\|`), `${id} is missing from the findings table`)
 })
