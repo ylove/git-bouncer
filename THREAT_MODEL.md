@@ -44,7 +44,7 @@ Rule of the boundary: **secrets never cross into the sandbox, and nothing from t
 ### T1. The repo runs code during install
 npm/yarn/pnpm lifecycle scripts (`preinstall`, `install`, `postinstall`, `prepare`) run automatically. So do Python `setup.py` builds, `.pth` files, MSBuild targets on `dotnet build`, and husky hooks once installed.
 - In the sandbox, dependencies are installed with `--ignore-scripts`, so **no repo or dependency code is executed**.
-- Every lifecycle script in the repo **and in every installed dependency** is listed (`npm query`). Download-and-execute patterns are FAIL. Unknown install scripts are WARN. A short, documented allowlist of well-known native packages (esbuild, sharp, …) is informational.
+- Every install-time script npm would run is listed: the repo's own (including workspaces, the `dependencies` hook and `binding.gyp` builds) and every dependency the lockfile marks `hasInstallScript`, read from that package's own `package.json`. Download-and-execute patterns are FAIL. Unknown install scripts are WARN. A short, documented allowlist of well-known native packages (esbuild, sharp, …) is informational.
 - When you install on your machine afterwards and install scripts were found, you're asked whether to run them (`--ignore-scripts` is offered as the safe default).
 
 ### T2. The repo runs code when you merely open it
@@ -66,7 +66,7 @@ npm/yarn/pnpm lifecycle scripts (`preinstall`, `install`, `postinstall`, `prepar
 - **Checksum mismatch:** `npm ci` verifies every tarball against the lockfile's sha512 `integrity`; a mismatch (`EINTEGRITY`) → FAIL. Invalid registry signatures (`npm audit signatures`) → FAIL.
 - Lockfile tampering: `resolved` URLs that point anywhere but the registry (http, git, random tarball hosts) → FAIL/WARN. Missing or weak (sha1) integrity → WARN.
 - Project `.npmrc` that redirects the registry, or sets `git`, `script-shell`, `node-options` and similar (which can make npm run arbitrary programs even with `--ignore-scripts`) → FAIL. In the sandbox the project `.npmrc` is moved aside before npm runs.
-- Typosquatted dependency names (`expresss`, `crossenv`) → WARN, FAIL if the package is newly published.
+- Typosquatted dependency names (`expresss`, `crossenv`) → WARN.
 - Ordinary known vulnerabilities (CVEs) → WARN only. git-bouncer answers "will this repo attack *me*?", not "is this app secure?". A tutorial repo with an old lodash isn't an attack on you.
 
 ### T5. The repo attacks git during clone
