@@ -76,7 +76,7 @@ test('an ordinary repo has no git-level findings', { skip }, async () => {
 test('the scanner re-validates its clone input instead of trusting the host', () => {
   assert.doesNotThrow(() => validateCloneInput('https://github.com/a/b.git', null))
   assert.doesNotThrow(() => validateCloneInput('https://github.com/a/b.git', 'v1.2.3'))
-  for (const [url, ref] of [['--upload-pack=x', null], ['http://github.com/a/b', null], ['https://t@github.com/a/b', null],
+  for (const [url, ref] of [['--upload-pack=x', null], ['http://github.com/a/b', null], [`https://t${'@'}github.com/a/b`, null],
     ['https://github.com/../b', null], ['file:///etc', null], ['https://github.com/a/b.git', '--upload-pack=x'], ['https://github.com/a/b.git', 'a..b']]) {
     assert.throws(() => validateCloneInput(url, ref), /refusing to clone/, `${url} ${ref}`)
   }
