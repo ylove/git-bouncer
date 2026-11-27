@@ -16,9 +16,9 @@
 // Everything that touches the outside world (finding programs, asking questions, running
 // commands, printing) is passed in, so the tests drive every path without installing anything.
 
-import { spawn } from 'node:child_process'
 import { accessSync, constants, lstatSync, readFileSync, statSync } from 'node:fs'
-import path from 'node:path'
+import { homedir } from 'node:os'
+import { run, which } from '../proc.js'
 import { clean } from '../ui/sanitize.js'
 
 // Official pages only. Docker's terms change, so we link them instead of quoting numbers.
@@ -56,7 +56,9 @@ const LINUX_FAMILIES = [
 // Used only when os-release is missing or unfamiliar: is the package manager itself on PATH?
 const PM_PROGRAMS = [['apt', 'apt-get'], ['dnf', 'dnf'], ['pacman', 'pacman'], ['zypper', 'zypper'], ['apk', 'apk']]
 
-const show = argv => argv.join(' ') // every argv here is a constant from this file
+const show = argv => argv.join(' ')
+// Every program a plan may need. offerInstall looks them all up once, before planning.
+const PROBES = ['brew', 'winget', 'podman', 'docker', ...PM_PROGRAMS.map(([, program]) => program)]
 const DOCTOR = 'Then run "bouncer doctor" to check that git-bouncer can use it.'
 
 /**
@@ -234,8 +236,8 @@ export function explainChoices(plan) {
   return lines.join('\n')
 }
 
-function manualSummary(plan) {
-  const linux = plan.platform === 'linux'
+function manualSummary(platform) {
+  const linux = platform === 'linux'
   return [
     `Install Podman (recommended, free and open source): ${LINKS.podman}`,
     linux
@@ -248,34 +250,47 @@ function manualSummary(plan) {
 /**
  * Explain the choice, let the person pick, and run each install step only after an explicit yes.
  *
+ * Every program is resolved to an absolute path before the person is asked, and the question shows
+ * that path ("Run /opt/homebrew/bin/brew install podman now?"). Then exactly that file is run, so
+ * what was approved is what runs, whatever `exec` does with it.
+ *
  * @param {object} io
  * @param {string} [io.platform]  defaults to process.platform
- * @param {(cmd: string) => boolean} [io.has]  is a program on PATH (defaults to a real PATH lookup)
+ * @param {(cmd: string) => Promise<string|null>} [io.resolve]  a program's absolute path, or null
+ *   (default: findProgram, which checks known install locations, then trusted PATH folders)
  * @param {(question: string, opts: {default: boolean}) => Promise<boolean>} [io.confirm]  yes/no prompt
  * @param {(question: string, options: {key: string, label: string}[]) => Promise<string>} [io.choose]
- * @param {(cmd: string, args: string[]) => Promise<{code: number|null}>} [io.exec]  run a program, stdio inherited
+ * @param {(file: string, args: string[], opts: {cwd: string, env: object}) => Promise<{code: number|null, signal?: string|null, error?: Error|string}>} [io.exec]
+ *   run an absolute path with stdio inherited (default: runInstaller)
  * @param {(text: string) => void} [io.out]  print
  * @param {() => string|null} [io.readOsRelease]  the text of /etc/os-release, or null
+ * @param {Record<string, string|undefined>} [io.env]  the environment installers run with
+ * @param {string} [io.home]  installers start in this folder (default: your home folder)
  * @param {boolean} [io.interactive]  false (or no confirm/choose) means: offer nothing, run nothing
  * @returns {Promise<{installed: boolean, runtime?: 'podman'|'docker', reason: string, nextSteps: string[]}>}
  *   installed: an install command ran and succeeded during this call.
- *   reason: 'installed' | 'non-interactive' | 'cancelled' | 'manual' | 'already-installed' | 'declined' | 'failed'
+ *   reason: 'installed' | 'non-interactive' | 'cancelled' | 'manual' | 'already-installed' |
+ *           'declined' | 'not-found' | 'failed'
  *   Prompts that throw (Ctrl-C) propagate to the caller; nothing runs after them.
  */
 export async function offerInstall({
   platform = process.platform,
-  has = onPath,
+  env = process.env,
+  home = homedir(),
+  resolve = cmd => findProgram(cmd, { env, platform }),
   confirm,
   choose,
-  exec = runCommand,
+  exec = runInstaller,
   out = text => process.stdout.write(`${text}\n`),
   readOsRelease: read = readOsRelease,
   interactive = true,
 } = {}) {
-  const plan = planInstall({ platform, has, osRelease: platform === 'linux' ? read() : null })
   if (interactive !== true || typeof confirm !== 'function' || typeof choose !== 'function') {
-    return { installed: false, reason: 'non-interactive', nextSteps: manualSummary(plan) }
+    return { installed: false, reason: 'non-interactive', nextSteps: manualSummary(platform) }
   }
+  const found = new Map()
+  for (const program of PROBES) found.set(program, await resolve(program))
+  const plan = planInstall({ platform, has: program => typeof found.get(program) === 'string', osRelease: platform === 'linux' ? read() : null })
 
   out(explainChoices(plan))
   const picked = await choose('Which would you like to install?', [
@@ -286,7 +301,7 @@ export async function offerInstall({
   // Only the two known keys select anything; anything else, including a typo, is a cancel.
   if (picked !== 'podman' && picked !== 'docker') {
     out('Cancelled. Nothing was installed.')
-    return { installed: false, reason: 'cancelled', nextSteps: manualSummary(plan) }
+    return { installed: false, reason: 'cancelled', nextSteps: manualSummary(platform) }
   }
   const opt = plan.options[picked]
   const runtime = picked
@@ -301,8 +316,14 @@ export async function offerInstall({
   let installed = false
   for (let i = 0; i < total; i++) {
     const step = opt.steps[i]
-    const cmd = show(step.argv)
     const rest = opt.steps.slice(i).map(s => `Run: ${show(s.argv)}`)
+    // Looked up now, not at planning time: "podman" only exists once step 1 has installed it.
+    const file = await resolve(step.argv[0])
+    if (typeof file !== 'string') {
+      out(`\nCouldn't find ${step.argv[0]} in a trusted folder on your PATH. Nothing else was run.`)
+      return { installed, runtime, reason: 'not-found', nextSteps: [`Open a new terminal, then continue with: ${show(step.argv)}`, ...rest.slice(1), ...opt.after] }
+    }
+    const cmd = show([clean(file), ...step.argv.slice(1)])
     out(`\nStep ${i + 1} of ${total}: ${cmd}\n  ${step.what}`)
     if (await confirm(`Run "${cmd}" now?`, { default: false }) !== true) {
       out('Skipped. Nothing else was run.')
@@ -310,12 +331,14 @@ export async function offerInstall({
     }
     let result
     try {
-      result = await exec(step.argv[0], step.argv.slice(1))
+      // Started in your home folder, never the current one: that may be the repo being checked,
+      // and on Windows the current folder is where a program looks for DLLs it doesn't ship.
+      result = await exec(file, step.argv.slice(1), { cwd: home, env: { ...env, ...step.env } })
     } catch (e) {
-      result = { code: null, error: e && e.message ? e.message : String(e) }
+      result = { code: null, error: e }
     }
     if (!result || result.code !== 0) {
-      const why = result && result.code !== null && result.code !== undefined ? `exit code ${result.code}` : clean(result && result.error ? result.error : 'it could not be started')
+      const why = failure(result)
       out(`"${cmd}" did not finish (${why}). Nothing else was run.`)
       return { installed, runtime, reason: 'failed', nextSteps: [`"${cmd}" did not finish (${why}). Its output above should say why.`, ...rest, ...opt.after] }
     }
@@ -325,8 +348,17 @@ export async function offerInstall({
   return { installed, runtime, reason: 'installed', nextSteps: opt.after }
 }
 
+function failure(result) {
+  if (result && result.signal) return `stopped by ${clean(result.signal)}`
+  const error = result && result.error
+  if (error) return clean(error instanceof Error ? error.message : error)
+  if (result && Number.isInteger(result.code) && result.code >= 0) return `exit code ${result.code}`
+  return 'it could not be started'
+}
+
 // ---------------------------------------------------------------------------------------------
-// The real implementations of `has` and `exec`, used when the caller doesn't pass its own.
+// The real implementations of `resolve`, `exec` and `readOsRelease`, used when the caller doesn't
+// pass its own.
 
 /** The text of /etc/os-release (or /usr/lib/os-release), or null. */
 export function readOsRelease() {
@@ -336,36 +368,38 @@ export function readOsRelease() {
   return null
 }
 
+const DRIVE_PATH = /^[A-Za-z]:[\\/]/
+
 /**
- * Find a program on PATH and return its absolute path, or null.
- *
- * Relative PATH entries ("", ".", "bin") are skipped: they mean "the current folder", and the
- * current folder may be a repository you're about to check. On Windows only .com and .exe are
- * considered, because those are the only files a process can be started from without a shell.
+ * Where these programs' own installers put them. Checked before PATH, so a program of the same
+ * name earlier on PATH can't stand in for them.
+ * @returns {string[]}
  */
-export function findOnPath(cmd, { env = process.env, platform = process.platform } = {}) {
-  if (typeof cmd !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(cmd)) return null
-  const win = platform === 'win32'
-  const p = win ? path.win32 : path.posix
-  const value = (win ? env.PATH ?? env.Path ?? env.path : env.PATH) ?? ''
-  const names = win ? (/\.(com|exe)$/i.test(cmd) ? [cmd] : [`${cmd}.com`, `${cmd}.exe`]) : [cmd]
-  for (const entry of value.split(win ? ';' : ':')) {
-    const dir = win ? entry.replace(/^"(.*)"$/, '$1') : entry
-    if (!dir || !p.isAbsolute(dir)) continue
-    for (const name of names) {
-      const file = p.join(dir, name)
-      if (isProgram(file, win)) return file
-    }
+export function knownLocations(cmd, platform = process.platform, env = process.env) {
+  if (platform === 'darwin') {
+    if (cmd === 'brew') return ['/opt/homebrew/bin/brew', '/usr/local/bin/brew'] // Apple silicon, Intel
+    if (cmd === 'podman') return ['/opt/homebrew/bin/podman', '/usr/local/bin/podman', '/opt/podman/bin/podman'] // Homebrew, or Podman's .pkg
   }
-  return null
+  if (platform === 'win32' && cmd === 'winget' && typeof env.LOCALAPPDATA === 'string' && DRIVE_PATH.test(env.LOCALAPPDATA)) {
+    return [`${env.LOCALAPPDATA.replace(/[\\/]+$/, '')}\\Microsoft\\WindowsApps\\winget.exe`]
+  }
+  return []
 }
 
-/** Is a program on PATH? (The default `has`.) */
-export function onPath(cmd, opts) {
-  return findOnPath(cmd, opts) !== null
+/**
+ * The absolute path of an installer or runtime program, or null: its known install location if
+ * it's there, otherwise the first match in a trusted PATH folder (see trustedPathDirs in proc.js:
+ * nothing relative, nothing inside the current folder, nothing in node_modules). On Windows only
+ * .exe and .com count, because those are the only files a process can start without a shell.
+ */
+export async function findProgram(cmd, { env = process.env, platform = process.platform, cwd, home, known = knownLocations(cmd, platform, env) } = {}) {
+  if (typeof cmd !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(cmd)) return null
+  for (const file of known) if (isProgram(file, platform)) return file
+  return which(cmd, env, { cwd, home, exts: ['.EXE', '.COM'] })
 }
 
-function isProgram(file, win) {
+function isProgram(file, platform) {
+  const win = platform === 'win32'
   try {
     if (!statSync(file).isFile()) return false
     if (!win) accessSync(file, constants.X_OK)
@@ -378,23 +412,11 @@ function isProgram(file, win) {
 }
 
 /**
- * Run a program with the terminal attached, so the person sees the installer's own output and
- * prompts. An argument array and no shell, so nothing is ever re-parsed. The program is resolved
- * to an absolute path first: on Windows, starting a bare name looks in the current folder before
- * PATH, so a "winget.exe" sitting in the current folder would otherwise run instead of the real one.
- * @returns {Promise<{code: number|null, signal?: string|null, error?: string}>}
+ * Run an installer with the terminal attached, so the person sees its own output and prompts.
+ * An argument array and no shell, so nothing is ever re-parsed. No timeout: an installer someone
+ * is watching should never be killed halfway by a timer.
+ * @returns {Promise<{code: number, signal: string|null, error?: Error}>}
  */
-export function runCommand(cmd, args, { env = process.env, platform = process.platform } = {}) {
-  return new Promise(resolve => {
-    const file = path.isAbsolute(cmd) ? cmd : findOnPath(cmd, { env, platform })
-    if (!file) return resolve({ code: null, error: `${cmd} was not found on your PATH` })
-    let child
-    try {
-      child = spawn(file, args, { stdio: 'inherit', shell: false })
-    } catch (e) {
-      return resolve({ code: null, error: e.message })
-    }
-    child.on('error', e => resolve({ code: null, error: e.message }))
-    child.on('close', (code, signal) => resolve({ code, signal }))
-  })
+export function runInstaller(file, args, { cwd, env } = {}) {
+  return run(file, args, { inherit: true, cwd, env, timeoutMs: 2 ** 31 - 1 })
 }

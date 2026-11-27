@@ -1,15 +1,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
-  planInstall, offerInstall, explainChoices, parseOsRelease, findOnPath, onPath, runCommand, LINKS, WINGET_IDS,
+  planInstall, offerInstall, explainChoices, parseOsRelease, findProgram, knownLocations, runInstaller, LINKS, WINGET_IDS,
 } from '../src/runtimes/install-offer.js'
-
-const moduleFile = fileURLToPath(new URL('../src/runtimes/install-offer.js', import.meta.url))
 
 // A fake machine: `programs` is what's "on PATH". Nothing in these tests installs or runs an installer.
 const hasOnly = (...programs) => cmd => programs.includes(cmd)
@@ -26,25 +22,43 @@ const OS_RELEASE = {
   alpine: 'NAME="Alpine Linux"\nID=alpine\n',
 }
 
+// For offerInstall: where each program "is" on the fake machine, and what appears once a command
+// succeeds (after brew installs podman, there is a podman to run).
+const HOME = '/srv/me'
+const BREW = '/opt/homebrew/bin/brew'
+const PODMAN = '/opt/homebrew/bin/podman'
+const WINGET = 'C:\\Tools\\winget.exe'
+const MAC = { programs: { brew: BREW }, installs: { [`${BREW} install podman`]: { podman: PODMAN } } }
+
 /** Drives offerInstall like a person at a keyboard, and records everything that happened. */
 function session(opts = {}) {
-  const { pick: _pick, answers = [], execResults = [], ...io } = opts
+  const { pick: _pick, answers = [], execResults = [], programs = {}, installs = {}, ...io } = opts
   const pick = Object.hasOwn(opts, 'pick') ? opts.pick : 'podman' // so a test can pick `undefined`
   const log = { out: '', questions: [], confirms: [], execs: [], choices: null }
+  const found = { ...programs }
   const yes = [...answers]
   const results = [...execResults]
   return {
     log,
     run: () => offerInstall({
+      home: HOME,
+      env: { PATH: '/usr/bin' },
+      resolve: async cmd => found[cmd] ?? null,
       out: text => { log.out += `${text}\n` },
       choose: async (question, options) => { log.questions.push(question); log.choices = options; return pick },
       confirm: async (question, opts) => { log.confirms.push({ question, opts }); return yes.length ? yes.shift() : false },
-      exec: async (cmd, args) => { log.execs.push([cmd, ...args]); return results.length ? results.shift() : { code: 0 } },
+      exec: async (file, args, { cwd, env }) => {
+        log.execs.push({ argv: [file, ...args], cwd, env })
+        const result = results.length ? results.shift() : { code: 0 }
+        if (result.code === 0) Object.assign(found, installs[[file, ...args].join(' ')])
+        return result
+      },
       readOsRelease: () => null,
       ...io,
     }),
   }
 }
+const ran = s => s.log.execs.map(e => e.argv)
 
 // --- planInstall: what each platform is offered ------------------------------------------------
 
@@ -180,32 +194,34 @@ test('parseOsRelease reads quoted values and ID_LIKE lists, and ignores junk', (
 // --- offerInstall: consent ----------------------------------------------------------------------
 
 test('non-interactive: nothing is offered, asked or run', async () => {
-  let ran = false
-  const exec = async () => { ran = true; return { code: 0 } }
-  const noPrompts = await offerInstall({ platform: 'darwin', has: hasOnly('brew'), exec, out: () => { ran = true } })
+  let touched = false
+  const exec = async () => { touched = true; return { code: 0 } }
+  const noPrompts = await offerInstall({ platform: 'darwin', resolve: async () => { touched = true; return null }, exec, out: () => { touched = true } })
   assert.equal(noPrompts.installed, false)
   assert.equal(noPrompts.reason, 'non-interactive')
   assert.ok(noPrompts.nextSteps.some(s => s.includes(LINKS.podman)))
 
   // Even with prompts available, interactive: false wins.
-  const s = session({ platform: 'darwin', has: hasOnly('brew'), interactive: false, answers: [true, true, true], exec })
+  const s = session({ platform: 'darwin', ...MAC, interactive: false, answers: [true, true, true], exec })
   const r = await s.run()
   assert.equal(r.reason, 'non-interactive')
   assert.equal(s.log.questions.length, 0)
   assert.equal(s.log.confirms.length, 0)
-  assert.equal(ran, false)
+  assert.equal(touched, false)
 })
 
-test('macOS, yes to everything: runs exactly the three commands, in order, each after its own yes (default no)', async () => {
-  const s = session({ platform: 'darwin', has: hasOnly('brew'), pick: 'podman', answers: [true, true, true] })
+test('macOS, yes to everything: the three commands run by absolute path, in order, from your home folder', async () => {
+  const s = session({ platform: 'darwin', ...MAC, pick: 'podman', answers: [true, true, true] })
   const r = await s.run()
-  assert.deepEqual(s.log.execs, [['brew', 'install', 'podman'], ['podman', 'machine', 'init'], ['podman', 'machine', 'start']])
+  assert.deepEqual(ran(s), [[BREW, 'install', 'podman'], [PODMAN, 'machine', 'init'], [PODMAN, 'machine', 'start']])
+  // The question names the exact file that then runs.
   assert.deepEqual(s.log.confirms.map(c => c.question), [
-    'Run "brew install podman" now?',
-    'Run "podman machine init" now?',
-    'Run "podman machine start" now?',
+    `Run "${BREW} install podman" now?`,
+    `Run "${PODMAN} machine init" now?`,
+    `Run "${PODMAN} machine start" now?`,
   ])
   assert.ok(s.log.confirms.every(c => c.opts.default === false))
+  assert.ok(s.log.execs.every(e => e.cwd === HOME), 'installers never start in the current folder')
   assert.deepEqual(s.log.choices.map(c => c.key), ['podman', 'docker', 'cancel'])
   assert.equal(r.installed, true)
   assert.equal(r.runtime, 'podman')
@@ -213,10 +229,26 @@ test('macOS, yes to everything: runs exactly the three commands, in order, each 
   assert.match(r.nextSteps.join(' '), /bouncer doctor/)
 })
 
+test('what the person approves is the file that runs, even when it is somewhere suspicious', async () => {
+  // A resolver bug (or a planted program) can't hide behind a bare name in the question.
+  const planted = '/srv/take-home/node_modules/.bin/brew'
+  const s = session({ platform: 'darwin', programs: { brew: planted }, pick: 'docker', answers: [true] })
+  await s.run()
+  assert.equal(s.log.confirms[0].question, `Run "${planted} install --cask docker-desktop" now?`)
+  assert.deepEqual(ran(s), [[planted, 'install', '--cask', 'docker-desktop']])
+})
+
+test('Windows: winget runs by absolute path too', async () => {
+  const s = session({ platform: 'win32', programs: { winget: WINGET }, pick: 'podman', answers: [true] })
+  await s.run()
+  assert.deepEqual(ran(s), [[WINGET, 'install', '-e', '--id', 'RedHat.Podman', '--source', 'winget']])
+  assert.equal(s.log.execs[0].cwd, HOME)
+})
+
 test('no means no: declining the first step runs nothing', async () => {
-  const s = session({ platform: 'darwin', has: hasOnly('brew'), pick: 'podman', answers: [false] })
+  const s = session({ platform: 'darwin', ...MAC, pick: 'podman', answers: [false] })
   const r = await s.run()
-  assert.deepEqual(s.log.execs, [])
+  assert.deepEqual(ran(s), [])
   assert.equal(s.log.confirms.length, 1) // it stops asking, too
   assert.deepEqual(r, {
     installed: false, runtime: 'podman', reason: 'declined',
@@ -226,34 +258,52 @@ test('no means no: declining the first step runs nothing', async () => {
 
 test('only the boolean true is a yes: "y", 1 and "true" all count as no', async () => {
   for (const answer of ['y', 'yes', 1, 'true', {}, null, undefined]) {
-    const s = session({ platform: 'win32', has: hasOnly('winget'), pick: 'docker', answers: [answer] })
+    const s = session({ platform: 'win32', programs: { winget: WINGET }, pick: 'docker', answers: [answer] })
     const r = await s.run()
-    assert.deepEqual(s.log.execs, [], String(answer))
+    assert.deepEqual(ran(s), [], String(answer))
     assert.equal(r.reason, 'declined')
   }
 })
 
 test('yes to installing, no to the virtual machine: Podman is installed and the rest are next steps', async () => {
-  const s = session({ platform: 'darwin', has: hasOnly('brew'), pick: 'podman', answers: [true, false] })
+  const s = session({ platform: 'darwin', ...MAC, pick: 'podman', answers: [true, false] })
   const r = await s.run()
-  assert.deepEqual(s.log.execs, [['brew', 'install', 'podman']])
+  assert.deepEqual(ran(s), [[BREW, 'install', 'podman']])
   assert.equal(r.installed, true)
   assert.equal(r.reason, 'declined')
   assert.deepEqual(r.nextSteps.slice(0, 2), ['Run: podman machine init', 'Run: podman machine start'])
 })
 
-test('a failed step stops everything after it', async () => {
-  const s = session({ platform: 'darwin', has: hasOnly('brew'), pick: 'podman', answers: [true, true, true], execResults: [{ code: 1 }] })
+test('a program that is not in a trusted folder stops the steps instead of guessing', async () => {
+  // brew "succeeds" but no podman appears where we'd trust it.
+  const s = session({ platform: 'darwin', programs: { brew: BREW }, pick: 'podman', answers: [true, true, true] })
   const r = await s.run()
-  assert.deepEqual(s.log.execs, [['brew', 'install', 'podman']])
+  assert.deepEqual(ran(s), [[BREW, 'install', 'podman']])
+  assert.equal(s.log.confirms.length, 1)
+  assert.equal(r.installed, true)
+  assert.equal(r.reason, 'not-found')
+  assert.deepEqual(r.nextSteps.slice(0, 2), ['Open a new terminal, then continue with: podman machine init', 'Run: podman machine start'])
+})
+
+test('a failed step stops everything after it', async () => {
+  const s = session({ platform: 'darwin', ...MAC, pick: 'podman', answers: [true, true, true], execResults: [{ code: 1 }] })
+  const r = await s.run()
+  assert.deepEqual(ran(s), [[BREW, 'install', 'podman']])
   assert.equal(s.log.confirms.length, 1)
   assert.equal(r.installed, false)
   assert.equal(r.reason, 'failed')
   assert.match(r.nextSteps[0], /exit code 1/)
 })
 
-test('an installer that cannot start (or throws) is a failure, not a crash, and its message is sanitized', async () => {
-  const s = session({ platform: 'win32', has: hasOnly('winget'), pick: 'podman', answers: [true], exec: async () => { throw new Error('spawn failed\u001B[2K') } })
+test('an installer stopped by a signal, or one that could not start, says so', async () => {
+  const stopped = session({ platform: 'darwin', ...MAC, pick: 'podman', answers: [true], execResults: [{ code: -1, signal: 'SIGINT' }] })
+  assert.match((await stopped.run()).nextSteps[0], /stopped by SIGINT/)
+  const unstartable = session({ platform: 'darwin', ...MAC, pick: 'podman', answers: [true], execResults: [{ code: -1, signal: null, error: new Error('spawn EACCES') }] })
+  assert.match((await unstartable.run()).nextSteps[0], /spawn EACCES/)
+})
+
+test('an installer that throws is a failure, not a crash, and its message is sanitized', async () => {
+  const s = session({ platform: 'win32', programs: { winget: WINGET }, pick: 'podman', answers: [true], exec: async () => { throw new Error('spawn failed\u001B[2K') } })
   const r = await s.run()
   assert.equal(r.reason, 'failed')
   assert.doesNotMatch(r.nextSteps[0], /\u001B/)
@@ -262,67 +312,78 @@ test('an installer that cannot start (or throws) is a failure, not a crash, and 
 
 test('Cancel, and anything that is not a known choice, installs nothing', async () => {
   for (const pick of ['cancel', undefined, '', 'Podman', '__proto__', 'constructor', 'podman; rm -rf ~']) {
-    const s = session({ platform: 'darwin', has: hasOnly('brew'), pick, answers: [true, true, true] })
+    const s = session({ platform: 'darwin', ...MAC, pick, answers: [true, true, true] })
     const r = await s.run()
     assert.equal(r.reason, 'cancelled', String(pick))
     assert.equal(r.installed, false)
     assert.deepEqual(s.log.confirms, [])
-    assert.deepEqual(s.log.execs, [])
+    assert.deepEqual(ran(s), [])
   }
 })
 
 test('Linux: shows the commands, never asks to run them, never runs anything', async () => {
   for (const pick of ['podman', 'docker']) {
-    const s = session({ platform: 'linux', has: hasOnly('apt-get', 'sudo'), pick, answers: [true, true], readOsRelease: () => OS_RELEASE.ubuntu })
+    const s = session({ platform: 'linux', programs: { 'apt-get': '/usr/bin/apt-get' }, pick, answers: [true, true], readOsRelease: () => OS_RELEASE.ubuntu })
     const r = await s.run()
-    assert.deepEqual(s.log.execs, [], pick)
+    assert.deepEqual(ran(s), [], pick)
     assert.deepEqual(s.log.confirms, [], pick)
     assert.equal(r.reason, 'manual')
     assert.equal(r.installed, false)
   }
-  const s = session({ platform: 'linux', has: hasOnly('apt-get'), pick: 'podman', readOsRelease: () => OS_RELEASE.ubuntu })
+  const s = session({ platform: 'linux', programs: { 'apt-get': '/usr/bin/apt-get' }, pick: 'podman', readOsRelease: () => OS_RELEASE.ubuntu })
   await s.run()
   assert.match(s.log.out, /sudo apt-get -y install podman/)
   assert.match(s.log.out, /prints the commands instead of running them/)
 })
 
 test('already installed: says so, runs nothing', async () => {
-  const s = session({ platform: 'darwin', has: hasOnly('brew', 'podman'), pick: 'podman', answers: [true, true, true] })
+  const s = session({ platform: 'darwin', programs: { brew: BREW, podman: PODMAN }, pick: 'podman', answers: [true, true, true] })
   const r = await s.run()
   assert.equal(r.reason, 'already-installed')
-  assert.deepEqual(s.log.execs, [])
+  assert.deepEqual(ran(s), [])
 })
 
-// --- the real `has` and `exec` (no installers involved) -----------------------------------------
+// --- the real resolve and exec (no installers involved) ----------------------------------------
 
-test('findOnPath finds programs in absolute PATH entries and ignores relative ones', t => {
-  const dir = mkdtempSync(path.join(tmpdir(), 'bouncer-path-'))
-  t.after(() => rmSync(dir, { recursive: true, force: true }))
+test('knownLocations: the places Homebrew, Podman\'s installer and winget put their programs', () => {
+  assert.deepEqual(knownLocations('brew', 'darwin'), ['/opt/homebrew/bin/brew', '/usr/local/bin/brew'])
+  assert.deepEqual(knownLocations('podman', 'darwin'), ['/opt/homebrew/bin/podman', '/usr/local/bin/podman', '/opt/podman/bin/podman'])
+  assert.deepEqual(knownLocations('winget', 'win32', { LOCALAPPDATA: 'C:\\me\\AppData\\Local' }), ['C:\\me\\AppData\\Local\\Microsoft\\WindowsApps\\winget.exe'])
+  for (const LOCALAPPDATA of [undefined, '', '..\\x', '\\Local', 'AppData']) assert.deepEqual(knownLocations('winget', 'win32', { LOCALAPPDATA }), [], String(LOCALAPPDATA))
+  assert.deepEqual(knownLocations('brew', 'linux'), [])
+})
+
+test('findProgram checks the known location before PATH, and only looks up plain names', async t => {
+  const root = mkdtempSync(path.join(tmpdir(), 'bouncer-find-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
   const win = process.platform === 'win32'
-  const file = path.join(dir, win ? 'fake-tool.exe' : 'fake-tool')
-  writeFileSync(file, '')
-  if (!win) chmodSync(file, 0o755)
-  const sep = path.delimiter
-  assert.equal(findOnPath('fake-tool', { env: { PATH: `${dir}${sep}` } }), file)
-  assert.equal(onPath('fake-tool', { env: { PATH: dir } }), true)
-  // Run from inside that folder, PATH entries meaning "the current folder" must not find it.
-  const lookup = `import { findOnPath } from ${JSON.stringify(pathToFileURL(moduleFile).href)}
-for (const PATH of ['.', '', '${sep}', '.${sep}x']) console.log(findOnPath('fake-tool', { env: { PATH } }))`
-  const child = spawnSync(process.execPath, ['--input-type=module', '-e', lookup], { cwd: dir, encoding: 'utf8' })
-  assert.equal(child.status, 0, child.stderr)
-  assert.deepEqual(child.stdout.trim().split(/\r?\n/), ['null', 'null', 'null', 'null'])
-  // Only plain program names are looked up.
-  for (const name of ['../fake-tool', 'a/b', '-x', '', 'fake tool']) assert.equal(findOnPath(name, { env: { PATH: dir } }), null, name)
+  const plant = dir => {
+    mkdirSync(dir, { recursive: true })
+    const file = path.join(dir, win ? 'fake-brew.exe' : 'fake-brew')
+    writeFileSync(file, '')
+    chmodSync(file, 0o755)
+    return file
+  }
+  const official = plant(path.join(root, 'official'))
+  const onPathToo = plant(path.join(root, 'elsewhere'))
+  const env = { PATH: path.join(root, 'elsewhere') }
+  const same = (a, b) => assert.equal(win ? a?.toLowerCase() : a, win ? b.toLowerCase() : b)
+  same(await findProgram('fake-brew', { env, known: [official] }), official)
+  same(await findProgram('fake-brew', { env, known: [path.join(root, 'missing', 'fake-brew')] }), onPathToo)
+  assert.equal(await findProgram('fake-brew', { env: { PATH: '.' }, known: [] }), null)
+  for (const name of ['../fake-brew', 'a/b', '-x', '', 'fake brew']) assert.equal(await findProgram(name, { env, known: [] }), null, name)
   if (!win) {
-    chmodSync(file, 0o644) // not executable
-    assert.equal(findOnPath('fake-tool', { env: { PATH: dir } }), null)
+    chmodSync(official, 0o644) // not executable: skipped
+    same(await findProgram('fake-brew', { env, known: [official] }), onPathToo)
   }
 })
 
-test('runCommand passes an argument array (no shell) and reports the exit code', async () => {
-  const r = await runCommand(process.execPath, ['-e', 'process.exit(process.argv[1] === "a b; c" ? 7 : 1)', 'a b; c'])
+test('runInstaller passes an argument array (no shell), the environment and the folder, and reports the exit code', async t => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'bouncer-run-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const want = realpathSync.native(dir)
+  const script = 'const same = (a, b) => process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b; process.exit(process.argv[1] === "a b; c" && process.env.BOUNCER_TEST === "1" && same(process.cwd(), process.argv[2]) ? 7 : 1)'
+  const r = await runInstaller(process.execPath, ['-e', script, 'a b; c', want], { cwd: dir, env: { ...process.env, BOUNCER_TEST: '1' } })
   assert.equal(r.code, 7)
-  const missing = await runCommand('no-such-program-for-bouncer-tests', [], { env: { PATH: '' } })
-  assert.equal(missing.code, null)
-  assert.match(missing.error, /not found/)
+  assert.equal(r.signal, null)
 })
