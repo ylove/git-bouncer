@@ -156,7 +156,11 @@ export async function handoff({ target, report, findings, dir, install, runtime,
     }
     if (pm.generatedLockfile) {
       const text = await runtime.readFile(session, 'package-lock.json')
-      if (!text) throw new HandoffError('could not copy the verified lockfile out of the sandbox')
+      if (!text) {
+        // Cloud sandboxes are gone when the build ends, so the verified lockfile can't come back.
+        out.note(`Dependencies were not installed: the repo has no lockfile, and the one verified in the sandbox can't be copied back from ${runtime.name}. Review it, then run: cd ${dir} && npm install --ignore-scripts`)
+        return { dest, installed: false, ignoreScripts: null, manual: 'npm install --ignore-scripts' }
+      }
       await writeFile(path.join(dest, 'package-lock.json'), validateGeneratedLockfile(text), { flag: 'wx' })
       out.note('the repo had no lockfile; copied in the one generated and checked in the sandbox, so you get the exact same packages')
     }
