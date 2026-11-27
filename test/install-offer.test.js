@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -436,9 +436,10 @@ test('findProgram checks the known location before PATH, and only looks up plain
 test('runInstaller passes an argument array (no shell), the environment and the folder, and reports the exit code', async t => {
   const dir = mkdtempSync(path.join(tmpdir(), 'bouncer-run-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
-  const want = realpathSync.native(dir)
-  const script = 'const same = (a, b) => process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b; process.exit(process.argv[1] === "a b; c" && process.env.BOUNCER_TEST === "1" && same(process.cwd(), process.argv[2]) ? 7 : 1)'
-  const r = await runInstaller(process.execPath, ['-e', script, 'a b; c', want], { cwd: dir, env: { ...process.env, BOUNCER_TEST: '1' } })
+  // Compared after realpath on both sides: on Windows the temp folder can be a short 8.3 name.
+  const script = 'const fs = require("fs"); const real = p => { const r = fs.realpathSync.native(p); return process.platform === "win32" ? r.toLowerCase() : r };'
+    + ' process.exit(process.argv[1] === "a b; c" && process.env.BOUNCER_TEST === "1" && real(process.cwd()) === real(process.argv[2]) ? 7 : 1)'
+  const r = await runInstaller(process.execPath, ['-e', script, 'a b; c', dir], { cwd: dir, env: { ...process.env, BOUNCER_TEST: '1' } })
   assert.equal(r.code, 7)
   assert.equal(r.signal, null)
 })
