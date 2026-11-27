@@ -34,7 +34,7 @@ import { tmpdir as osTmpdir } from 'node:os'
 import path from 'node:path'
 import { clean } from '../ui/sanitize.js'
 import {
-  CLOUD_RUN_FLAGS, SANDBOX_IMAGE, SCANNER_ENTRY, TEMP_DIR_PLACEHOLDER, abortError, assertScanInputs,
+  CLOUD_RUN_FLAGS, SANDBOX_IMAGE, SCANNER_ENTRY, TEMP_DIR_PLACEHOLDER, abortError, assertSandboxDir, assertScanInputs,
   copySandbox, defaultExec, errorTail, fillStep, hasCompleteReport, loadCloudConfig, runIdFor, sleep,
   toYaml, writePlanFiles,
 } from './cloud-common.js'
@@ -280,6 +280,7 @@ export function createAwsRuntime({ exec = defaultExec, env = process.env, tmpdir
 
   async function scan({ url, ref = null, nonce, sandboxDir, onLog = () => {}, signal } = {}) {
     assertScanInputs({ url, ref, nonce })
+    assertSandboxDir(sandboxDir)
     const ready = await available()
     if (!ready.ok) throw new Error(`CodeBuild is not ready: ${ready.reason}`)
     if (!path.isAbsolute(tmpdir)) throw new Error('the temporary folder must be an absolute path')

@@ -78,6 +78,13 @@ export function assertScanInputs({ url, ref, nonce }) {
   if (typeof nonce !== 'string' || !NONCE.test(nonce)) throw new Error('refusing to start a cloud build: the nonce must be 32-64 lowercase hex characters')
 }
 
+/** scan() needs the absolute path of git-bouncer's own sandbox/ folder (Dockerfile + scanner). */
+export function assertSandboxDir(sandboxDir) {
+  if (typeof sandboxDir !== 'string' || !path.isAbsolute(sandboxDir)) {
+    throw new Error('refusing to start a cloud build: sandboxDir must be the absolute path of git-bouncer\'s sandbox folder')
+  }
+}
+
 /** The scanner command inside the sandbox container. `--flag=value` binds each value to its flag. */
 export function scannerCommand({ url, ref, nonce }) {
   return ['node', SCANNER_ENTRY, `--url=${url}`, ...(ref ? [`--ref=${ref}`] : []), `--nonce=${nonce}`]

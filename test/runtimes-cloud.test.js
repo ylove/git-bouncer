@@ -312,7 +312,7 @@ test('the runtime modules only ever use spawn(), never a shell', async () => {
   assert.ok(files.includes('cloud-common.js'))
   for (const file of files) {
     const src = await readFile(path.join(SRC_DIR, file), 'utf8')
-    const imports = src.split('\n').filter(l => l.includes("'node:child_process'"))
+    const imports = src.split(/\r?\n/).filter(l => l.includes("'node:child_process'")) // CRLF on Windows checkouts
     assert.deepEqual(imports, file === 'cloud-common.js' ? ["import { spawn } from 'node:child_process'"] : [], file)
     assert.doesNotMatch(src, /shell:\s*true/, file)
     assert.doesNotMatch(src, /\b(execSync|execFile|execFileSync|spawnSync)\b/, file)
@@ -671,6 +671,8 @@ test('gcp: invalid inputs are refused before any command runs', async () => {
   await assert.rejects(rt.scan({ url: URL_, ref: '$(id)', nonce: NONCE, sandboxDir: '/nowhere' }), /ref/)
   await assert.rejects(rt.scan({ url: 'https://github.com/o/r;id.git', nonce: NONCE, sandboxDir: '/nowhere' }), /repository URL/)
   await assert.rejects(rt.plan({ url: URL_, nonce: 'nope', sandboxDir: '/nowhere' }), /nonce/)
+  await assert.rejects(rt.scan({ url: URL_, nonce: NONCE }), /sandbox folder/)
+  await assert.rejects(rt.scan({ url: URL_, nonce: NONCE, sandboxDir: 'relative/sandbox' }), /sandbox folder/)
   assert.equal(fake.calls.length, 0)
 })
 
@@ -977,5 +979,6 @@ test('aws: invalid inputs are refused before any command runs', async () => {
   await assert.rejects(rt.scan({ url: URL_, ref: 'a b', nonce: NONCE, sandboxDir: '/nowhere' }), /ref/)
   await assert.rejects(rt.scan({ url: 'https://github.com/o/`id`.git', nonce: NONCE, sandboxDir: '/nowhere' }), /repository URL/)
   await assert.rejects(rt.plan({ url: URL_, nonce: 'NOPE', sandboxDir: '/nowhere' }), /nonce/)
+  await assert.rejects(rt.scan({ url: URL_, nonce: NONCE, sandboxDir: 'relative/sandbox' }), /sandbox folder/)
   assert.equal(fake.calls.length, 0)
 })

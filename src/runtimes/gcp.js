@@ -30,7 +30,7 @@ import { tmpdir as osTmpdir } from 'node:os'
 import path from 'node:path'
 import { clean } from '../ui/sanitize.js'
 import {
-  CLOUD_RUN_FLAGS, SANDBOX_IMAGE, TEMP_DIR_PLACEHOLDER, abortError, assertScanInputs, copySandbox,
+  CLOUD_RUN_FLAGS, SANDBOX_IMAGE, TEMP_DIR_PLACEHOLDER, abortError, assertSandboxDir, assertScanInputs, copySandbox,
   defaultExec, errorTail, fillStep, hasCompleteReport, lineSink, loadCloudConfig, scannerCommand, sleep,
   toYaml, writePlanFiles,
 } from './cloud-common.js'
@@ -214,6 +214,7 @@ export function createGcpRuntime({ exec = defaultExec, env = process.env, tmpdir
 
   async function scan({ url, ref = null, nonce, sandboxDir, onLog = () => {}, signal } = {}) {
     assertScanInputs({ url, ref, nonce })
+    assertSandboxDir(sandboxDir)
     const ready = await available()
     if (!ready.ok) throw new Error(`Cloud Build is not ready: ${ready.reason}`)
 
