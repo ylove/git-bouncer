@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -372,4 +372,12 @@ test('text that comes from the API is cleaned before it reaches a finding or a f
 test('a malformed target is a programming error', async () => {
   await assert.rejects(idCheck({}, { api: async () => NOT_FOUND }), TypeError)
   await assert.rejects(idCheck(null), TypeError)
+})
+
+test('every finding ID the ID check can produce is documented in docs/id-check.md', () => {
+  const source = readFileSync(new URL('../src/idcheck/index.js', import.meta.url), 'utf8')
+  const docs = readFileSync(new URL('../docs/id-check.md', import.meta.url), 'utf8')
+  const ids = new Set(source.match(/'ID-[A-Z-]+'/g).map(s => s.slice(1, -1)))
+  assert.ok(ids.size >= 19)
+  for (const id of ids) assert.match(docs, new RegExp(`\\| \`${id}\` \\|`), `${id} is missing from the findings table`)
 })
