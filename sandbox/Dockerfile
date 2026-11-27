@@ -9,7 +9,7 @@
 # The final image has no curl/wget, and runs as an unprivileged user.
 
 # ---- stage 1: fetch and verify osv-scanner -----------------------------------------------------
-FROM node:24-trixie-slim@sha256:4d00acb4bcc42c454c4eb801526f7ad7f772ea3bd4fd168c5cc2e384abcbb9d4 AS fetch
+FROM node:25-trixie-slim@sha256:aabbe39553d15ede8a97cc60c9e1a97034ff772afcf696ea42b94e7f5f2ec71b AS fetch
 ARG TARGETARCH
 ARG OSV_VERSION=2.7.1
 ARG OSV_SHA256_amd64=fb7dab19a8bd9bbe5c3189f09d4b7ee1820c9553a23bac202648a56efd2f6ee8
@@ -29,7 +29,7 @@ RUN set -eu; \
     chmod 0755 /osv-scanner
 
 # ---- stage 2: the sandbox ----------------------------------------------------------------------
-FROM node:24-trixie-slim@sha256:4d00acb4bcc42c454c4eb801526f7ad7f772ea3bd4fd168c5cc2e384abcbb9d4
+FROM node:25-trixie-slim@sha256:aabbe39553d15ede8a97cc60c9e1a97034ff772afcf696ea42b94e7f5f2ec71b
 LABEL org.opencontainers.image.title="git-bouncer sandbox" \
       org.opencontainers.image.source="https://github.com/ylove/git-bouncer" \
       org.opencontainers.image.licenses="Apache-2.0" \
