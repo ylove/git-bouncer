@@ -263,6 +263,7 @@ async function symlinkChecks(dir, entries, links, findings) {
     detail: 'Tools on your machine would follow this link, but the scanner could not put a faithful copy of its target in its place, so what your tools would read there was not (fully) checked. Treat the result as incomplete.',
   })
 
+  const exists = p => lstat(path.join(dir, p)).then(() => true, () => false)
   const plans = []
   for (const [i, link] of links.entries()) {
     const sensitive = sensitiveComponent(link.file)
@@ -295,15 +296,14 @@ async function symlinkChecks(dir, entries, links, findings) {
     if (i >= MAX_MATERIALIZE_LINKS) { unresolved(link, `more than ${MAX_MATERIALIZE_LINKS} symlinks`); continue }
     if (views.some(v => v.unreadable)) { unresolved(link, 'its target could not be read from git'); continue }
     if (views.some(v => v.loop)) { unresolved(link, 'it is part of a loop of links'); continue }
+    // What tools that resolve ".." first would read instead, if that exists at all.
+    const other = views.find(v => v.path !== undefined && v.path !== phys.path)
+    const otherShown = other && (await exists(other.path)) ? `"${other.path || '.'}"` : null
     if (phys.missing) {
-      const other = views.find(v => v.path !== undefined)
-      unresolved(link, other ? `it points at nothing on macOS/Linux but at "${other.path || '.'}" for tools that resolve ".." first (Windows, Node's realpath)` : 'its target does not exist in the repo')
+      unresolved(link, otherShown ? `it points at nothing on macOS/Linux but at ${otherShown} for tools that resolve ".." first (Windows, Node's realpath)` : 'its target does not exist in the repo')
       continue
     }
-    if (!agreed) {
-      const other = views.find(v => v.path !== phys.path)
-      unresolved(link, `it means "${phys.path || '.'}" on macOS/Linux but ${other.path === undefined ? 'nothing' : `"${other.path || '.'}"`} to tools that resolve ".." first (Windows, Node's realpath)`)
-    }
+    if (!agreed) unresolved(link, `it means "${phys.path || '.'}" on macOS/Linux but ${otherShown ?? 'nothing'} to tools that resolve ".." first (Windows, Node's realpath)`)
     if (!realKind) { unresolved(link, phys.path ? 'its target does not exist in the repo' : 'it points at the repository itself'); continue }
     plans.push({ link, real: phys.path, kind: realKind })
   }
