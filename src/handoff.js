@@ -18,13 +18,16 @@ import { run, which } from './proc.js'
 
 // Host git runs with none of the system's or your global configuration (no LFS smudge filter, no hooks
 // path, no fsmonitor, no aliases), plus explicit hardening on every command.
-const HOST_GIT = [
+export const HOST_GIT = [
   '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always', '-c', 'protocol.file.allow=never',
   '-c', 'init.templateDir=', '-c', `core.hooksPath=${devNull}`, '-c', 'core.fsmonitor=false',
   '-c', 'transfer.fsckObjects=true', '-c', 'fetch.fsckObjects=true',
   '-c', 'submodule.recurse=false', '-c', 'credential.helper=',
   '-c', 'filter.lfs.smudge=', '-c', 'filter.lfs.process=', '-c', 'filter.lfs.required=false',
   '-c', 'core.protectNTFS=true', '-c', 'core.protectHFS=true',
+  // Symlinks are written as small text files holding their target, exactly as the sandbox saw them.
+  // A link can't redirect a later tool (npm, your editor) to files the scan never looked at.
+  '-c', 'core.symlinks=false',
 ]
 const gitEnv = () => ({
   ...process.env,
@@ -66,8 +69,15 @@ export function installCommand(kind, { ignoreScripts }) {
 }
 
 /** What we'd tell someone to run themselves when git-bouncer won't install for them. */
-export function manualInstallHint(kind) {
-  return { npm: 'npm ci --ignore-scripts', yarn: 'yarn install --immutable --mode=skip-build', pnpm: 'pnpm install --frozen-lockfile --ignore-scripts', bun: 'bun install --frozen-lockfile --ignore-scripts' }[kind] || null
+export function manualInstallHint(kind, { berry = false } = {}) {
+  if (kind === 'yarn') {
+    // Yarn 1 silently ignores Berry's flags, so the right command depends on the version. Berry also runs
+    // the repo's own copy of Yarn from .yarn/releases, which is repo-controlled code.
+    return berry
+      ? 'yarn install --immutable --mode=skip-build   (note: this runs the Yarn release committed in .yarn/releases; review it first)'
+      : 'yarn install --frozen-lockfile --ignore-scripts'
+  }
+  return { npm: 'npm ci --ignore-scripts', pnpm: 'pnpm install --frozen-lockfile --ignore-scripts', bun: 'bun install --frozen-lockfile --ignore-scripts' }[kind] || null
 }
 
 /** Environment for the install: what package managers need, minus every token and credential we can name. */
@@ -81,12 +91,18 @@ export function installEnv(env = process.env) {
   return out
 }
 
-/** On Windows, npm is a .cmd shim that Node can only start through cmd.exe: started by full path, with the
- * current folder removed from the program search. Arguments here are constants. */
-function platformCommand(cmdPath, args) {
-  if (process.platform !== 'win32') return [cmdPath, args, {}]
-  const cmdExe = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'cmd.exe')
-  return [cmdExe, ['/d', '/s', '/c', cmdPath, ...args], { NoDefaultCurrentDirectoryInExePath: '1' }]
+/**
+ * How to start npm without a shell. On Windows, npm is a .cmd shim that would need cmd.exe (and cmd's
+ * quoting rules); instead run the npm that ships next to the node running us: node + npm-cli.js.
+ * @returns {Promise<{cmd: string, args: string[]}|null>}
+ */
+async function npmCommand() {
+  if (process.platform === 'win32') {
+    const cli = path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js')
+    return (await lstat(cli).catch(() => null)) ? { cmd: process.execPath, args: [cli] } : null
+  }
+  const bin = await which('npm')
+  return bin ? { cmd: bin, args: [] } : null
 }
 
 /**
@@ -135,7 +151,16 @@ export async function handoff({ target, report, findings, dir, install, runtime,
     if (co.code !== 0) throw new HandoffError(`checkout failed: ${co.stderr.trim().split('\n').pop()}`)
     const [nowCommit, nowTree] = (await git(['-C', dest, 'rev-parse', 'HEAD', 'HEAD^{tree}'])).stdout.trim().split('\n')
     if (nowCommit !== commit || nowTree !== tree) throw new HandoffError('the checked-out files do not match what was scanned')
-    out.note(`verified: commit ${commit.slice(0, 12)} and tree ${tree.slice(0, 12)} match the scan (written with filters, hooks and LFS off)`)
+    // Commit and tree IDs describe what git stored. What landed on disk can still differ on this
+    // filesystem: on macOS and Windows, two paths that fold to the same name (".VSCode" and ".vscode",
+    // or Unicode look-alikes) overwrite each other. git status catches any such difference.
+    const st = await git(['-C', dest, 'status', '--porcelain', '--untracked-files=no', '--ignore-submodules'])
+    if (st.code !== 0 || st.stdout.trim() !== '') {
+      throw new HandoffError('on this filesystem the checked-out files differ from what was scanned (usually two paths that only differ by case or by look-alike characters). Nothing was kept.')
+    }
+    const links = (await git(['-C', dest, 'ls-files', '-s'])).stdout.split('\n').filter(l => l.startsWith('120000 ')).length
+    out.note(`verified: commit ${commit.slice(0, 12)} and tree ${tree.slice(0, 12)} match the scan, and the files on disk match the commit (written with filters, hooks, LFS and symlinks off)`)
+    if (links) out.note(`${links} symlink(s) were written as plain text files holding their targets. After reviewing them, restore real links with: cd ${dir} && git config core.symlinks true && git checkout -- .`)
     created = false // from here on, the folder is the user's
     onCreated(null)
 
@@ -146,11 +171,12 @@ export async function handoff({ target, report, findings, dir, install, runtime,
     const present = new Set((await readdir(dest)).map(n => n.toLowerCase()))
     const steering = STEERING_FILES.filter(f => present.has(f))
     const reason =
+      links ? 'the repo contains symlinks, and npm would follow them once they are restored' :
       pm.kind !== 'npm' ? `${pm.kind} projects aren't installed automatically (the sandbox only exercises npm)` :
       !pm.installed ? 'the sandbox could not install this project, so its install was never checked' :
       steering.length ? `the repo ships ${steering.join(', ')}, which can change what the package manager runs` : null
     if (reason) {
-      const hint = manualInstallHint(pm.kind)
+      const hint = manualInstallHint(pm.kind, { berry: present.has('.yarnrc.yml') })
       out.note(`Dependencies were not installed: ${reason}. Review it, then run: cd ${dir} && ${hint}`)
       return { dest, installed: false, ignoreScripts: null, manual: hint }
     }
@@ -165,29 +191,25 @@ export async function handoff({ target, report, findings, dir, install, runtime,
       out.note('the repo had no lockfile; copied in the one generated and checked in the sandbox, so you get the exact same packages')
     }
 
+    // git-bouncer never runs install scripts for you. The scan can't see everything npm would run
+    // (old lockfiles, file: and git dependencies, packages in subfolders), so "no scripts found" is not
+    // proof there are none. Scripts are always skipped; running them is a separate, deliberate step.
+    const ignoreScripts = true
     const scriptFindings = findings.filter(f => SCRIPT_FINDINGS.has(f.id))
-    let ignoreScripts = false
-    if (scriptFindings.length) {
-      const onlyKnown = scriptFindings.every(f => f.id === 'DEP-INSTALL-SCRIPT-KNOWN')
-      out.line()
-      out.note(onlyKnown
-        ? 'Some well-known packages run install scripts (usually to download a prebuilt binary).'
-        : 'This project or its dependencies run scripts during install (listed above). They run with your full permissions.')
-      ignoreScripts = !(await prompter.confirm('Run install scripts?', { defaultYes: onlyKnown, safeAnswer: false }))
-    }
-    const npmBin = await which('npm')
-    if (!npmBin) {
+    const npm = await npmCommand()
+    if (!npm) {
       out.note(`npm is not installed; the code is cloned. Install dependencies with: cd ${dir} && npm ci --ignore-scripts`)
       return { dest, installed: false, ignoreScripts, manual: 'npm ci --ignore-scripts' }
     }
     const [, args] = installCommand('npm', { ignoreScripts })
     out.step(`Installing dependencies: npm ${args.join(' ')}`)
-    const [cmd, cmdArgs, extraEnv] = platformCommand(npmBin, args)
+    const [cmd, cmdArgs, extraEnv] = [npm.cmd, [...npm.args, ...args], {}]
     const r = await run(cmd, cmdArgs, { cwd: dest, env: { ...installEnv(), ...extraEnv }, inherit: true, timeoutMs: 60 * 60_000 })
     if (r.code !== 0) {
       out.note(`npm exited with code ${r.code}; the code is cloned, dependencies may be incomplete.`)
       return { dest, installed: false, ignoreScripts, manual: null }
     }
+    out.note(`Install scripts were not run${scriptFindings.length ? ' (the scan listed some above)' : ''}. If the project needs them, read them first, then run: cd ${dir} && npm rebuild`)
     return { dest, installed: true, ignoreScripts, manual: null }
   } catch (e) {
     if (created) await rm(dest, { recursive: true, force: true }) // only ever a folder we created in this run

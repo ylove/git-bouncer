@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { extractReport } from '../src/report.js'
 import { runArgs } from '../src/runtimes/container.js'
-import { installCommand, manualInstallHint, installEnv, validateGeneratedLockfile, HandoffError } from '../src/handoff.js'
+import { installCommand, manualInstallHint, installEnv, validateGeneratedLockfile, HandoffError, HOST_GIT } from '../src/handoff.js'
 import { which } from '../src/proc.js'
 
 const N = 'a'.repeat(32)
@@ -105,4 +105,16 @@ test('a lockfile coming out of the sandbox must be registry-only with sha512 has
     JSON.stringify({ lockfileVersion: 3, packages: { 'node_modules/x': { resolved: 'https://evil.example/x.tgz', integrity: 'sha512-a' } } }),
     JSON.stringify({ lockfileVersion: 3, packages: { 'node_modules/x': { resolved: 'https://registry.npmjs.org/x/-/x-1.tgz', integrity: 'sha1-a' } } }),
   ]) assert.throws(() => validateGeneratedLockfile(bad), HandoffError)
+})
+
+test('host git writes symlinks as plain files and runs no hooks, filters or LFS', () => {
+  const cfg = HOST_GIT.filter((_, i) => HOST_GIT[i - 1] === '-c')
+  for (const want of ['core.symlinks=false', 'filter.lfs.smudge=', 'credential.helper=', 'protocol.allow=never']) assert.ok(cfg.includes(want), want)
+  assert.ok(cfg.some(c => c.startsWith('core.hooksPath=')))
+})
+
+test('manual install hints skip scripts for every package manager, and say when yarn runs repo code', () => {
+  assert.equal(manualInstallHint('yarn'), 'yarn install --frozen-lockfile --ignore-scripts')
+  assert.match(manualInstallHint('yarn', { berry: true }), /--mode=skip-build.*\.yarn\/releases/)
+  for (const k of ['npm', 'pnpm', 'bun']) assert.match(manualInstallHint(k), /--ignore-scripts/)
 })

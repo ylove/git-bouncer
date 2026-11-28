@@ -8,7 +8,7 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { run } from './proc.js'
+import { run, which } from './proc.js'
 
 const MANIFESTS = {
   npm: ['package.json', 'package-lock.json', 'npm-shrinkwrap.json'],
@@ -18,7 +18,9 @@ const MANIFESTS = {
 
 /** Is the Snyk CLI installed and signed in? (`snyk whoami` doesn't use test quota.) */
 export async function snykReady() {
-  const r = await run('snyk', ['whoami', '--experimental'], { timeoutMs: 20_000 })
+  const bin = await which('snyk')
+  if (!bin) return false
+  const r = await run(bin, ['whoami', '--experimental'], { timeoutMs: 20_000 })
   return r.code === 0
 }
 
@@ -34,7 +36,9 @@ export async function snykTest({ runtime, session, packageManager }) {
       if (text !== null) { await writeFile(path.join(dir, f), text, { mode: 0o600 }); copied++ }
     }
     if (copied < 2) return { ran: false, findings: [], note: 'Snyk was skipped: manifest or lockfile missing.' }
-    const r = await run('snyk', ['test', '--json'], { cwd: dir, timeoutMs: 10 * 60_000 })
+    const bin = await which('snyk')
+    if (!bin) return { ran: false, findings: [], note: 'Snyk was skipped: the snyk CLI was not found.' }
+    const r = await run(bin, ['test', '--json'], { cwd: dir, timeoutMs: 10 * 60_000 })
     let data
     try { data = JSON.parse(r.stdout) } catch { data = null }
     if (!data || (r.code !== 0 && r.code !== 1)) {

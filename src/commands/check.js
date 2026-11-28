@@ -34,7 +34,9 @@ function describePublisher(facts) {
   const parts = []
   if (facts.ownerType) parts.push(facts.ownerType === 'Organization' ? 'organization' : 'personal account')
   if (facts.ownerCreatedAt) parts.push(`since ${String(facts.ownerCreatedAt).slice(0, 10)}`)
-  if (facts.verifiedOrg && facts.orgWebsite) parts.push(`verified domain ${facts.orgWebsite}`)
+  // "Verified" is GitHub's domain verification. The website field itself is free text the owner typed,
+  // so it is not repeated here as if it were verified.
+  if (facts.verifiedOrg) parts.push('organization with a GitHub-verified domain')
   if (Number.isFinite(facts.stars)) parts.push(`${facts.stars} stars`)
   if (facts.latestRelease) parts.push(`latest release ${facts.latestRelease}`)
   return parts.join(', ')
@@ -127,7 +129,8 @@ export async function check(cmd, deps) {
       await printPlan(CLOUD[options.runtime]({}), target, options, stdout)
       const a = await CLOUD[options.runtime]({}).available().catch(e => ({ ok: false, reason: e.message }))
       if (!a.ok) out.note(`Not runnable yet: ${a.reason}`)
-      return EXIT.PASS
+      out.note('Dry run: nothing was checked, so this exits 2, never 0.')
+      return EXIT.ERROR
     }
     out.step('Pat-down: cloning into a throwaway sandbox with none of your credentials')
     const picked = await pickRuntime(options, { ...deps, onLog: s => out.progress(s) })

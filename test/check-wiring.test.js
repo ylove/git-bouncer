@@ -52,7 +52,7 @@ function frame(nonce) {
 test('--dry-run prints the cloud plan as JSON and runs nothing', async () => {
   const idCheck = async () => ({ findings: [], facts: {}, complete: true })
   const r = await run(['scan', 'owner/repo', '--runtime', 'gcp', '--dry-run', '--no-snyk'], { idCheck })
-  assert.equal(r.code, EXIT.PASS)
+  assert.equal(r.code, EXIT.ERROR, 'a dry run checks nothing, so it must never exit 0')
   const plan = JSON.parse(r.out)
   assert.equal(plan.runtime, 'gcp')
   assert.ok(plan.steps.length > 0 && plan.steps.every(s => typeof s.cmd === 'string' && Array.isArray(s.args)))

@@ -122,9 +122,9 @@ test('requirements.txt with --extra-index-url (dependency confusion) is a warnin
   assert.ok(r.some(f => f.id === 'PY-INDEX-OVERRIDE'), ids(r))
 })
 
-test('yarnPath is reported: low for the standard release path, a warning anywhere else', async () => {
+test('yarnPath is a warning wherever it points (the standard release path is still repo code)', async () => {
   const std = await deps({ '.yarnrc.yml': 'yarnPath: .yarn/releases/yarn-4.5.0.cjs\n' })
-  assert.ok(std.some(f => f.id === 'YARN-PATH' && f.severity === 'low'), ids(std))
+  assert.ok(std.some(f => f.id === 'YARN-PATH' && f.severity === 'medium'), ids(std))
   const odd = await deps({ '.yarnrc.yml': 'yarnPath: scripts/setup.js\n' })
   assert.ok(odd.some(f => f.id === 'YARN-PATH' && f.severity === 'medium'), ids(odd))
 })
