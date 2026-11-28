@@ -180,6 +180,9 @@ export function linkResolver(entries, links) {
     remember(e.file)
     for (let at = e.file.indexOf('/'); at !== -1; at = e.file.indexOf('/', at + 1)) { remember(e.file.slice(0, at)); folders.add(e.file.slice(0, at)) }
   }
+  // A work budget shared by every resolution (roughly, characters looked at), so thousands of links with
+  // 4 KiB targets can't stall the scan. A link that runs out is reported as unresolved.
+  let budget = 4_000_000
   /** The real spelling of `p` in the index (or `p` itself if it doesn't exist). */
   const spell = p => (exact.has(p) ? p : folded.get(foldPath(p)) ?? p)
   const targetOf = p => linkTarget.get(spell(p))
@@ -199,7 +202,9 @@ export function linkResolver(entries, links) {
       const c = pending.shift()
       if (c === '' || c === '.') continue
       if (c === '..') { if (!stack.length) return { escape: true }; stack.pop(); continue }
-      const cand = spell([...stack, c].join('/'))
+      const joined = [...stack, c].join('/')
+      if ((budget -= joined.length + 16) < 0) return { budget: true }
+      const cand = spell(joined)
       const t = targetOf(cand)
       if (t === undefined) {
         if (!exact.has(cand)) return { missing: true }
@@ -224,6 +229,7 @@ export function linkResolver(entries, links) {
     for (let hop = 0; hop <= MAX_LINK_HOPS; hop++) {
       if (cur === '..' || cur.startsWith('../')) return { escape: true }
       const parts = cur.split('/')
+      if ((budget -= parts.length * (cur.length + 16)) < 0) return { budget: true }
       let changed = false
       for (let i = 1; i <= parts.length; i++) {
         const prefix = parts.slice(0, i).join('/')
@@ -294,6 +300,7 @@ async function symlinkChecks(dir, entries, links, findings) {
     }
     if (escape) continue
     if (i >= MAX_MATERIALIZE_LINKS) { unresolved(link, `more than ${MAX_MATERIALIZE_LINKS} symlinks`); continue }
+    if (views.some(v => v.budget)) { unresolved(link, 'there are too many links, or too long ones, to follow them all'); continue }
     if (views.some(v => v.unreadable)) { unresolved(link, 'its target could not be read from git'); continue }
     if (views.some(v => v.loop)) { unresolved(link, 'it is part of a loop of links'); continue }
     // What tools that resolve ".." first would read instead, if that exists at all.

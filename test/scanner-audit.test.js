@@ -494,3 +494,11 @@ test('[audit 4] a file: dependency is installed with the root even without a roo
   const nested = r.find(f => f.id === 'DEP-NESTED-PROJECT')
   assert.ok(nested && nested.evidence === 'examples/demo', ids(r))
 })
+
+test('[audit 2] thousands of long link targets cannot stall the scan', { skip: posix }, async () => {
+  const deep = Array.from({ length: 1500 }, () => 'a').join('/') // a 3 KiB target of real-looking components
+  const t = Date.now()
+  const r = await scanCheckout([{ name: 'a/x' }, ...Array.from({ length: 3000 }, (_, i) => link(`l${i}`, deep))])
+  assert.ok(Date.now() - t < 30000, `took ${Date.now() - t} ms`)
+  assert.ok(r.some(f => f.id === 'GIT-SYMLINK-UNRESOLVED'), ids(r))
+})
