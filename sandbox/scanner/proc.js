@@ -47,10 +47,13 @@ function gitConfigEnv(pairs) {
 
 /**
  * Run a command and collect its output.
- * Resolves (never rejects) with { code, stdout, stderr, timedOut, error }.
+ * Resolves (never rejects) with { code, stdout, stderr, timedOut, error }. With `raw`, stdout is a Buffer
+ * of the exact bytes (for binary-safe parsing), otherwise a string.
  */
-export function run(cmd, args, { cwd, env = cleanEnv(), timeoutMs = 10 * 60 * 1000, input } = {}) {
+export function run(cmd, args, { cwd, env = cleanEnv(), timeoutMs = 10 * 60 * 1000, input, raw = false } = {}) {
   return new Promise(resolve => {
+    const chunks = []
+    let outBytes = 0
     let stdout = ''
     let stderr = ''
     let truncated = false
@@ -61,7 +64,7 @@ export function run(cmd, args, { cwd, env = cleanEnv(), timeoutMs = 10 * 60 * 10
       // (npm -> git -> ssh ...), not just the top process.
       child = spawn(cmd, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], shell: false, detached: true })
     } catch (error) {
-      resolve({ code: -1, stdout: '', stderr: String(error), timedOut: false, error })
+      resolve({ code: -1, stdout: raw ? Buffer.alloc(0) : '', stderr: String(error), timedOut: false, error })
       return
     }
     const timer = setTimeout(() => {
@@ -69,6 +72,12 @@ export function run(cmd, args, { cwd, env = cleanEnv(), timeoutMs = 10 * 60 * 10
       try { process.kill(-child.pid, 'SIGKILL') } catch { child.kill('SIGKILL') }
     }, timeoutMs)
     const take = (buf, which) => {
+      if (which === 'out' && raw) {
+        if (outBytes + buf.length > MAX_OUTPUT) { truncated = true; return }
+        chunks.push(buf)
+        outBytes += buf.length
+        return
+      }
       const s = buf.toString('utf8')
       if (which === 'out') {
         if (stdout.length + s.length > MAX_OUTPUT) { truncated = true; return }
@@ -77,19 +86,20 @@ export function run(cmd, args, { cwd, env = cleanEnv(), timeoutMs = 10 * 60 * 10
         stderr += s
       }
     }
+    const out = () => (raw ? Buffer.concat(chunks) : stdout)
     child.stdout.on('data', b => take(b, 'out'))
     child.stderr.on('data', b => take(b, 'err'))
     child.on('error', error => {
       clearTimeout(timer)
-      resolve({ code: -1, stdout, stderr: stderr + String(error), timedOut, error })
+      resolve({ code: -1, stdout: out(), stderr: stderr + String(error), timedOut, error })
     })
     child.on('close', code => {
       clearTimeout(timer)
-      resolve({ code: code ?? -1, stdout, stderr, timedOut, truncated })
+      resolve({ code: code ?? -1, stdout: out(), stderr, timedOut, truncated })
     })
     // On timeout, the group is killed; 'close' can still wait on a grandchild holding a pipe, so
     // resolve on 'exit' + timeout as well.
-    child.on('exit', () => { if (timedOut) { clearTimeout(timer); resolve({ code: -1, stdout, stderr, timedOut, truncated }) } })
+    child.on('exit', () => { if (timedOut) { clearTimeout(timer); resolve({ code: -1, stdout: out(), stderr, timedOut, truncated }) } })
     if (input !== undefined) child.stdin.end(input)
     else child.stdin.end()
   })

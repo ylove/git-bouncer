@@ -18,8 +18,12 @@ import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { excerpt } from '../findings.js'
 import { iocIndex, matchIocStrings, IOC_SNAPSHOT_DATE } from './iocs.js'
+import { foldPath } from '../paths.js'
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024
+// Code and build config are read further: PolinRider-style padding pushes a payload past whatever limit
+// the scanner has, and these are the files where that matters. Anything still cut off is reported.
+export const MAX_CODE_FILE_BYTES = 16 * 1024 * 1024
 const MAX_TOTAL_BYTES = 400 * 1024 * 1024
 const MAX_FILES = 60000 // distinct, non-empty files
 const MAX_ENTRIES = 400000 // directory entries we're willing to list at all
@@ -98,10 +102,25 @@ function decode(buf) {
 
 const CODEISH = /[;(){}=]|\b(require|import|eval|exec|Function|fetch|http|atob|Buffer|subprocess|base64)\b/
 
+// Characters that render as nothing: whitespace of every kind (\s covers NBSP, em space, ideographic
+// space and more), glyphs that are blank without being whitespace (Braille blank, the Hangul fillers),
+// and zero-width code points, which add no width but mustn't break a run either.
+const GAP_RE = /[\s\u2800\u3164\uFFA0\u115F\u1160\p{Default_Ignorable_Code_Point}]/u
+const GAP_BMP = new Uint8Array(0x10000)
+for (let c = 0; c < 0x10000; c++) if (c < 0xd800 || c > 0xdfff) GAP_BMP[c] = GAP_RE.test(String.fromCharCode(c)) ? 1 : 0
+/** Width (in UTF-16 units) of the gap character at i, or 0 if the character there is visible. */
+function gapAt(line, i) {
+  const c = line.charCodeAt(i)
+  if (c < 0xd800 || c > 0xdbff) return GAP_BMP[c]
+  const cp = line.codePointAt(i)
+  return cp > 0xffff && GAP_RE.test(String.fromCodePoint(cp)) ? 2 : 0
+}
+
 /**
- * Longest run of "nothing visible" between two visible characters on one line: whitespace of any kind
- * (including non-breaking and other Unicode spaces) and empty comments used to break up runs.
- * A single pass over the line, so it stays fast on a 2 MiB one-line file.
+ * Longest run of "nothing visible" between two visible characters on one line: whitespace of any kind,
+ * blank-looking glyphs, and comments with nothing visible in them (of any length), which attackers use
+ * to break up a run of spaces. A single pass over the line (a failed comment look-ahead only re-reads
+ * gap characters), so it stays linear on a 16 MiB one-line file.
  * @returns {{len: number, after: string}}
  */
 export function longestHiddenGap(line) {
@@ -109,17 +128,18 @@ export function longestHiddenGap(line) {
   let bestEnd = -1
   let run = 0
   let seenVisible = false
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i]
-    if (ch === '/' && line[i + 1] === '*') { // an empty or whitespace-only comment counts as gap
+  for (let i = 0; i < line.length;) {
+    if (line.charCodeAt(i) === 0x2f && line.charCodeAt(i + 1) === 0x2a) { // "/*" ... "*/" with only gap inside
       let j = i + 2
-      while (j < line.length && j < i + 12 && /\s/.test(line[j])) j++
-      if (line[j] === '*' && line[j + 1] === '/') { run += j + 2 - i; i = j + 1; continue }
+      for (let w; j < line.length && (w = gapAt(line, j)); j += w);
+      if (line.charCodeAt(j) === 0x2a && line.charCodeAt(j + 1) === 0x2f) { run += j + 2 - i; i = j + 2; continue }
     }
-    if (/\s/.test(ch)) { run++; continue }
+    const w = gapAt(line, i)
+    if (w) { run += w; i += w; continue }
     if (seenVisible && run > best) { best = run; bestEnd = i }
     seenVisible = true
     run = 0
+    i++
   }
   return { len: best, after: bestEnd >= 0 ? line.slice(bestEnd, bestEnd + 120) : '' }
 }
@@ -420,7 +440,7 @@ async function listFiles(root, findings) {
       if (ent.isDirectory()) {
         if (ent.name === '.git' && relDir === '') continue
         // These checks run before anything is installed, so any node_modules here was committed.
-        if (ent.name === 'node_modules' && nmReported++ < 5) {
+        if (foldPath(ent.name) === 'node_modules' && nmReported++ < 5) {
           findings.add({ id: 'REPO-COMMITTED-NODE-MODULES', severity: 'medium', file: rel, title: 'node_modules is committed to the repo',
             detail: 'Committed dependencies bypass the lockfile and registry checks, and Node will load them from here. It\'s scanned like the rest of the repo, but nothing verifies where it came from.' })
         }
@@ -431,8 +451,9 @@ async function listFiles(root, findings) {
     }
   }
   const rank = rel => {
-    const base = path.posix.basename(rel).toLowerCase()
-    if (/^\.(vscode|devcontainer|claude|cursor|husky|github|idea)\//.test(rel) || CONFIG_FILE.test(base) || ['package.json', '.npmrc', 'conftest.py', 'setup.py'].includes(base)) return 0
+    const folded = foldPath(rel)
+    const base = path.posix.basename(folded)
+    if (/^\.(vscode|devcontainer|claude|cursor|husky|github|idea)\//.test(folded) || CONFIG_FILE.test(base) || ['package.json', '.npmrc', 'conftest.py', 'setup.py'].includes(base)) return 0
     const ext = path.posix.extname(base).slice(1)
     if (EXEC_EXT.has(ext) || EXEC_NAMES.has(base) || FONT_EXT.has(ext)) return 1
     return 2
@@ -463,7 +484,8 @@ export async function contentChecks(root, findings) {
     if (!st || !st.isFile()) { await fh.close(); continue }
     stats.files++
     const name = path.posix.basename(rel)
-    const base = name.toLowerCase()
+    // Classified by the folded name: "next.config.j<U+017F>" is next.config.js to Node on macOS.
+    const base = foldPath(name)
     const ext = path.posix.extname(base).slice(1)
     if (ioc.files.has(base)) {
       const c = ioc.files.get(base)
@@ -474,15 +496,21 @@ export async function contentChecks(root, findings) {
     if (st.size === 0) { await fh.close(); continue }
     if (stats.scanned >= MAX_FILES || stats.bytes > MAX_TOTAL_BYTES) { await fh.close(); stats.truncated = true; break }
 
+    const kind = kindOf(ext, base)
+    const codeOrConfig = kind === 'exec' || CONFIG_FILE.test(base)
+    const limit = codeOrConfig ? MAX_CODE_FILE_BYTES : MAX_FILE_BYTES
     let buf
     try {
-      const size = Math.min(st.size, MAX_FILE_BYTES)
+      const size = Math.min(st.size, limit)
       buf = Buffer.alloc(size)
       await fh.read(buf, 0, size, 0)
     } finally { await fh.close() }
-    if (st.size > MAX_FILE_BYTES) stats.skippedLarge++
+    if (st.size > limit && codeOrConfig) {
+      findings.add({ id: 'SCAN-LARGE-CODE-FILE', severity: 'medium', file: rel, evidence: `${(st.size / 1024 / 1024).toFixed(1)} MiB`,
+        title: 'A code or config file is too large to scan completely',
+        detail: `Only the first ${MAX_CODE_FILE_BYTES / 1024 / 1024} MiB were checked. Padding a file past a scanner's limit is a known way to hide a payload at the end, and this file runs as code. Treat the result as incomplete.` })
+    } else if (st.size > limit) stats.skippedLarge++
 
-    const kind = kindOf(ext, base)
     // Identical bytes are checked once, unless the name changes what they mean (code, config, fonts).
     const digest = createHash('sha1').update(buf).digest('hex')
     if (seen.has(digest) && kind === 'other' && !FONT_EXT.has(ext) && !MAGIC[ext]) { stats.duplicates++; continue }
@@ -547,8 +575,8 @@ export async function contentChecks(root, findings) {
       detail: `Scanning stopped after ${MAX_FILES} distinct files or ${MAX_TOTAL_BYTES / 1024 / 1024} MiB. Auto-run locations, config files and code were scanned first; the rest may not have been.` })
   }
   if (stats.skippedLarge) {
-    findings.add({ id: 'SCAN-LARGE-FILES', severity: 'info', title: `${stats.skippedLarge} file(s) larger than 2 MiB were only partly scanned`,
-      detail: 'The first 2 MiB of each was checked.' })
+    findings.add({ id: 'SCAN-LARGE-FILES', severity: 'info', title: `${stats.skippedLarge} data file(s) larger than 2 MiB were only partly scanned`,
+      detail: 'The first 2 MiB of each was checked. (Code and config files are read up to 16 MiB, and reported on their own if they are larger.)' })
   }
   return stats
 }

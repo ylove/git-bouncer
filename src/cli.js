@@ -17,7 +17,7 @@ const HELP = `bouncer ${VERSION} — a door check for repositories you didn't wr
 Usage:
   bouncer clone <url> [dir]     ID check, sandboxed pat-down, then asks before cloning to your machine
   git bouncer <url> [dir]       the same, as a git subcommand
-  bouncer scan <url>            check only; never touches your disk (exit 0 pass, 1 fail, 3 warn)
+  bouncer scan <url>            check only; never touches your disk
   bouncer doctor                show which sandbox runtimes are available
   bouncer shell-init [shell]    print an opt-in function so "git clone <url> --bouncer" works
 
@@ -25,7 +25,7 @@ Options:
   --ref <branch|tag|sha>        check this ref instead of the default branch
   --allow-host <host>           also accept this git host (github.com, gitlab.com, bitbucket.org
                                 and codeberg.org are always accepted)
-  --runtime <name>              docker | podman | codespace | gcp | aws (default: first that works)
+  --runtime <name>              docker | podman | gcp | aws (default: Docker or Podman, whichever works)
   --json                        machine-readable report on stdout (never installs anything)
   --keep                        keep the sandbox afterwards so you can inspect it
   --no-install                  clone to your machine but don't install dependencies
@@ -33,6 +33,9 @@ Options:
   --snyk / --no-snyk            also run Snyk on the dependency manifests (asks by default if Snyk is set up)
   -h, --help                    show this help
   -v, --version                 show the version
+
+Exit codes:
+  0 let in   1 turned away   2 incomplete, dry run or usage error   3 warning
 
 Examples:
   bouncer clone https://github.com/someone/take-home-test
@@ -53,7 +56,7 @@ const OPTIONS = {
   help: { type: 'boolean', short: 'h', default: false },
   version: { type: 'boolean', short: 'v', default: false },
 }
-const RUNTIMES = ['docker', 'podman', 'codespace', 'gcp', 'aws']
+const RUNTIMES = ['docker', 'podman', 'gcp', 'aws']
 const COMMANDS = ['clone', 'scan', 'doctor', 'shell-init', 'help', 'version']
 
 /**

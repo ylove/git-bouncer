@@ -47,7 +47,7 @@ Why the split: the **ID check** needs nothing from the repo, so it runs on your 
    `--cap-drop=ALL --security-opt=no-new-privileges --read-only --user 10001:10001`
    `--tmpfs /work:noexec,nosuid,nodev,size=…` `--tmpfs /tmp:noexec,nosuid,nodev`
    `--pids-limit --memory --cpus`, and no mounts, no Docker socket, no inherited environment.
-2. **GitHub Codespaces.** Used when there's no local runtime but `gh` is signed in with the `codespace` scope. The Codespace is created from **this** repo's pinned `.devcontainer/sandbox` config, never from the suspect repo. The scanner is copied in with `gh codespace cp`, tokens are unset, and the Codespace is deleted afterwards.
+2. **GitHub Codespaces (planned, not in 1.0.0; see PR #23).** For when there's no local runtime but `gh` is signed in with the `codespace` scope. The Codespace is created from **this** repo's pinned `.devcontainer/sandbox` config, never from the suspect repo. The scanner is copied in with `gh codespace cp`, tokens are unset, and the Codespace is deleted afterwards.
 3. **Cloud** (opt-in): GCP Cloud Build or AWS CodeBuild run the same scanner in an ephemeral build VM. **Not live-tested by the maintainer** (it costs money). `--dry-run` prints exactly what would run. See `docs/cloud.md`.
 4. **Nothing available:** offers to install **Podman** (open source, no account) or Docker Desktop, with your consent.
 

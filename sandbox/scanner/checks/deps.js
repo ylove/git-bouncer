@@ -16,6 +16,7 @@ import { run, cleanEnv } from '../proc.js'
 import { DOWNLOAD_EXEC } from './content.js'
 import { iocIndex, IOC_SNAPSHOT_DATE } from './iocs.js'
 import { POPULAR_NPM } from './popular.js'
+import { foldPath, variantsOf } from '../paths.js'
 
 const REGISTRY = 'https://registry.npmjs.org/'
 const REGISTRY_HOSTS = new Set(['registry.npmjs.org', 'registry.yarnpkg.com'])
@@ -64,17 +65,31 @@ const LOCKFILE_NAMES = new Set(['package-lock.json', 'npm-shrinkwrap.json', 'yar
 const isRegistryUrl = u => { try { const x = new URL(u); return x.protocol === 'https:' && REGISTRY_HOSTS.has(x.hostname) } catch { return false } }
 const KNOWN_PY_INDEXES = /^https:\/\/(download\.pytorch\.org|pypi\.nvidia\.com|data\.pyg\.org)\//
 
-/** Read a whole file (size-capped) through one open handle, so the size check and the read can't diverge. */
-async function readText(file, max = 8 * 1024 * 1024) {
+const MAX_CONFIG_BYTES = 16 * 1024 * 1024
+const MAX_LOCKFILE_BYTES = 64 * 1024 * 1024
+
+/**
+ * Read a whole file (size-capped) through one open handle, so the size check and the read can't diverge.
+ * With `report`, a file over the cap is a coverage gap (SCAN-LARGE-CODE-FILE), never silently "absent":
+ * padding package.json or a lockfile past the cap must not make its scripts disappear.
+ * @param {{findings: object, label: string}} [report]
+ */
+async function readText(file, max = MAX_CONFIG_BYTES, report) {
   let fh
   try {
     fh = await open(file, 'r')
     const st = await fh.stat()
-    if (!st.isFile() || st.size > max) return null
+    if (!st.isFile()) return null
+    if (st.size > max) {
+      report?.findings.add({ id: 'SCAN-LARGE-CODE-FILE', severity: 'medium', file: report.label, evidence: `${(st.size / 1024 / 1024).toFixed(1)} MiB`,
+        title: `${path.posix.basename(report.label)} is too large to check`,
+        detail: `Package managers read this file automatically, but it is over the ${max / 1024 / 1024} MiB the scanner reads, so its scripts, settings or locked packages were not checked. Treat the result as incomplete.` })
+      return null
+    }
     return await fh.readFile('utf8')
   } catch { return null } finally { await fh?.close() }
 }
-async function readJson(file) { const t = await readText(file); if (t === null) return null; try { return JSON.parse(t.replace(/^\uFEFF/, '')) } catch { return undefined } }
+async function readJson(file, max, report) { const t = await readText(file, max, report); if (t === null) return null; try { return JSON.parse(t.replace(/^\uFEFF/, '')) } catch { return undefined } }
 
 /** Damerau-Levenshtein (optimal string alignment) distance, capped for speed. */
 export function editDistance(a, b, cap = 3) {
@@ -124,25 +139,35 @@ function classifyResolved(resolved) {
   if (/^git(\+ssh|\+https|\+http|\+file)?:|^github:|^gitlab:|^bitbucket:/.test(resolved)) return 'git'
   let u
   try { u = new URL(resolved) } catch { return 'odd' }
-  if (u.protocol === 'http:') return 'insecure'
+  // npm rewrites registry.npmjs.org "resolved" URLs to the configured https registry, so an old
+  // http:// registry URL is noted, not treated like a download from an arbitrary http server.
+  if (u.protocol === 'http:') return REGISTRY_HOSTS.has(u.hostname) ? 'oldRegistryHttp' : 'insecure'
   if (u.protocol !== 'https:') return 'odd'
   if (REGISTRY_HOSTS.has(u.hostname)) return null
   if (u.hostname === 'codeload.github.com') return 'git'
   return 'nonregistry'
 }
 
-const newTally = () => ({ insecure: [], nonregistry: [], git: [], odd: [], noIntegrity: 0, sha1Only: 0 })
+const newTally = () => ({ insecure: [], oldRegistryHttp: [], nonregistry: [], git: [], odd: [], noIntegrity: 0, sha1Only: 0 })
 const note = (t, kind, label) => { t[kind].push(t[kind].length < 5 ? label : null) }
 
-/** Static review of npm/yarn/pnpm lockfiles. Returns every package name seen, and npm's per-package info. */
-export async function lockfileChecks(root, findings) {
+/**
+ * Static review of the npm/yarn/pnpm lockfiles in one folder (the repo root by default), every spelling
+ * of each name. Returns every package name seen, and npm's per-package info.
+ */
+export async function lockfileChecks(root, findings, rel = '') {
   const names = new Set()
   const npmEntries = [] // [key, entry] from package-lock v2/v3
+  let offRegistry = false // anything here downloads from outside the registry (or over http, or from somewhere odd)
+  const tally = (file, t) => { reportTally(findings, file, t); offRegistry ||= t.insecure.length + t.nonregistry.length + t.odd.length > 0 }
+  const dir = path.join(root, rel)
+  const here = await readdir(dir).catch(() => [])
+  const label = n => (rel ? `${rel}/${n}` : n)
 
-  for (const lockName of ['package-lock.json', 'npm-shrinkwrap.json']) {
-    const lock = await readJson(path.join(root, lockName))
+  for (const lockName of [...variantsOf(here, 'package-lock.json'), ...variantsOf(here, 'npm-shrinkwrap.json')]) {
+    const lock = await readJson(path.join(dir, lockName), MAX_LOCKFILE_BYTES, { findings, label: label(lockName) })
     if (lock === undefined) {
-      findings.add({ id: 'LOCK-UNPARSABLE', severity: 'medium', file: lockName, title: `${lockName} is not valid JSON`,
+      findings.add({ id: 'LOCK-UNPARSABLE', severity: 'medium', file: label(lockName), title: `${label(lockName)} is not valid JSON`,
         detail: 'npm can\'t use a broken lockfile, so the dependency tree couldn\'t be verified.' })
       continue
     }
@@ -170,11 +195,12 @@ export async function lockfileChecks(root, findings) {
       if (where && !p.integrity) t.noIntegrity++
       else if (p.integrity && !/sha(256|384|512)-/.test(p.integrity)) t.sha1Only++
     }
-    reportTally(findings, lockName, t)
+    tally(label(lockName), t)
   }
 
-  const yarn = await readText(path.join(root, 'yarn.lock'))
-  if (yarn) {
+  for (const yarnName of variantsOf(here, 'yarn.lock')) {
+    const yarn = await readText(path.join(dir, yarnName), MAX_LOCKFILE_BYTES, { findings, label: label(yarnName) })
+    if (!yarn) continue
     const t = newTally()
     for (const m of yarn.matchAll(/^"?(@?[^@\s"]+)@[^\n]*\n((?:[ \t]+[^\n]*\n?)*)/gm)) {
       const name = m[1]
@@ -194,11 +220,12 @@ export async function lockfileChecks(root, findings) {
       if (kind === 'git') continue
       if (url && /:\/\//.test(url) && !/^\s+(integrity|checksum)\s|^\s+checksum:/m.test(block)) t.noIntegrity++
     }
-    reportTally(findings, 'yarn.lock', t)
+    tally(label(yarnName), t)
   }
 
-  const pnpm = await readText(path.join(root, 'pnpm-lock.yaml'))
-  if (pnpm) {
+  for (const pnpmName of variantsOf(here, 'pnpm-lock.yaml')) {
+    const pnpm = await readText(path.join(dir, pnpmName), MAX_LOCKFILE_BYTES, { findings, label: label(pnpmName) })
+    if (!pnpm) continue
     const t = newTally()
     for (const m of pnpm.matchAll(/^\s{2,4}'?\/?(@?[^@\s':]+)@([^:\n']*)'?:\n((?:\s{4,}[^\n]*\n?)*)/gm)) {
       names.add(m[1])
@@ -207,9 +234,9 @@ export async function lockfileChecks(root, findings) {
       const kind = classifyResolved(tarball)
       if (kind) note(t, kind, `${m[1]} → ${tarball.slice(0, 120)}`)
     }
-    reportTally(findings, 'pnpm-lock.yaml', t)
+    tally(label(pnpmName), t)
   }
-  return { names, npmEntries }
+  return { names, npmEntries, offRegistry }
 }
 
 function reportTally(findings, file, t) {
@@ -217,6 +244,9 @@ function reportTally(findings, file, t) {
   if (t.insecure.length) findings.add({ id: 'LOCK-RESOLVED-INSECURE', severity: 'high', file, evidence: show(t.insecure),
     title: `${t.insecure.length} package(s) download over plain http`,
     detail: 'Anyone on the network path can replace these packages in transit. Registry packages always use https.' })
+  if (t.oldRegistryHttp.length) findings.add({ id: 'LOCK-RESOLVED-HTTP-REGISTRY', severity: 'low', file, evidence: show(t.oldRegistryHttp),
+    title: `${t.oldRegistryHttp.length} package(s) list the npm registry over http`,
+    detail: 'Old lockfiles sometimes record http://registry.npmjs.org. npm rewrites these to the https registry when installing, so this is noted rather than treated as an insecure download.' })
   if (t.nonregistry.length) findings.add({ id: 'LOCK-RESOLVED-NONREGISTRY', severity: 'medium', file, evidence: show(t.nonregistry),
     title: `${t.nonregistry.length} package(s) come from outside the npm registry`,
     detail: 'Packages downloaded from arbitrary servers skip the registry\'s malware takedowns and signatures. A swapped lockfile URL is a known supply-chain trick.' })
@@ -232,6 +262,16 @@ function reportTally(findings, file, t) {
     title: 'Lockfile entries pinned only with SHA-1', detail: 'SHA-1 is no longer collision-resistant. Modern lockfiles use sha512.' })
 }
 
+// What osv-scanner should parse each lockfile as, by folded name. Passed explicitly ("parse-as:path"), so
+// an odd spelling (Package-Lock.json, which npm on macOS reads as package-lock.json) or a ":" in a folder
+// name can't make osv-scanner skip or misread the file.
+const OSV_PARSE_AS = new Map([...LOCKFILE_NAMES].map(n => [foldPath(n), n === 'npm-shrinkwrap.json' ? 'package-lock.json' : n]))
+const isRequirements = name => /^requirements[\w.-]*\.txt$/.test(foldPath(name))
+const osvLockfileArg = rel => {
+  const base = path.posix.basename(rel)
+  return `${OSV_PARSE_AS.get(foldPath(base)) ?? (isRequirements(base) ? 'requirements.txt' : base)}:${rel}`
+}
+
 /** Find lockfiles (not inside node_modules), shallowest first, for OSV. */
 async function findLockfiles(root, depth = 4) {
   const out = []
@@ -243,8 +283,8 @@ async function findLockfiles(root, depth = 4) {
     for (const e of entries) {
       const r = rel ? `${rel}/${e.name}` : e.name
       if (e.isDirectory()) {
-        if (d > 0 && !['node_modules', '.git', 'vendor', '.venv', 'venv'].includes(e.name)) queue.push([r, d - 1])
-      } else if (e.isFile() && (LOCKFILE_NAMES.has(e.name) || /^requirements[\w.-]*\.txt$/.test(e.name))) out.push(r)
+        if (d > 0 && !['node_modules', '.git', 'vendor', '.venv', 'venv'].includes(foldPath(e.name))) queue.push([r, d - 1])
+      } else if (e.isFile() && (OSV_PARSE_AS.has(foldPath(e.name)) || isRequirements(e.name))) out.push(r)
     }
   }
   return out
@@ -258,6 +298,12 @@ function cvssBucket(score) {
 
 const MAX_OSV_LOCKFILES = 25
 
+// --no-resolve: never resolve transitive dependencies of manifest-only files (pom.xml, requirements.txt, ...).
+// Resolution downloads metadata from wherever the manifest says (a pom.xml <repositories> URL, a parent
+// POM), so the repo could steer the sandbox at any server it likes, including the host's own 127.0.0.1
+// through host.docker.internal. Manifests are matched on the versions they declare instead.
+export const OSV_ARGS = (osvConfig, lockfile) => ['scan', 'source', '--format', 'json', '--no-resolve', '--config', osvConfig, '-L', osvLockfileArg(lockfile)]
+
 /** osv-scanner, one lockfile per run (one bad file can't sink the rest), always with OUR config file. */
 async function osvChecks(root, lockfiles, findings, { osvBin, osvConfig }) {
   if (!lockfiles.length) return { ran: false, reason: 'no lockfiles or manifests found' }
@@ -267,7 +313,7 @@ async function osvChecks(root, lockfiles, findings, { osvBin, osvConfig }) {
   let ok = 0
   const failed = []
   for (const l of lockfiles.slice(0, MAX_OSV_LOCKFILES)) {
-    const r = await run(osvBin, ['scan', 'source', '--format', 'json', '--config', osvConfig, '-L', l], { cwd: root, timeoutMs: 5 * 60 * 1000 })
+    const r = await run(osvBin, OSV_ARGS(osvConfig, l), { cwd: root, timeoutMs: 5 * 60 * 1000 })
     let data = null
     if (r.code === 0 || r.code === 1) { try { data = JSON.parse(r.stdout) } catch { data = null } }
     if (r.code === 128) { ok++; continue } // "no packages found" in this file
@@ -303,9 +349,11 @@ async function osvChecks(root, lockfiles, findings, { osvBin, osvConfig }) {
   if (vulnPkgs.size) {
     const total = Object.values(buckets).reduce((a, b) => a + b, 0)
     const top = [...vulnPkgs.entries()].slice(0, 4).map(([k, ids]) => `${k}: ${ids.slice(0, 2).join(', ')}`).join('; ')
-    findings.add({ id: 'DEP-VULN', severity: 'medium', evidence: top,
+    // Low on purpose: the verdict answers "will this repo attack me?", and an ordinary CVE answers "is this
+    // app vulnerable?". The counts stay in the title so a critical CVE is still visible at a glance.
+    findings.add({ id: 'DEP-VULN', severity: 'low', evidence: top,
       title: `${total} known vulnerabilit${total === 1 ? 'y' : 'ies'} in ${vulnPkgs.size} package(s) (${buckets.critical} critical, ${buckets.high} high)`,
-      detail: 'These are ordinary security bugs (CVEs), not malware: they make the app vulnerable, not your machine at install time. Worth knowing before you build on it.' })
+      detail: 'These are ordinary security bugs (CVEs), not malware: they make the app vulnerable, not your machine at install time. Worth knowing before you build on it or deploy it.' })
   }
   return { ran: ok > 0, lockfiles: Math.min(lockfiles.length, MAX_OSV_LOCKFILES) }
 }
@@ -317,10 +365,10 @@ function expandScript(cmd, scripts) {
   return target ? `${cmd}  →  ${m[1]}: ${target}` : cmd
 }
 
-/** Lifecycle scripts of one package.json (the root, or a workspace that npm installs with it). */
-async function lifecycleFindings(dir, rel, pkg, findings) {
+/** Lifecycle scripts of one package.json: the root, a workspace npm installs with it, or a nested project. */
+async function lifecycleFindings(dir, rel, pkg, findings, pkgName = 'package.json', where = 'workspace') {
   const scripts = pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {}
-  const file = rel ? `${rel}/package.json` : 'package.json'
+  const file = rel ? `${rel}/${pkgName}` : pkgName
   for (const name of LIFECYCLE) {
     const raw = scripts[name]
     if (typeof raw !== 'string') continue
@@ -331,7 +379,7 @@ async function lifecycleFindings(dir, rel, pkg, findings) {
       id: dangerous ? 'SCRIPT-ROOT-DANGEROUS' : 'SCRIPT-ROOT-LIFECYCLE',
       severity: dangerous ? 'high' : hooks ? 'medium' : BENIGN_ROOT_SCRIPT.test(raw.trim()) ? 'low' : 'medium',
       file, evidence: `${name}: ${cmd.slice(0, 220)}`,
-      title: `"${name}" script runs automatically on install${rel ? ` (workspace ${rel})` : ''}`,
+      title: `"${name}" script runs automatically on install${rel ? ` (${where} ${rel})` : ''}`,
       detail: dangerous
         ? 'This script downloads or decodes something and runs it the moment you run npm install. That is the most common way malicious repos attack.'
         : hooks ? 'It points git at a hooks folder inside the repo, so its scripts run on every commit from then on.'
@@ -339,28 +387,132 @@ async function lifecycleFindings(dir, rel, pkg, findings) {
     })
   }
   // A binding.gyp means npm runs `node-gyp rebuild` on install, even with no install script listed.
-  const gyp = await readText(path.join(dir, 'binding.gyp'), 1024 * 1024)
-  if (gyp !== null && typeof scripts.install !== 'string' && typeof scripts.preinstall !== 'string') {
+  for (const gypName of variantsOf(await readdir(dir).catch(() => []), 'binding.gyp')) {
+    if (typeof scripts.install === 'string' || typeof scripts.preinstall === 'string') continue
+    if (!(await stat(path.join(dir, gypName)).catch(() => null))?.isFile()) continue
+    const gyp = (await readText(path.join(dir, gypName), MAX_CONFIG_BYTES, { findings, label: rel ? `${rel}/${gypName}` : gypName })) ?? ''
     const expand = /<!@?\(/.test(gyp) // gyp command expansion: runs a shell command while configuring
-    findings.add({ id: expand ? 'SCRIPT-ROOT-DANGEROUS' : 'SCRIPT-ROOT-LIFECYCLE', severity: expand ? 'high' : 'medium', file: rel ? `${rel}/binding.gyp` : 'binding.gyp',
+    findings.add({ id: expand ? 'SCRIPT-ROOT-DANGEROUS' : 'SCRIPT-ROOT-LIFECYCLE', severity: expand ? 'high' : 'medium', file: rel ? `${rel}/${gypName}` : gypName,
       evidence: expand ? (gyp.match(/<!@?\([^)]{0,160}/) || [''])[0] : 'binding.gyp',
       title: expand ? 'binding.gyp runs shell commands during install' : 'npm compiles native code (node-gyp) on install',
       detail: 'A binding.gyp file makes npm run `node-gyp rebuild` during install. Its <!(...) syntax runs arbitrary shell commands.' })
   }
 }
 
+const workspaceGlobs = pkg => (Array.isArray(pkg.workspaces) ? pkg.workspaces : Array.isArray(pkg.workspaces?.packages) ? pkg.workspaces.packages : [])
+  .filter(g => typeof g === 'string' && !g.includes('..') && !g.startsWith('/') && !g.startsWith('!')).slice(0, 50)
+
 /** Workspace folders listed in package.json ("packages/*" style globs, one level). */
 async function workspaceDirs(root, pkg) {
-  const globs = Array.isArray(pkg.workspaces) ? pkg.workspaces : Array.isArray(pkg.workspaces?.packages) ? pkg.workspaces.packages : []
   const out = []
-  for (const g of globs.slice(0, 50)) {
-    if (typeof g !== 'string' || g.includes('..') || g.startsWith('/')) continue
+  for (const g of workspaceGlobs(pkg)) {
     if (g.endsWith('/*')) {
       const base = g.slice(0, -2)
       try { for (const e of await readdir(path.join(root, base), { withFileTypes: true })) if (e.isDirectory()) out.push(`${base}/${e.name}`) } catch { /* missing */ }
-    } else if (!g.includes('*')) out.push(g.replace(/\/$/, ''))
+    } else if (!g.includes('*')) out.push(g.replace(/^\.\//, '').replace(/\/$/, ''))
   }
   return out.slice(0, 200)
+}
+
+/** Does a folder match any of the root's workspace globs ("packages/*", "apps/**", "tools/x/")? */
+function workspaceMatcher(pkgs) {
+  const res = pkgs.flatMap(workspaceGlobs).map(g => {
+    const body = g.replace(/^\.\//, '').replace(/\/+$/, '').split('/').map(seg => (seg === '**' ? '.*' : seg.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*'))).join('/')
+    return new RegExp(`^${body}$`)
+  })
+  return rel => res.some(re => re.test(rel))
+}
+
+const MAX_NESTED_DEPTH = 5
+const MAX_NESTED_PACKAGES = 100
+const MAX_NESTED_DIRS = 20000
+
+/**
+ * Every folder (up to 5 deep, outside node_modules and .git) with a package.json or an npm lockfile,
+ * breadth-first. `capped` is set when there were more package.json files (or folders) than are checked.
+ */
+async function findNpmProjects(root) {
+  const projects = []
+  const lockDirs = []
+  let capped = false
+  let level = ['']
+  let dirs = 0
+  for (let depth = 1; level.length && depth <= MAX_NESTED_DEPTH; depth++) {
+    const next = []
+    for (const rel of level) {
+      let entries
+      try { entries = await readdir(path.join(root, rel), { withFileTypes: true }) } catch { continue }
+      for (const e of entries) {
+        if (!e.isDirectory() || e.name === '.git' || foldPath(e.name) === 'node_modules') continue
+        if (++dirs > MAX_NESTED_DIRS) { capped = true; break }
+        next.push(rel ? `${rel}/${e.name}` : e.name)
+      }
+    }
+    for (const rel of next) {
+      const names = await readdir(path.join(root, rel)).catch(() => [])
+      if (variantsOf(names, 'package.json').length) {
+        if (projects.length >= MAX_NESTED_PACKAGES) capped = true
+        else projects.push(rel)
+      }
+      if (variantsOf(names, 'package-lock.json').length || variantsOf(names, 'npm-shrinkwrap.json').length) lockDirs.push(rel)
+    }
+    level = next
+  }
+  return { projects, lockDirs, capped }
+}
+
+const DEP_FIELDS = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']
+
+/**
+ * A package.json dependency spec that npm fetches from GitHub (shorthand, github:, or a github.com URL).
+ * The host is parsed, not searched for: "https://evil.example/github.com.tgz" is not GitHub.
+ */
+function fromGitHub(spec) {
+  if (/^[\w.-]+\/[\w.-]+(#.*)?$/.test(spec) || /^github:/.test(spec)) return true
+  const s = spec.replace(/^git\+/, '')
+  if (/^git@github\.com:/.test(s)) return true
+  try {
+    const u = new URL(s)
+    return ['https:', 'ssh:', 'git:'].includes(u.protocol) && ['github.com', 'codeload.github.com'].includes(u.hostname)
+  } catch { return false }
+}
+
+/**
+ * Everything one package.json says about what runs and what gets installed: lifecycle scripts, dangerous
+ * `npm run` targets, URL/git dependencies. Returns its direct dependency names, the URL/git specs, and the
+ * local folders it installs with `file:` (which npm installs, scripts included, along with it).
+ */
+async function manifestFindings(root, rel, pkgName, pkg, findings, where) {
+  const file = rel ? `${rel}/${pkgName}` : pkgName
+  await lifecycleFindings(path.join(root, rel), rel, pkg, findings, pkgName, where)
+  const scripts = pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {}
+  for (const name of RUN_SCRIPTS) {
+    const cmd = typeof scripts[name] === 'string' ? expandScript(scripts[name], scripts) : null
+    if (cmd && DOWNLOAD_EXEC.test(cmd)) {
+      findings.add({ id: 'SCRIPT-RUN-DANGEROUS', severity: 'medium', file, evidence: `${name}: ${cmd.slice(0, 200)}`,
+        title: `"npm run ${name}" downloads or decodes something and runs it${rel ? ` (in ${rel})` : ''}`,
+        detail: 'Take-home tests tell you to run "npm run dev" or "npm test". Read what that actually does first.' })
+    }
+  }
+  const deps = new Set()
+  const urlSpecs = []
+  const localDirs = []
+  for (const field of DEP_FIELDS) {
+    for (const [name, spec] of Object.entries(pkg[field] && typeof pkg[field] === 'object' ? pkg[field] : {})) {
+      if (typeof spec !== 'string') continue
+      const local = spec.match(/^(?:file:|link:)?(\.{1,2}\/[^#?]*)$|^(?:file:|link:)([^/][^#?]*)$/)
+      if (local) localDirs.push(path.posix.normalize(path.posix.join(rel || '.', local[1] ?? local[2])).replace(/\/$/, ''))
+      // "alias": "npm:real-name@1.2.3" installs real-name under another name; check the real one.
+      const alias = spec.match(/^npm:((?:@[^/@]+\/)?[^@]+)/)
+      deps.add(alias ? alias[1] : name)
+      if (/^(https?:|git|github:|gitlab:|bitbucket:|file:\/)/.test(spec) || /^[\w.-]+\/[\w.-]+(#.*)?$/.test(spec)) {
+        urlSpecs.push(spec)
+        findings.add({ id: 'DEP-SPEC-URL', severity: spec.startsWith('http:') ? 'high' : 'low', file, evidence: `${name}: ${spec.slice(0, 160)}`,
+          title: `"${name}" is installed from a URL or git, not the registry`, detail: 'URL and git dependencies skip registry signatures and malware takedowns.' })
+      }
+    }
+  }
+  return { deps, urlSpecs, localDirs }
 }
 
 /**
@@ -372,13 +524,17 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
   const pm = { kind: 'none', lockfile: null, generatedLockfile: false, analysisLockfile: false, installed: false, osv: null }
 
   // 1. Project config that changes how package managers behave. Read it, report it, then move it out of
-  //    the way. Names are matched case-insensitively (".NPMRC" is ".npmrc" on macOS and Windows).
-  const rootNames = new Map((await readdir(root).catch(() => [])).map(n => [n.toLowerCase(), n]))
-  for (const lower of ['.npmrc', '.yarnrc', '.yarnrc.yml']) {
-    const rc = rootNames.get(lower)
-    if (!rc) continue
-    const text = await readText(path.join(root, rc))
-    if (text === null) continue
+  //    the way. Names are folded the way macOS and Windows compare them (".NPMRC" is ".npmrc" there), and
+  //    every spelling present is checked.
+  const rootEntries = await readdir(root).catch(() => [])
+  const spellings = name => variantsOf(rootEntries, name)
+  for (const lower of ['.npmrc', '.yarnrc', '.yarnrc.yml']) for (const rc of spellings(lower)) {
+    const text = await readText(path.join(root, rc), MAX_CONFIG_BYTES, { findings, label: rc })
+    if (text === null) {
+      // Too large (reported) or unreadable: still never let the sandbox's own npm read it.
+      if (lower !== '.yarnrc.yml' && !dryRun) await rename(path.join(root, rc), path.join(root, `${rc}.bouncer-disabled`)).catch(() => {})
+      continue
+    }
     if (lower === '.yarnrc') {
       // Yarn classic: `yarn-path "./x.js"` makes every yarn command run that file.
       const yp = text.match(/^\s*yarn-path\s+["']?([^"'\n]+)/m)
@@ -389,10 +545,11 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
     if (lower === '.yarnrc.yml') {
       const yp = text.match(/^\s*yarnPath:\s*["']?([^"'\n]+)/m)
       if (yp) {
-        const official = /^\.yarn\/releases\/yarn-[\d.]+(-[\w.]+)?\.c?js$/.test(yp[1].trim())
-        findings.add({ id: 'YARN-PATH', severity: official ? 'low' : 'medium', file: rc, evidence: yp[1].trim().slice(0, 120),
+        // Medium even for the standard .yarn/releases/yarn-x.y.z.cjs path: the file at that path is whatever
+        // the repo committed, and nothing checks it against a real Yarn release.
+        findings.add({ id: 'YARN-PATH', severity: 'medium', file: rc, evidence: yp[1].trim().slice(0, 120),
           title: 'Running yarn here executes a JavaScript file from the repo',
-          detail: '`yarnPath` makes every yarn command run the repo\'s own copy of Yarn. That\'s normal for Yarn Berry, but it means the repo controls the program that installs your dependencies.' })
+          detail: '`yarnPath` makes every yarn command (even `yarn --version`) run this file from the repo instead of the Yarn you installed. Yarn Berry projects commonly ship one at .yarn/releases/yarn-x.y.z.cjs, but the path proves nothing: the file is repo-controlled code, it was not compared with a real Yarn release, and it runs with your permissions the moment you type `yarn`.' })
       }
       const reg = text.match(/^\s*npmRegistryServer:\s*["']?([^"'\s]+)/m)
       if (reg && !isRegistryUrl(reg[1])) findings.add({ id: 'NPMRC-OVERRIDE', severity: 'high', file: rc, evidence: `npmRegistryServer: ${reg[1].slice(0, 100)}`,
@@ -437,61 +594,80 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
     if (!dryRun) await rename(path.join(root, rc), path.join(root, `${rc}.bouncer-disabled`)).catch(() => {})
   }
   // pnpm runs .pnpmfile.cjs on every install, even with --ignore-scripts; bunfig.toml can preload scripts.
-  const pnpmfile = rootNames.get('.pnpmfile.cjs') || rootNames.get('.pnpmfile.mjs')
-  if (pnpmfile) {
-    const t = (await readText(path.join(root, pnpmfile))) ?? ''
+  for (const pnpmfile of [...spellings('.pnpmfile.cjs'), ...spellings('.pnpmfile.mjs')]) {
+    const t = (await readText(path.join(root, pnpmfile), MAX_CONFIG_BYTES, { findings, label: pnpmfile })) ?? ''
     findings.add({ id: 'PNPMFILE', severity: DOWNLOAD_EXEC.test(t) || /child_process/.test(t) ? 'high' : 'medium', file: pnpmfile,
       title: 'pnpm runs code from this repo on every install',
       detail: '.pnpmfile.cjs hooks run whenever pnpm installs, even with --ignore-scripts. Read it before running pnpm here.' })
   }
-  const bunfig = rootNames.get('bunfig.toml')
-  if (bunfig && /^\s*preload\s*=/m.test((await readText(path.join(root, bunfig))) ?? '')) {
+  for (const bunfig of spellings('bunfig.toml')) {
+    if (!/^\s*preload\s*=/m.test((await readText(path.join(root, bunfig), MAX_CONFIG_BYTES, { findings, label: bunfig })) ?? '')) continue
     findings.add({ id: 'BUNFIG-PRELOAD', severity: 'medium', file: bunfig, title: 'bunfig.toml preloads scripts',
       detail: '`preload` makes bun run these files before your code (and before tests).' })
   }
 
-  // 2. package.json scripts (root + workspaces) and direct dependencies.
-  const pkg = await readJson(path.join(root, 'package.json'))
-  const directDeps = new Set()
-  if (pkg && typeof pkg === 'object') {
+  // 2. package.json scripts and direct dependencies. The root first, every spelling of the name (npm on
+  //    macOS or Windows opens "Package.json" as package.json), then every other package.json up to five
+  //    folders deep: workspaces, local file: dependencies, and separate projects like frontend/ that
+  //    the README tells you to `cd` into and install. Their scripts run just the same.
+  const rootPkgs = []
+  for (const name of spellings('package.json')) {
+    const p = await readJson(path.join(root, name), MAX_CONFIG_BYTES, { findings, label: name })
+    if (p && typeof p === 'object') rootPkgs.push([name, p])
+  }
+  const pkg = (rootPkgs.find(([n]) => n === 'package.json') ?? rootPkgs[0])?.[1] ?? null
+  const directDeps = new Map() // name -> the package.json that asked for it
+  const rootUrlSpecs = []
+  const rootLocalDirs = new Set()
+  for (const [pkgName, p] of rootPkgs) {
     pm.kind = 'npm'
-    await lifecycleFindings(root, '', pkg, findings)
-    for (const ws of await workspaceDirs(root, pkg)) {
-      const wpkg = await readJson(path.join(root, ws, 'package.json'))
-      if (wpkg && typeof wpkg === 'object') await lifecycleFindings(path.join(root, ws), ws, wpkg, findings)
+    const { deps, urlSpecs, localDirs } = await manifestFindings(root, '', pkgName, p, findings, '')
+    for (const d of deps) if (!directDeps.has(d)) directDeps.set(d, pkgName)
+    rootUrlSpecs.push(...urlSpecs)
+    for (const d of localDirs) rootLocalDirs.add(d)
+  }
+  const isWorkspace = workspaceMatcher(rootPkgs.map(([, p]) => p))
+  const found = await findNpmProjects(root)
+  const wsListed = (await Promise.all(rootPkgs.map(([, p]) => workspaceDirs(root, p)))).flat()
+  const projectDirs = [...new Set([...found.projects, ...wsListed])].filter(Boolean)
+  const nested = [] // { rel, workspace, hasDeps }
+  for (const rel of projectDirs) {
+    for (const name of variantsOf(await readdir(path.join(root, rel)).catch(() => []), 'package.json')) {
+      const p = await readJson(path.join(root, rel, name), MAX_CONFIG_BYTES, { findings, label: `${rel}/${name}` })
+      if (!p || typeof p !== 'object') continue
+      const workspace = isWorkspace(rel) || wsListed.includes(rel)
+      const { deps } = await manifestFindings(root, rel, name, p, findings, workspace ? 'workspace' : 'in')
+      for (const d of deps) if (!directDeps.has(d)) directDeps.set(d, `${rel}/${name}`)
+      nested.push({ rel, workspace, hasDeps: DEP_FIELDS.some(f => p[f] && typeof p[f] === 'object' && Object.keys(p[f]).length > 0) })
     }
-    const scripts = pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {}
-    for (const name of RUN_SCRIPTS) {
-      const cmd = typeof scripts[name] === 'string' ? expandScript(scripts[name], scripts) : null
-      if (cmd && DOWNLOAD_EXEC.test(cmd)) {
-        findings.add({ id: 'SCRIPT-RUN-DANGEROUS', severity: 'medium', file: 'package.json', evidence: `${name}: ${cmd.slice(0, 200)}`,
-          title: `"npm run ${name}" downloads or decodes something and runs it`,
-          detail: 'Take-home tests tell you to run "npm run dev" or "npm test". Read what that actually does first.' })
-      }
-    }
-    for (const field of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
-      for (const [name, spec] of Object.entries(pkg[field] || {})) {
-        if (typeof spec !== 'string') continue
-        // "alias": "npm:real-name@1.2.3" installs real-name under another name; check the real one.
-        const alias = spec.match(/^npm:((?:@[^/@]+\/)?[^@]+)/)
-        directDeps.add(alias ? alias[1] : name)
-        if (/^(https?:|git|github:|gitlab:|bitbucket:|file:\/)/.test(spec) || /^[\w.-]+\/[\w.-]+(#.*)?$/.test(spec)) {
-          findings.add({ id: 'DEP-SPEC-URL', severity: spec.startsWith('http:') ? 'high' : 'low', file: 'package.json', evidence: `${name}: ${spec.slice(0, 160)}`,
-            title: `"${name}" is installed from a URL or git, not the registry`, detail: 'URL and git dependencies skip registry signatures and malware takedowns.' })
-        }
-      }
-    }
+  }
+  if (found.capped) {
+    findings.add({ id: 'DEP-NESTED-PROJECT', severity: 'medium', evidence: `first ${MAX_NESTED_PACKAGES} checked`,
+      title: `More than ${MAX_NESTED_PACKAGES} package.json files (or a very deep tree): only the first ones were checked`,
+      detail: `Install scripts were checked in the ${MAX_NESTED_PACKAGES} shallowest package.json files up to ${MAX_NESTED_DEPTH} folders deep. The rest were not. Treat the result as incomplete.` })
   }
 
-  // 3. Static lockfile review.
-  const { names, npmEntries } = await lockfileChecks(root, findings)
-  for (const n of directDeps) names.add(n)
-  const exists = async f => Boolean(await stat(path.join(root, f)).catch(() => null))
-  for (const f of ['yarn.lock', 'pnpm-lock.yaml', 'bun.lock', 'bun.lockb']) {
-    if (await exists(f)) { pm.kind = f.startsWith('yarn') ? 'yarn' : f.startsWith('pnpm') ? 'pnpm' : 'bun'; pm.lockfile = f; break }
+  // 3. Static lockfile review: the root's, then every nested npm lockfile (their install scripts run when
+  //    you install that project).
+  const rootLock = await lockfileChecks(root, findings)
+  const { names, npmEntries } = rootLock
+  for (const n of directDeps.keys()) names.add(n)
+  const nestedEntries = [] // [folder, key, entry]
+  for (const rel of [...new Set([...found.lockDirs, ...nested.map(n => n.rel)])]) {
+    const lock = await lockfileChecks(root, findings, rel)
+    for (const n of lock.names) names.add(n)
+    for (const [key, e] of lock.npmEntries) nestedEntries.push([rel, key, e])
   }
-  const npmLock = (await exists('npm-shrinkwrap.json')) ? 'npm-shrinkwrap.json' : (await exists('package-lock.json')) ? 'package-lock.json' : null
-  if (npmLock) { pm.kind = 'npm'; pm.lockfile = npmLock }
+  for (const f of ['yarn.lock', 'pnpm-lock.yaml', 'bun.lock', 'bun.lockb']) {
+    if (spellings(f).length) { pm.kind = f.startsWith('yarn') ? 'yarn' : f.startsWith('pnpm') ? 'pnpm' : 'bun'; pm.lockfile = f; break }
+  }
+  // npmLock is what the sandbox's own npm will see (exact names only, it runs on Linux).
+  const npmLock = spellings('npm-shrinkwrap.json').includes('npm-shrinkwrap.json') ? 'npm-shrinkwrap.json' : spellings('package-lock.json').includes('package-lock.json') ? 'package-lock.json' : null
+  const anyNpmLock = spellings('npm-shrinkwrap.json').length ? 'npm-shrinkwrap.json' : spellings('package-lock.json').length ? 'package-lock.json' : null
+  if (anyNpmLock) { pm.kind = 'npm'; pm.lockfile = anyNpmLock }
+  // A file npm reads that exists only under another spelling: npm on your Mac or PC would read it, the
+  // sandbox's npm on Linux would not, so an install here would verify a different tree than yours.
+  const oddSpelling = ['package.json', 'package-lock.json', 'npm-shrinkwrap.json'].flatMap(n => (spellings(n).length && !spellings(n).includes(n) ? spellings(n) : []))
 
   // 4. Known-bad package names (IOC snapshot) and typosquats.
   for (const n of names) {
@@ -499,9 +675,9 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
     if (c) findings.add({ id: 'IOC-MATCH', severity: 'critical', evidence: `npm package: ${n}`, title: `Depends on a package named in ${c.campaign} reporting`,
       detail: `Reported in public research (snapshot ${IOC_SNAPSHOT_DATE}): ${c.source}` })
   }
-  for (const n of directDeps) {
+  for (const [n, file] of directDeps) {
     const like = typosquatOf(n)
-    if (like) findings.add({ id: 'DEP-TYPOSQUAT', severity: 'medium', file: 'package.json', evidence: `${n} ≈ ${like}`,
+    if (like) findings.add({ id: 'DEP-TYPOSQUAT', severity: 'medium', file, evidence: `${n} ≈ ${like}`,
       title: `"${n}" looks like a misspelling of "${like}"`,
       detail: 'Typosquatting packages copy a popular name with one letter changed and add malware. Check that this is really the package the author meant.' })
   }
@@ -519,14 +695,19 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
     if (k !== 'git') return true
     return !/^(git\+)?(https:\/\/|ssh:\/\/git@|git@)?(github\.com|codeload\.github\.com)[/:]|^github:/.test(u)
   }
-  const offRegistry = npmEntries.some(([, e]) => e && !e.link && offRegistryUrl(e.resolved)) ||
-    findings.items.some(f => ['LOCK-RESOLVED-INSECURE', 'LOCK-RESOLVED-NONREGISTRY', 'LOCK-RESOLVED-ODD'].includes(f.id)) ||
-    findings.items.some(f => f.id === 'DEP-SPEC-URL' && !/(github\.com|github:|^[^:]+: [\w.-]+\/[\w.-]+)/.test(f.evidence || ''))
+  // Decided from the root's own manifest and lockfiles (not from the findings list, which caps how many
+  // of each finding it keeps, and which also holds nested projects' findings).
+  const offRegistry = npmEntries.some(([, e]) => e && !e.link && offRegistryUrl(e.resolved)) || rootLock.offRegistry ||
+    rootUrlSpecs.some(spec => !fromGitHub(spec))
   if (offRegistry && pkg && !skipInstall) {
     findings.add({ id: 'DEP-INSTALL-SKIPPED', severity: 'medium', title: 'Dependencies were not installed in the sandbox',
       detail: 'Some packages would be downloaded from servers outside the npm registry, so the sandbox did not contact them. Checksum and signature checks were skipped; install scripts were read from the lockfile where possible.' })
+  } else if (oddSpelling.length && pkg && !skipInstall) {
+    findings.add({ id: 'DEP-INSTALL-SKIPPED', severity: 'medium', evidence: oddSpelling.slice(0, 4).join(', '),
+      title: `Dependencies were not installed in the sandbox: ${oddSpelling[0]} is spelled unusually`,
+      detail: 'npm on macOS and Windows reads this file as if it had the usual name; the sandbox\'s npm runs on Linux, where it doesn\'t. Installing here would have verified a different dependency tree than the one your machine would install, so checksum and signature checks were skipped. Its scripts and lockfile entries were still read.' })
   }
-  if (pkg && typeof pkg === 'object' && !skipInstall && !offRegistry) {
+  if (pkg && typeof pkg === 'object' && !skipInstall && !offRegistry && !oddSpelling.length) {
     const npmEnv = cleanEnv({ npm_config_ignore_scripts: 'true', npm_config_registry: REGISTRY, npm_config_audit: 'false', npm_config_fund: 'false' })
     const common = ['--ignore-scripts', '--no-audit', '--no-fund', `--registry=${REGISTRY}`, '--loglevel=error']
     const args = npmLock ? ['ci', ...common] : ['install', ...common, '--package-lock=true']
@@ -542,7 +723,7 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
       pm.installed = true
       if (!npmLock) {
         if (pm.kind === 'npm') { pm.lockfile = 'package-lock.json'; pm.generatedLockfile = true } else pm.analysisLockfile = true
-        const gen = await readJson(path.join(root, 'package-lock.json'))
+        const gen = await readJson(path.join(root, 'package-lock.json'), MAX_LOCKFILE_BYTES)
         if (gen && gen.packages) lockEntries = Object.entries(gen.packages)
       }
     } else if (/EINTEGRITY|integrity checksum failed|sha512-.* integrity/i.test(err)) {
@@ -557,6 +738,17 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
         title: r.timedOut ? 'Dependency install timed out in the sandbox' : 'Dependencies could not be installed in the sandbox',
         detail: 'Checksum and signature checks need the dependency tree, so those checks are incomplete. Install scripts were still read from the lockfile where possible.' })
     }
+  }
+
+  // 5b. Nested projects that the root install doesn't cover (not a workspace, not a file: dependency in
+  //     the root lockfile) were not installed here, so nothing verified what their install would download.
+  const installedWithRoot = new Set([...npmEntries, ...lockEntries].map(([k]) => k).filter(k => k && !k.split('/').includes('node_modules')))
+  for (const d of rootLocalDirs) installedWithRoot.add(d)
+  const unverified = [...new Set(nested.filter(n => !n.workspace && !installedWithRoot.has(n.rel) && (n.hasDeps || found.lockDirs.includes(n.rel))).map(n => n.rel))]
+  if (unverified.length) {
+    findings.add({ id: 'DEP-NESTED-PROJECT', severity: 'medium', file: `${unverified[0]}/package.json`, evidence: unverified.slice(0, 12).join(', ').slice(0, 240),
+      title: `${unverified.length} nested npm project(s) were not installed or verified in the sandbox: ${unverified.slice(0, 3).join(', ')}${unverified.length > 3 ? ', ...' : ''}`,
+      detail: `Projects in sub-folders (${unverified.slice(0, 20).join(', ')}${unverified.length > 20 ? ', ...' : ''}) are installed separately, with \`cd <folder> && npm install\`. Their package.json scripts and lockfiles were checked, and install scripts listed in their lockfiles are reported, but their dependencies were not downloaded here, so checksums and registry signatures were not verified. Review them, or run npm install there with --ignore-scripts.` })
   }
 
   if (pm.installed) {
@@ -577,15 +769,16 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
   //     hasInstallScript (including implicit node-gyp builds), so that flag is the source of truth, and
   //     the script text comes from the package's own package.json. Platform-specific packages that weren't
   //     installed in the sandbox are still listed.
+  //     Nested projects' lockfiles count too: their install scripts run when you install that project.
   const known = []
-  for (const [key, entry] of lockEntries) {
+  for (const [base, key, entry] of [...lockEntries.map(([k, e]) => ['', k, e]), ...nestedEntries]) {
     if (!key || !entry || entry.hasInstallScript !== true || entry.link) continue
     const name = entry.name || key.split('node_modules/').pop()
     const fromRegistry = typeof entry.resolved === 'string' && /^https:\/\/registry\.npmjs\.org\//.test(entry.resolved)
-    const dpkg = /^[\w@./-]+$/.test(key) && !key.includes('..') ? await readJson(path.join(root, key, 'package.json')) : null
+    const dpkg = /^[\w@./-]+$/.test(key) && !key.includes('..') ? await readJson(path.join(root, base, key, 'package.json')) : null
     const s = dpkg && typeof dpkg.scripts === 'object' && dpkg.scripts ? dpkg.scripts : null
     const cmd = s ? DEP_LIFECYCLE.filter(k => typeof s[k] === 'string').map(k => `${k}: ${s[k]}`).join(' ; ') : ''
-    const gyp = !cmd && dpkg ? await readText(path.join(root, key, 'binding.gyp'), 1024 * 1024) : null
+    const gyp = !cmd && dpkg ? await readText(path.join(root, base, key, 'binding.gyp')) : null
     const shown = cmd || (gyp !== null ? 'node-gyp rebuild (implicit, from binding.gyp)' : '')
     const dangerous = DOWNLOAD_EXEC.test(cmd) || (gyp !== null && /<!@?\(/.test(gyp))
     if (KNOWN_INSTALL_SCRIPTS.has(name) && fromRegistry && !dangerous) { known.push(`${name}@${entry.version}`); continue }
@@ -593,7 +786,7 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
       id: dangerous ? 'DEP-INSTALL-SCRIPT-DANGEROUS' : 'DEP-INSTALL-SCRIPT',
       severity: dangerous ? 'high' : 'medium',
       evidence: `${name}@${entry.version ?? '?'} ${shown || '(script not readable: package not installed in the sandbox)'}`.slice(0, 240),
-      title: `Dependency "${name}" runs a script on install`,
+      title: `Dependency "${name}" runs a script on install${base ? ` (in ${base})` : ''}`,
       detail: dangerous
         ? 'This dependency downloads or decodes something and runs it during install. Malicious packages almost always work this way.'
         : 'Install scripts run with your user\'s full permissions. This one isn\'t on the list of well-known native packages from the npm registry; read it before installing with scripts enabled.',
@@ -607,7 +800,7 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
   // The npm-resolved analysis tree is only useful to OSV when the project's own lockfile can't be read.
   if (pm.analysisLockfile && pm.kind !== 'bun') lockfiles = lockfiles.filter(l => l !== 'package-lock.json')
   for (const l of lockfiles.filter(f => /requirements[\w.-]*\.txt$/.test(f))) {
-    const text = await readText(path.join(root, l))
+    const text = await readText(path.join(root, l), MAX_CONFIG_BYTES, { findings, label: l })
     const m = text && text.match(/^\s*(-i|--index-url|--extra-index-url|--trusted-host|-f|--find-links)\b\s*=?\s*(\S*)/m)
     if (m) {
       const knownIndex = KNOWN_PY_INDEXES.test(m[2] || '')

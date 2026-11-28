@@ -1,8 +1,20 @@
 {
   "name": "git-bouncer",
-  "version": "0.0.0",
-  "private": true,
+  "version": "1.0.0",
   "description": "Don't just git clone. A door check for repos you didn't write: ID check, sandboxed pat-down, then a verdict before anything touches your machine.",
+  "keywords": [
+    "security",
+    "supply-chain-security",
+    "git",
+    "git-clone",
+    "sandbox",
+    "docker",
+    "podman",
+    "malware",
+    "typosquatting",
+    "devsecops",
+    "cli"
+  ],
   "type": "module",
   "bin": {
     "bouncer": "bin/bouncer.js",
@@ -16,7 +28,8 @@
     "NOTICE",
     "README.md",
     "SECURITY.md",
-    "THREAT_MODEL.md"
+    "THREAT_MODEL.md",
+    "docs/"
   ],
   "engines": {
     "node": ">=22"
@@ -33,5 +46,9 @@
   "bugs": {
     "url": "https://github.com/ylove/git-bouncer/issues"
   },
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
 }

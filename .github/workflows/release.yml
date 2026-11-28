@@ -1,0 +1,104 @@
+name: Release
+
+# Stages git-bouncer on npm from a version tag, with npm trusted publishing: GitHub's OIDC token proves
+# to npm which repo and workflow is publishing, so there is NO long-lived npm token anywhere, and the
+# staged version only goes public after the maintainer approves it with 2FA.
+# (This week's 1Password and SAP breaches both started from stolen developer tokens.)
+#
+# Runs only for a v*.*.* tag that matches package.json, and the publish job waits for approval
+# in the "release" environment.
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions: {} # nothing at the workflow level; each job lists exactly what it needs
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # check out the tagged commit
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # full history, so the ancestry check below can see main
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          # A release must never restore a cache that a pull request could have written.
+          package-manager-cache: false
+
+      - name: Tagged commit must be on main
+        # A tag pushed at an unreviewed commit (for example with a stolen token) must not publish.
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "Tag $GITHUB_REF_NAME points at a commit that is not on main"; exit 1; }
+
+      - name: Tag must match package.json
+        run: |
+          want="v$(node -p 'require("./package.json").version')"
+          test "$GITHUB_REF_NAME" = "$want" || { echo "Tag $GITHUB_REF_NAME does not match package.json ($want)"; exit 1; }
+
+      - run: npm test
+
+      - name: Pack and generate the CycloneDX SBOM
+        run: |
+          npm pack --json --ignore-scripts > pack.json
+          node -p 'JSON.parse(require("node:fs").readFileSync("pack.json", "utf8"))[0].filename' > package-name.txt
+          npm sbom --sbom-format cyclonedx > sbom.cdx.json
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-files
+          path: |
+            *.tgz
+            package-name.txt
+            sbom.cdx.json
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write # create the GitHub release and attach the package + SBOM
+      id-token: write # npm trusted publishing (OIDC) and provenance
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+
+      # Staged publishing (npm 11.15+): CI uploads the version to npm's staging area, and it only becomes
+      # public after the maintainer approves it on npmjs.com (or `npm stage approve`) with 2FA. Even a
+      # compromised workflow can't publish on its own.
+      - name: npm must support staged publishing
+        run: |
+          v="$(npm --version)"
+          node -e 'const [a,b]=process.argv[1].split(".").map(Number); process.exit(a>11||(a===11&&b>=15)?0:1)' "$v" || { echo "npm $v is too old for npm stage publish (needs 11.15.0+)"; exit 1; }
+
+      # Trusted publishing (OIDC) needs no token. NODE_AUTH_TOKEN is only for the first version, before a
+      # trusted publisher can be configured (see RELEASING.md); that token can stage but never publish.
+      - name: Stage the release on npm (with provenance)
+        run: npm stage publish "./$(cat package-name.txt)" --provenance --access public --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create the GitHub release with the package and SBOM
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes "./$(cat package-name.txt)" ./sbom.cdx.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}

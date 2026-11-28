@@ -83,7 +83,8 @@ test('lockfile entries over http, from odd hosts, from git, or without integrity
     lockfileVersion: 3,
     packages: {
       '': { name: 'demo' },
-      'node_modules/a': { version: '1.0.0', resolved: 'http://registry.npmjs.org/a/-/a-1.0.0.tgz', integrity: 'sha512-x' },
+      'node_modules/a': { version: '1.0.0', resolved: 'http://files.example.invalid/a/-/a-1.0.0.tgz', integrity: 'sha512-x' },
+      'node_modules/a2': { version: '1.0.0', resolved: 'http://registry.npmjs.org/a2/-/a2-1.0.0.tgz', integrity: 'sha512-x' },
       'node_modules/b': { version: '1.0.0', resolved: 'https://files.example.invalid/b-1.0.0.tgz', integrity: 'sha512-x' },
       'node_modules/c': { version: '1.0.0', resolved: 'git+ssh://git@github.com/x/c.git#abc' },
       'node_modules/d': { version: '1.0.0', resolved: 'https://registry.npmjs.org/d/-/d-1.0.0.tgz' },
@@ -96,7 +97,7 @@ test('lockfile entries over http, from odd hosts, from git, or without integrity
     const f = new Findings()
     const { names } = await lockfileChecks(fx.dir, f)
     const r = f.toJSON()
-    for (const [id, sev] of [['LOCK-RESOLVED-INSECURE', 'high'], ['LOCK-RESOLVED-NONREGISTRY', 'medium'], ['LOCK-RESOLVED-GIT', 'low'], ['LOCK-MISSING-INTEGRITY', 'medium'], ['LOCK-WEAK-INTEGRITY', 'low']]) {
+    for (const [id, sev] of [['LOCK-RESOLVED-INSECURE', 'high'], ['LOCK-RESOLVED-HTTP-REGISTRY', 'low'], ['LOCK-RESOLVED-NONREGISTRY', 'medium'], ['LOCK-RESOLVED-GIT', 'low'], ['LOCK-MISSING-INTEGRITY', 'medium'], ['LOCK-WEAK-INTEGRITY', 'low']]) {
       assert.ok(r.some(x => x.id === id && x.severity === sev), `${id} in ${ids(r)}`)
     }
     assert.ok(names.has('f') && names.has('a'))
@@ -122,9 +123,9 @@ test('requirements.txt with --extra-index-url (dependency confusion) is a warnin
   assert.ok(r.some(f => f.id === 'PY-INDEX-OVERRIDE'), ids(r))
 })
 
-test('yarnPath is reported: low for the standard release path, a warning anywhere else', async () => {
+test('yarnPath is a warning wherever it points (the standard release path is still repo code)', async () => {
   const std = await deps({ '.yarnrc.yml': 'yarnPath: .yarn/releases/yarn-4.5.0.cjs\n' })
-  assert.ok(std.some(f => f.id === 'YARN-PATH' && f.severity === 'low'), ids(std))
+  assert.ok(std.some(f => f.id === 'YARN-PATH' && f.severity === 'medium'), ids(std))
   const odd = await deps({ '.yarnrc.yml': 'yarnPath: scripts/setup.js\n' })
   assert.ok(odd.some(f => f.id === 'YARN-PATH' && f.severity === 'medium'), ids(odd))
 })

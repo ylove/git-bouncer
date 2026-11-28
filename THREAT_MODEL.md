@@ -44,8 +44,8 @@ Rule of the boundary: **secrets never cross into the sandbox, and nothing from t
 ### T1. The repo runs code during install
 npm/yarn/pnpm lifecycle scripts (`preinstall`, `install`, `postinstall`, `prepare`) run automatically. So do Python `setup.py` builds, `.pth` files, MSBuild targets on `dotnet build`, and husky hooks once installed.
 - In the sandbox, dependencies are installed with `--ignore-scripts`, so **no repo or dependency code is executed**.
-- Every install-time script npm would run is listed: the repo's own (including workspaces, the `dependencies` hook and `binding.gyp` builds) and every dependency the lockfile marks `hasInstallScript`, read from that package's own `package.json`. Download-and-execute patterns are FAIL. Unknown install scripts are WARN. A short, documented allowlist of well-known native packages (esbuild, sharp, …) is informational.
-- When you install on your machine afterwards and install scripts were found, you're asked whether to run them (`--ignore-scripts` is offered as the safe default).
+- The install scripts the scan can see are listed: the repo's own (including workspaces, the `dependencies` hook and `binding.gyp` builds) and every dependency the lockfile marks `hasInstallScript`, read from that package's own `package.json`. Download-and-execute patterns are FAIL. Unknown install scripts are WARN. A short, documented allowlist of well-known native packages (esbuild, sharp, …) is informational.
+- **That list can be incomplete** (old v1 lockfiles, `file:` and git dependencies, projects in subfolders), so "no scripts found" is never treated as "no scripts". **git-bouncer never runs install scripts on your machine:** the handoff always installs with `npm ci --ignore-scripts`. Running them is a separate step you take yourself (`npm rebuild`) after reading the list.
 
 ### T2. The repo runs code when you merely open it
 - `.vscode/tasks.json` with `"runOn": "folderOpen"` → FAIL. Workspace settings that select executables (`typescript.tsdk`, interpreter paths, terminal profiles) → WARN.
@@ -67,27 +67,29 @@ npm/yarn/pnpm lifecycle scripts (`preinstall`, `install`, `postinstall`, `prepar
 - Lockfile tampering: `resolved` URLs that point anywhere but the registry (http, git, random tarball hosts) → FAIL/WARN. Missing or weak (sha1) integrity → WARN.
 - Project `.npmrc` that redirects the registry, or sets `git`, `script-shell`, `node-options` and similar (which can make npm run arbitrary programs even with `--ignore-scripts`) → FAIL. In the sandbox the project `.npmrc` is moved aside before npm runs.
 - Typosquatted dependency names (`expresss`, `crossenv`) → WARN.
-- Ordinary known vulnerabilities (CVEs) → WARN only. git-bouncer answers "will this repo attack *me*?", not "is this app secure?". A tutorial repo with an old lodash isn't an attack on you.
+- Ordinary known vulnerabilities (CVEs) → LOW: shown with counts, but they don't block. git-bouncer answers "will this repo attack *me*?", not "is this app secure?". A tutorial repo with an old lodash isn't an attack on you.
 
 ### T5. The repo attacks git during clone
 Malicious repos have exploited git itself (CVE-2024-32002, CVE-2025-48384).
 - The clone happens **inside the sandbox**, never on your machine first.
 - Only `https` is allowed (`protocol.allow=never` + `protocol.https.allow=always`, `GIT_ALLOW_PROTOCOL=https`): no `ext::`, `file://`, `ssh` command tricks.
 - No hooks (`core.hooksPath=/dev/null`, empty template dir), no symlink creation (`core.symlinks=false`), object verification on (`transfer.fsckObjects=true`), submodules never fetched, NTFS/HFS path protections on, empty credential helper, no terminal prompts.
-- Symlinks escaping the repo, `.git` look-alike paths, case-colliding paths, and suspicious submodule URLs/paths → reported.
+- Symlinks are resolved the way the operating system would (one path component at a time, and under case variants): any that escape the repo, or that sit at a sensitive path (`node_modules`, `.vscode`, `package.json`, …), are FAIL. `.git` look-alike paths, paths that collide once case and Unicode are folded the way macOS and Windows fold them (FAIL), and suspicious submodule URLs/paths are reported.
+- Projects in subfolders (`frontend/package.json`) get their install scripts listed too; their dependencies aren't installed in the sandbox, which is reported as an incomplete check.
 
 ### T6. Look-alike and low-reputation sources (the ID check)
 Runs on your machine **before** anything is downloaded, using the GitHub API (through `gh` if you're signed in, so the token stays host-side; otherwise anonymously):
 - Owner or repo name within a small edit distance of a well-known org or project, including digit/letter swaps (`micr0s0ft`, `vercell`) → FAIL.
 - A famous project name under an unrelated owner that isn't a GitHub fork of the original → WARN.
-- Brand-new owner account or repo, archived repo, fork, missing or non-matching releases, unsigned commits → reported with context. New accounts are common for real take-home tests too, so this is WARN, not FAIL.
+- Brand-new owner account or repo, archived repo, a stranger's fork of a famous project, accounts whose name changed hands → reported with context. New accounts are common for real take-home tests too, so this is WARN, not FAIL. (Commit signatures and release/ref comparison are not checked yet.)
 - Repos named in public IOC reporting → FAIL.
 - Non-GitHub hosts get a reduced ID check, and the report says so.
 
 ### T7. Time-of-check vs. time-of-use
 An attacker could swap the repo between the scan and your install.
-- The sandbox scans **one exact commit**. Your local clone checks out **that commit SHA** and verifies it. Git object IDs are cryptographic hashes of content, so matching SHA means byte-identical files. If the branch moved, git-bouncer stops and tells you.
-- Dependencies install from the lockfile (`npm ci`, `yarn --immutable`, `pnpm --frozen-lockfile`). If the repo had no npm lockfile, the lockfile generated and verified in the sandbox is copied into your clone so you install exactly the scanned tree.
+- The sandbox scans **one exact commit**. Your local clone checks out **that commit SHA** and verifies the commit and tree IDs. If the branch moved, git-bouncer stops and tells you.
+- IDs describe what git *stores*; what lands on *your* disk can still differ (filters, hooks, LFS, symlinks, and filesystems that fold case or Unicode). So the host checkout runs with your system and global git config switched off, no hooks, no filters, no LFS, and **symlinks written as plain text files** (as in the sandbox). After checkout, `git status` must show no difference between the files on disk and the commit; if two paths collided on your filesystem, nothing is kept.
+- Dependencies are installed automatically only for npm projects that the sandbox installed, with no symlinks and no package-manager config in the repo, from the lockfile (`npm ci --ignore-scripts`). If the repo had no lockfile, the one generated and verified in the sandbox is copied in. Everything else gets the exact command to run yourself, with scripts off.
 
 ### T8. The report lies, or attacks your terminal
 - File names and contents are attacker-controlled. Every string shown to you is stripped of ANSI escape sequences and control characters, so a file name can't rewrite your terminal to hide a FAIL.
@@ -97,7 +99,7 @@ An attacker could swap the repo between the scan and your install.
 ### T9. Secrets leaking into the sandbox
 - No host directories are mounted. No environment variables are passed except a fixed minimal set. No Docker socket. The `gh`/`git` credentials on your machine are never used for the sandbox clone (public repos only).
 - **Snyk** (optional): your `SNYK_TOKEN` must not enter the sandbox, so Snyk runs on your machine against **copies of the manifest and lockfiles only**, never the repo's code.
-- **Codespaces fallback:** the Codespace is created from *git-bouncer's own* repo with a pinned devcontainer that has no lifecycle commands, never from the suspect repo (whose `devcontainer.json` could run code at creation). `GITHUB_TOKEN`, `GH_TOKEN` and the git credential helper are removed before the suspect repo is cloned. The Codespace is deleted afterwards.
+- **Codespaces fallback (planned, #8 / PR #23, not in 1.0.0):** the Codespace will be created from *git-bouncer's own* repo with a pinned devcontainer that has no lifecycle commands, never from the suspect repo (whose `devcontainer.json` could run code at creation). `GITHUB_TOKEN`, `GH_TOKEN` and the git credential helper are removed before the suspect repo is cloned. The Codespace is deleted afterwards.
 
 ### T10. Resource abuse in the sandbox
 A repo can try to fill the disk or fork-bomb: pids, memory and CPU are capped, the work area is a size-limited tmpfs, and every step has a timeout.

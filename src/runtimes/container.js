@@ -17,7 +17,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { readdir, readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { run } from '../proc.js'
+import { run, which } from '../proc.js'
 
 export const SANDBOX_DIR = fileURLToPath(new URL('../../sandbox/', import.meta.url))
 export const LABEL = 'dev.git-bouncer.sandbox=1'
@@ -86,7 +86,13 @@ export async function sandboxHash(dir = SANDBOX_DIR) {
  */
 export function createContainerRuntime(engine, { exec = run, onLog = () => {} } = {}) {
   if (engine !== 'docker' && engine !== 'podman') throw new Error(`unknown engine ${engine}`)
-  const cli = (args, o = {}) => exec(engine, args, { env: MINIMAL_ENV(), ...o })
+  // The engine is found once, on trusted PATH entries only (never the current folder or node_modules).
+  let bin
+  const cli = async (args, o = {}) => {
+    if (bin === undefined) bin = (await which(engine)) ?? null
+    if (!bin) return { code: -1, stdout: '', stderr: `${engine} not found`, error: Object.assign(new Error(`${engine} not found`), { code: 'ENOENT' }) }
+    return exec(bin, args, { env: MINIMAL_ENV(), ...o })
+  }
 
   return {
     name: engine,
