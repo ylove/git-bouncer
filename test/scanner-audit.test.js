@@ -484,3 +484,13 @@ test('[audit 18] AGENTS.md, CLAUDE.md and GEMINI.md are checked in sub-folders t
   assert.ok(r.some(f => f.id === 'AUTORUN-AGENT-INSTRUCTIONS' && f.file === 'a/b/c/d/e/CLAUDE.md'), ids(r))
   assert.ok(!r.some(f => f.file === 'docs/GEMINI.md'), ids(r))
 })
+
+test('[audit 4] a file: dependency is installed with the root even without a root lockfile', async () => {
+  const r = await deps({
+    'package.json': JSON.stringify({ dependencies: { helper: 'file:./tools/helper' } }),
+    'tools/helper/package.json': JSON.stringify({ name: 'helper', dependencies: { ms: '2.1.3' } }),
+    'examples/demo/package.json': JSON.stringify({ name: 'demo', dependencies: { ms: '2.1.3' } }),
+  })
+  const nested = r.find(f => f.id === 'DEP-NESTED-PROJECT')
+  assert.ok(nested && nested.evidence === 'examples/demo', ids(r))
+})

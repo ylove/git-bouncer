@@ -474,7 +474,8 @@ function fromGitHub(spec) {
 
 /**
  * Everything one package.json says about what runs and what gets installed: lifecycle scripts, dangerous
- * `npm run` targets, URL/git dependencies. Returns its direct dependency names.
+ * `npm run` targets, URL/git dependencies. Returns its direct dependency names, the URL/git specs, and the
+ * local folders it installs with `file:` (which npm installs, scripts included, along with it).
  */
 async function manifestFindings(root, rel, pkgName, pkg, findings, where) {
   const file = rel ? `${rel}/${pkgName}` : pkgName
@@ -490,9 +491,12 @@ async function manifestFindings(root, rel, pkgName, pkg, findings, where) {
   }
   const deps = new Set()
   const urlSpecs = []
+  const localDirs = []
   for (const field of DEP_FIELDS) {
     for (const [name, spec] of Object.entries(pkg[field] && typeof pkg[field] === 'object' ? pkg[field] : {})) {
       if (typeof spec !== 'string') continue
+      const local = spec.match(/^(?:file:|link:)?(\.{1,2}\/[^#?]*)$|^(?:file:|link:)([^/][^#?]*)$/)
+      if (local) localDirs.push(path.posix.normalize(path.posix.join(rel || '.', local[1] ?? local[2])).replace(/\/$/, ''))
       // "alias": "npm:real-name@1.2.3" installs real-name under another name; check the real one.
       const alias = spec.match(/^npm:((?:@[^/@]+\/)?[^@]+)/)
       deps.add(alias ? alias[1] : name)
@@ -503,7 +507,7 @@ async function manifestFindings(root, rel, pkgName, pkg, findings, where) {
       }
     }
   }
-  return { deps, urlSpecs }
+  return { deps, urlSpecs, localDirs }
 }
 
 /**
@@ -609,11 +613,13 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
   const pkg = (rootPkgs.find(([n]) => n === 'package.json') ?? rootPkgs[0])?.[1] ?? null
   const directDeps = new Map() // name -> the package.json that asked for it
   const rootUrlSpecs = []
+  const rootLocalDirs = new Set()
   for (const [pkgName, p] of rootPkgs) {
     pm.kind = 'npm'
-    const { deps, urlSpecs } = await manifestFindings(root, '', pkgName, p, findings, '')
+    const { deps, urlSpecs, localDirs } = await manifestFindings(root, '', pkgName, p, findings, '')
     for (const d of deps) if (!directDeps.has(d)) directDeps.set(d, pkgName)
     rootUrlSpecs.push(...urlSpecs)
+    for (const d of localDirs) rootLocalDirs.add(d)
   }
   const isWorkspace = workspaceMatcher(rootPkgs.map(([, p]) => p))
   const found = await findNpmProjects(root)
@@ -731,8 +737,9 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
 
   // 5b. Nested projects that the root install doesn't cover (not a workspace, not a file: dependency in
   //     the root lockfile) were not installed here, so nothing verified what their install would download.
-  const rootLockKeys = new Set(npmEntries.map(([k]) => k).filter(k => !k.split('/').includes('node_modules')))
-  const unverified = [...new Set(nested.filter(n => !n.workspace && !rootLockKeys.has(n.rel) && (n.hasDeps || found.lockDirs.includes(n.rel))).map(n => n.rel))]
+  const installedWithRoot = new Set([...npmEntries, ...lockEntries].map(([k]) => k).filter(k => k && !k.split('/').includes('node_modules')))
+  for (const d of rootLocalDirs) installedWithRoot.add(d)
+  const unverified = [...new Set(nested.filter(n => !n.workspace && !installedWithRoot.has(n.rel) && (n.hasDeps || found.lockDirs.includes(n.rel))).map(n => n.rel))]
   if (unverified.length) {
     findings.add({ id: 'DEP-NESTED-PROJECT', severity: 'medium', file: `${unverified[0]}/package.json`, evidence: unverified.slice(0, 12).join(', ').slice(0, 240),
       title: `${unverified.length} nested npm project(s) were not installed or verified in the sandbox: ${unverified.slice(0, 3).join(', ')}${unverified.length > 3 ? ', ...' : ''}`,
