@@ -21,14 +21,16 @@ The **ID check** (look-alike owners, account age and more) runs on your machine 
 | `GIT-FSCK` | critical | git's object verification rejected the download. Malformed objects have been used to exploit git clients. |
 | `GIT-UNSAFE-PATH` | high | git refused to check out a path (for example a `.git` look-alike) because of its NTFS/HFS protections. |
 | `GIT-DOTGIT-PATH` | high | A path component impersonates `.git` (case or trailing-dot variants, `GIT~1`). |
-| `GIT-SYMLINK-ESCAPE` | high | A symlink points outside the repo or at an absolute path (for example `~/.ssh`). |
+| `GIT-SYMLINK-ESCAPE` | high | A symlink points outside the repo or at an absolute path (for example `~/.ssh`). Links are followed one path component at a time, the way the OS does (`node_modules -> s/..` where `s -> .` climbs out), and also the way tools that tidy up `..` first do; an escape either way counts. |
+| `GIT-SYMLINK-SENSITIVE` | high | A symlink sits where a tool reads automatically: in or as `node_modules`, `.vscode`, `.devcontainer`, `.claude`, `.cursor`, `.husky` or any `.git*` path, or named `package.json`, `package-lock.json`, `npm-shrinkwrap.json`, `.npmrc`, `.yarnrc*`, `.pnpmfile*`, `bunfig.toml`, `binding.gyp`, `tasks.json`, `settings.json`, `AGENTS.md`, `CLAUDE.md` and similar. Where the link lands depends on how your OS and tools resolve it, which the scanner can only approximate. One exception: an agent instruction file linked to another one (`CLAUDE.md -> AGENTS.md`) that resolves unambiguously inside the repo, because the copy put in its place is scanned with the same rules. |
 | `GIT-CASE-COLLISION` | high | Two paths are the same file on macOS/Windows: they differ only by letter case, Unicode normalization, or a look-alike letter those filesystems fold together (U+017F, a long s, is "s"). A file whose name folds onto another entry's folder counts too. They overwrite each other at checkout, so the file you get may not be the one that was scanned; this was the trigger for CVE-2024-32002. |
 | `GIT-SUBMODULE-PATH` | high | A submodule path contains `..`, `.git` or a leading `-`, which are known exploit patterns. |
 | `GIT-SUBMODULE-URL` | medium | A submodule uses a non-https URL. |
+| `GIT-SYMLINK-UNRESOLVED` | medium | A symlink couldn't be replaced with a faithful copy of its target for scanning: the target is missing or unreadable, it's a loop or a folder that contains the link itself, it's a folder with more than the 5,000 files the scanner copies, or it means one thing on macOS/Linux and another to tools that resolve `..` first (Windows). A coverage gap: the result is incomplete. |
 | `GIT-LISTING-INCOMPLETE` | medium | `git ls-files` failed or its output was cut off, so the git-level checks above are incomplete. A coverage gap: the result is incomplete. |
 | `GIT-SUBMODULES` | low | Submodules exist and were not fetched or scanned. |
 | `GIT-SYMLINKS` | info | Symlinks exist (checked out as plain files in the sandbox). |
-| `GIT-SYMLINKS-RESOLVED` | info | In-repo symlinks were replaced with copies of their targets for scanning, because tools on your machine would follow them (`package.json -> tools/manifest.json`). |
+| `GIT-SYMLINKS-RESOLVED` | info | In-repo symlinks were replaced with copies of their targets for scanning, because tools on your machine would follow them (`package.json -> tools/manifest.json`). Links are resolved the way the OS resolves them, through other links, and under any spelling macOS or Windows would match; links inside a linked folder are resolved before the folder is copied. |
 
 ## Runs when you open the folder or start an AI agent
 

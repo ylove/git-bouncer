@@ -112,23 +112,27 @@ export async function hardenedClone(url, ref, dir) {
 }
 
 /**
- * Git-level checks on the checked-out tree (symlinks, submodules, case collisions, .git lookalikes).
- * Uses the index, because with core.symlinks=false the working tree shows links as plain files.
+ * Read many blobs in one `git cat-file --batch` call (no per-link process, no cap on link count).
+ * Returns the blobs it could read; any sha missing from the result could not be read.
  */
-/** Read many blobs in one `git cat-file --batch` call (no per-link process, no cap on link count). */
 async function readBlobs(dir, shas) {
   if (!shas.length) return new Map()
-  const r = await run('git', [...GIT_HARDENING, 'cat-file', '--batch'], { cwd: dir, env: cleanEnv(), input: `${shas.join('\n')}\n`, timeoutMs: 120000 })
+  // Raw bytes, not text: decoding chunk by chunk could split a multi-byte character, and then the
+  // byte sizes in the headers would no longer line up with the data.
+  const r = await run('git', [...GIT_HARDENING, 'cat-file', '--batch'], { cwd: dir, env: cleanEnv(), input: `${shas.join('\n')}\n`, timeoutMs: 120000, raw: true })
   const out = new Map()
-  const buf = Buffer.from(r.stdout, 'utf8')
+  const buf = r.stdout
   let at = 0
-  while (at < buf.length) {
+  // Objects come back in the order they were asked for; stop at the first header that doesn't match.
+  for (const want of shas) {
     const nl = buf.indexOf(10, at)
     if (nl === -1) break
     const [sha, type, size] = buf.subarray(at, nl).toString('utf8').split(' ')
+    if (sha !== want) break
     at = nl + 1
-    if (type !== 'blob') continue
+    if (type !== 'blob') continue // "missing"
     const n = Number(size)
+    if (!Number.isSafeInteger(n) || at + n > buf.length) break
     out.set(sha, buf.subarray(at, at + n).toString('utf8'))
     at += n + 1
   }
@@ -136,6 +140,114 @@ async function readBlobs(dir, shas) {
 }
 
 const MAX_MATERIALIZE_FILES = 5000
+const MAX_MATERIALIZE_LINKS = 2000
+const MAX_LINK_HOPS = 40
+
+const isAbsoluteTarget = t => t.startsWith('/') || t.startsWith('\\') || /^[A-Za-z]:/.test(t) || t.startsWith('~')
+
+// Places a tool reads automatically: a folder (anywhere in the link's path) or a file name. A link here
+// swaps what the editor, agent or package manager loads, and how that link resolves depends on your OS
+// and tools, which the scanner can only approximate. Folded names; any component starting ".git" counts.
+const SENSITIVE_DIRS = new Set(['node_modules', '.vscode', '.devcontainer', '.claude', '.cursor', '.husky', '.gemini', '.roo', '.windsurf'])
+const SENSITIVE_FILES = new Set(['package.json', 'package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml', '.npmrc',
+  'bunfig.toml', 'binding.gyp', 'tasks.json', 'settings.json', 'settings.local.json', 'mcp.json', '.mcp.json', 'hooks.json',
+  'devcontainer.json', '.devcontainer.json', 'agents.md', 'claude.md', 'claude.local.md', 'gemini.md', '.cursorrules', '.windsurfrules'])
+const SENSITIVE_PREFIXES = ['.git', '.yarnrc', '.pnpmfile']
+// Agent instruction files. `CLAUDE.md -> AGENTS.md` is a common, harmless way to share one file between
+// agents, and the copy put in its place is scanned with the same rules, so instruction-to-instruction
+// links that resolve unambiguously inside the repo are not treated as sensitive.
+const INSTRUCTION_FILES = new Set(['agents.md', 'claude.md', 'claude.local.md', 'gemini.md', 'copilot-instructions.md', '.cursorrules', '.windsurfrules'])
+
+function sensitiveComponent(file) {
+  const parts = foldPath(file).split('/')
+  const base = parts.at(-1)
+  const hit = p => SENSITIVE_DIRS.has(p) || SENSITIVE_PREFIXES.some(x => p.startsWith(x)) || p.endsWith('.code-workspace')
+  return parts.slice(0, -1).find(hit) ?? (hit(base) || SENSITIVE_FILES.has(base) ? base : null)
+}
+
+/**
+ * Resolves repo paths through the repo's own symlinks, the way different systems would.
+ * Lookups try the exact spelling first, then the folded one (macOS and Windows would follow a link or
+ * enter a folder spelled differently), so the scanner sees the worst case.
+ */
+export function linkResolver(entries, links) {
+  const linkTarget = new Map(links.map(l => [l.file, l.target]))
+  const exact = new Set()
+  const folders = new Set()
+  const folded = new Map() // folded path -> real spelling, for files, links and folders
+  const remember = p => { exact.add(p); const k = foldPath(p); if (!folded.has(k)) folded.set(k, p) }
+  for (const e of entries) {
+    remember(e.file)
+    for (let at = e.file.indexOf('/'); at !== -1; at = e.file.indexOf('/', at + 1)) { remember(e.file.slice(0, at)); folders.add(e.file.slice(0, at)) }
+  }
+  /** The real spelling of `p` in the index (or `p` itself if it doesn't exist). */
+  const spell = p => (exact.has(p) ? p : folded.get(foldPath(p)) ?? p)
+  const targetOf = p => linkTarget.get(spell(p))
+  const split = (t, backslash) => (backslash ? t.replace(/\\/g, '/') : t).split('/')
+
+  /**
+   * Physical resolution, as macOS and Linux do it: one component at a time, following a link the
+   * moment it appears. `s/../x` where `s -> a/b` is a/x: ".." leaves the link's TARGET, not the place
+   * the link sits. A component that doesn't exist, or a file used as a folder, stops resolution there,
+   * as it does for the OS. Returns {path} (in the repo, no links left in it), {missing}, {escape} or {loop}.
+   */
+  const physical = (start, backslash = false) => {
+    const stack = []
+    const pending = split(start, false)
+    let hops = 0
+    while (pending.length) {
+      const c = pending.shift()
+      if (c === '' || c === '.') continue
+      if (c === '..') { if (!stack.length) return { escape: true }; stack.pop(); continue }
+      const cand = spell([...stack, c].join('/'))
+      const t = targetOf(cand)
+      if (t === undefined) {
+        if (!exact.has(cand)) return { missing: true }
+        if (!folders.has(cand) && pending.some(x => x !== '' && x !== '.')) return { missing: true } // ENOTDIR
+        stack.splice(0, stack.length, ...cand.split('/'))
+        continue
+      }
+      if (t === null) return { unreadable: true }
+      if (++hops > MAX_LINK_HOPS) return { loop: true }
+      if (isAbsoluteTarget(t)) return { escape: true }
+      pending.unshift(...split(t, backslash)) // relative to the folder the link is in, which is `stack`
+    }
+    return { path: stack.join('/') }
+  }
+
+  /**
+   * Lexical resolution, as tools that clean up ".." before touching the disk do (Windows path handling,
+   * path.resolve-style code): `s/../x` is just x.
+   */
+  const lexical = (start, backslash = false) => {
+    let cur = path.posix.normalize(start)
+    for (let hop = 0; hop <= MAX_LINK_HOPS; hop++) {
+      if (cur === '..' || cur.startsWith('../')) return { escape: true }
+      const parts = cur.split('/')
+      let changed = false
+      for (let i = 1; i <= parts.length; i++) {
+        const prefix = parts.slice(0, i).join('/')
+        const t = targetOf(prefix)
+        if (t === undefined) continue
+        if (t === null) return { unreadable: true }
+        if (isAbsoluteTarget(t)) return { escape: true }
+        cur = path.posix.normalize(path.posix.join(path.posix.dirname(spell(prefix)), ...split(t, backslash), ...parts.slice(i)))
+        changed = true
+        break
+      }
+      if (!changed) return { path: cur === '.' ? '' : spell(cur) }
+    }
+    return { loop: true }
+  }
+
+  /** Every reading of a link: physical (macOS/Linux), lexical, and Windows' (backslashes are separators). */
+  const views = file => {
+    const out = [physical(file), lexical(file)]
+    if (/\\/.test(linkTarget.get(file) ?? '')) out.push(lexical(file, true))
+    return out
+  }
+  return { views }
+}
 
 /**
  * The sandbox checks out symlinks as plain text files (core.symlinks=false), so nothing can follow
@@ -143,53 +255,102 @@ const MAX_MATERIALIZE_FILES = 5000
  * repo: `package.json -> tools/manifest.json` makes npm read tools/manifest.json. So each in-repo link
  * is replaced with a copy of what it points to, and the scanner checks what your tools would really see.
  */
-async function materializeLinks(dir, links, findings) {
-  const targets = new Map(links.map(l => [l.file, l.target]))
-  // Resolve a repo-relative path through any links on the way (a/b where a is a link), max 40 hops.
-  const resolve = p => {
-    let cur = path.posix.normalize(p)
-    for (let hop = 0; hop < 40; hop++) {
-      const parts = cur.split('/')
-      let changed = false
-      for (let i = 1; i <= parts.length; i++) {
-        const prefix = parts.slice(0, i).join('/')
-        if (targets.has(prefix)) {
-          const t = targets.get(prefix)
-          if (t.startsWith('/') || /^[A-Za-z]:[\\/]/.test(t) || t.startsWith('~')) return null
-          cur = path.posix.normalize(path.posix.join(path.posix.dirname(prefix), t, ...parts.slice(i)))
-          if (cur.startsWith('..')) return null
-          changed = true
-          break
-        }
-      }
-      if (!changed) return cur
+async function symlinkChecks(dir, entries, links, findings) {
+  const resolver = linkResolver(entries, links)
+  const unresolved = (link, why) => findings.add({
+    id: 'GIT-SYMLINK-UNRESOLVED', severity: 'medium', file: link.file, evidence: `-> ${link.target ?? '(unreadable)'}`.slice(0, 200),
+    title: `A symlink could not be resolved for scanning: ${why}`,
+    detail: 'Tools on your machine would follow this link, but the scanner could not put a faithful copy of its target in its place, so what your tools would read there was not (fully) checked. Treat the result as incomplete.',
+  })
+
+  const plans = []
+  for (const [i, link] of links.entries()) {
+    const sensitive = sensitiveComponent(link.file)
+    const views = link.target === null ? [{ unreadable: true }] : resolver.views(link.file)
+    const escape = views.some(v => v.escape)
+    if (escape) {
+      findings.add({
+        id: 'GIT-SYMLINK-ESCAPE', severity: 'high', file: link.file, evidence: `-> ${link.target}`,
+        title: 'Symlink points outside the repository',
+        detail: 'A committed symlink that points outside the repo (for example at ~/.ssh, an absolute path, or a chain of links whose ".." climbs out) can make a tool or the app read or overwrite files on your machine. Paths are followed one step at a time, the way your OS does. It is also the building block of git clone exploits like CVE-2024-32002.',
+      })
     }
-    return null // a loop
+    const [phys] = views
+    const agreed = views.every(v => v.path !== undefined && v.path === phys.path)
+    let realKind = null
+    if (!escape && phys.path !== undefined) {
+      const st = await lstat(path.join(dir, phys.path)).catch(() => null)
+      realKind = st?.isFile() ? 'file' : st?.isDirectory() ? 'dir' : null
+    }
+    const sharedInstructions = agreed && realKind === 'file' && INSTRUCTION_FILES.has(path.posix.basename(foldPath(link.file))) &&
+      INSTRUCTION_FILES.has(path.posix.basename(foldPath(phys.path)))
+    if (sensitive && !sharedInstructions) {
+      findings.add({
+        id: 'GIT-SYMLINK-SENSITIVE', severity: 'high', file: link.file, evidence: `-> ${link.target ?? '(unreadable)'}`.slice(0, 200),
+        title: `Symlink at a path tools read automatically (${sensitive})`,
+        detail: 'Editors, AI agents and package managers load files here on their own. A symlink in this place decides what they load, and where it lands depends on how your OS and tools resolve links, which the scanner can only approximate. Legitimate repos almost never need one here.',
+      })
+    }
+    if (escape) continue
+    if (i >= MAX_MATERIALIZE_LINKS) { unresolved(link, `more than ${MAX_MATERIALIZE_LINKS} symlinks`); continue }
+    if (views.some(v => v.unreadable)) { unresolved(link, 'its target could not be read from git'); continue }
+    if (views.some(v => v.loop)) { unresolved(link, 'it is part of a loop of links'); continue }
+    if (phys.missing) {
+      const other = views.find(v => v.path !== undefined)
+      unresolved(link, other ? `it points at nothing on macOS/Linux but at "${other.path || '.'}" for tools that resolve ".." first (Windows, Node's realpath)` : 'its target does not exist in the repo')
+      continue
+    }
+    if (!agreed) {
+      const other = views.find(v => v.path !== phys.path)
+      unresolved(link, `it means "${phys.path || '.'}" on macOS/Linux but ${other.path === undefined ? 'nothing' : `"${other.path || '.'}"`} to tools that resolve ".." first (Windows, Node's realpath)`)
+    }
+    if (!realKind) { unresolved(link, phys.path ? 'its target does not exist in the repo' : 'it points at the repository itself'); continue }
+    plans.push({ link, real: phys.path, kind: realKind })
   }
+
+  // A copy of a folder must already contain whatever the links inside that folder point at, so links
+  // inside a target folder are materialized first. A folder that contains its own link is a loop.
+  const inside = (p, folder) => folder === '' || p.startsWith(`${folder}/`)
+  const order = []
+  const state = new Map()
+  const cyclic = new Set()
+  const stack = []
+  const visit = plan => {
+    if (state.get(plan) === 'done') return
+    if (state.get(plan) === 'visiting') { for (const p of stack.slice(stack.indexOf(plan))) cyclic.add(p); return }
+    state.set(plan, 'visiting')
+    stack.push(plan)
+    if (plan.kind === 'dir') for (const p of plans) if (inside(p.link.file, plan.real)) visit(p)
+    stack.pop()
+    state.set(plan, 'done')
+    order.push(plan)
+  }
+  for (const plan of plans) visit(plan)
+
   let done = 0
   let copiedFiles = 0
-  for (const link of links) {
-    const real = resolve(link.file)
-    if (!real || real === link.file) continue
-    const src = path.join(dir, real)
-    const st = await lstat(src).catch(() => null)
-    if (!st) continue
+  for (const plan of order) {
+    const { link } = plan
+    if (cyclic.has(plan)) { unresolved(link, 'its target folder contains the link itself (an endless folder)'); continue }
+    const src = path.join(dir, plan.real)
     const dest = path.join(dir, link.file)
     try {
-      if (st.isFile()) {
+      if (plan.kind === 'file') {
+        if (copiedFiles + 1 > MAX_MATERIALIZE_FILES) { unresolved(link, `more than ${MAX_MATERIALIZE_FILES} files would have to be copied`); continue }
         await rm(dest, { force: true })
         await cp(src, dest)
         copiedFiles++
-      } else if (st.isDirectory()) {
+      } else {
         const count = await countFiles(src, MAX_MATERIALIZE_FILES - copiedFiles)
-        if (count < 0) continue
+        if (count < 0) { unresolved(link, `its target folder holds more than the ${MAX_MATERIALIZE_FILES} files the scanner copies`); continue }
         await rm(dest, { force: true, recursive: true })
         await cp(src, dest, { recursive: true })
         copiedFiles += count
-      } else continue
+      }
       done++
-    } catch { /* leave the placeholder; the link itself is still reported */ }
-    if (copiedFiles >= MAX_MATERIALIZE_FILES) break
+    } catch (e) {
+      unresolved(link, `copying its target failed (${String(e?.code || e?.message || e).slice(0, 60)})`)
+    }
   }
   if (done) {
     findings.add({ id: 'GIT-SYMLINKS-RESOLVED', severity: 'info', title: `${done} in-repo symlink(s) were resolved for scanning`,
@@ -236,26 +397,16 @@ export async function gitChecks(dir, findings) {
   })
 
   // Symlinks: every one is checked (one batched git call), and in-repo ones are resolved for scanning.
+  // A target longer than any OS accepts (PATH_MAX) is treated as unreadable rather than cut short.
   const linkEntries = entries.filter(e => e.mode === '120000')
   const blobs = await readBlobs(dir, [...new Set(linkEntries.map(l => l.sha))])
-  const links = linkEntries.map(l => ({ file: l.file, target: (blobs.get(l.sha) ?? '').slice(0, 1000) }))
-  for (const link of links) {
-    const { target } = link
-    const resolved = path.posix.normalize(path.posix.join(path.posix.dirname(link.file), target))
-    if (target.startsWith('/') || /^[A-Za-z]:[\\/]/.test(target) || target.startsWith('~') || resolved.startsWith('..')) {
-      findings.add({
-        id: 'GIT-SYMLINK-ESCAPE', severity: 'high', file: link.file, evidence: `-> ${target}`,
-        title: 'Symlink points outside the repository',
-        detail: 'A committed symlink that points outside the repo (for example at ~/.ssh or an absolute path) can make a tool or the app read or overwrite files on your machine. It is also the building block of git clone exploits like CVE-2024-32002.',
-      })
-    }
-  }
+  const links = linkEntries.map(l => ({ file: l.file, target: blobs.has(l.sha) && blobs.get(l.sha).length <= 4096 ? blobs.get(l.sha) : null }))
   if (links.length) {
     findings.add({
       id: 'GIT-SYMLINKS', severity: 'info', title: `${links.length} symlink(s) in the repository`,
-      detail: 'Symlinks were checked out as plain files inside the sandbox. Ones pointing outside the repo are flagged; ones inside it are resolved so their targets are scanned where your tools would read them.',
+      detail: 'Symlinks were checked out as plain files inside the sandbox. Ones pointing outside the repo are flagged; ones inside it are resolved, step by step the way your OS does, so their targets are scanned where your tools would read them.',
     })
-    await materializeLinks(dir, links, findings)
+    await symlinkChecks(dir, entries, links, findings)
   }
 
   // Path components git itself treats specially (folded, so invisible or case variants count too).

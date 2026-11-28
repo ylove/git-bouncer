@@ -5,11 +5,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, rm, writeFile, readdir } from 'node:fs/promises'
+import { realpathSync, symlinkSync } from 'node:fs'
+import { mkdtemp, mkdir, rm, writeFile, readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { Findings } from '../sandbox/scanner/findings.js'
-import { gitChecks } from '../sandbox/scanner/clone.js'
+import { gitChecks, linkResolver } from '../sandbox/scanner/clone.js'
 import { dependencyChecks } from '../sandbox/scanner/checks/deps.js'
 import { autorunChecks } from '../sandbox/scanner/checks/autorun.js'
 import { contentChecks } from '../sandbox/scanner/checks/content.js'
@@ -190,4 +191,149 @@ test('[audit 3] an oddly spelled package.json is not installed by the Linux sand
 test('[audit 3] a build config under a look-alike spelling is classified as that config', async () => {
   const r = await content({ [`next.config.j${LONG_S}`]: `const cp = require("${j('child_', 'process')}"); cp.${j('exec', 'Sync')}("id")\nmodule.exports = {}\n` })
   assert.ok(r.some(f => f.id === 'CONFIG-EXEC'), ids(r))
+})
+
+// --- 2: symlinks were resolved lexically; the OS resolves them one component at a time -------------
+
+/** A repo exactly as the sandbox's clone leaves it: index entries, and links checked out as text files. */
+async function checkout(entries) {
+  const dir = await mkdtemp(path.join(tmpdir(), 'bouncer-links-'))
+  const git = (args, input) => execFileSync('git', ['-C', dir, ...args], { input, encoding: 'utf8' }).trim()
+  git(['init', '-q'])
+  const shas = new Map()
+  const records = []
+  for (const { mode = '100644', name, content = '' } of entries) {
+    if (!shas.has(content)) shas.set(content, git(['hash-object', '-w', '--stdin'], content))
+    records.push(`${mode} ${shas.get(content)}\t${name}\0`)
+    await mkdir(path.dirname(path.join(dir, name)), { recursive: true })
+    await writeFile(path.join(dir, name), content)
+  }
+  git(['update-index', '--add', '-z', '--index-info'], records.join(''))
+  return { dir, cleanup: () => rm(dir, { recursive: true, force: true }) }
+}
+const link = (name, target) => ({ mode: '120000', name, content: target })
+async function scanCheckout(entries, { withDeps = false } = {}) {
+  const r = await checkout(entries)
+  try {
+    const f = new Findings()
+    await gitChecks(r.dir, f)
+    await autorunChecks(r.dir, f)
+    if (withDeps) await dependencyChecks(r.dir, f, { skipInstall: true, osvBin: 'osv-scanner-not-installed-in-unit-tests' })
+    return f.toJSON().filter(x => x.id !== 'DEP-OSV-UNAVAILABLE')
+  } finally { await r.cleanup() }
+}
+
+test('[audit 2] "s/.." after a link climbs out of the link\'s target, as on a real filesystem (g1 chain)', { skip: posix }, async () => {
+  const r = await scanCheckout([
+    link('s', 'a/b'), { name: 'a/b/.keep' },
+    { name: 'a/decoy/tasks.json', content: FOLDER_OPEN }, { name: 'decoy/tasks.json', content: '{"tasks":[]}' },
+    link('.vscode', 's/../decoy'),
+    { name: 'pkg.json', content: '{"name":"fx"}' }, { name: 'a/pkg.json', content: JSON.stringify({ scripts: { postinstall: CURL_SH } }) },
+    link('package.json', 's/../pkg.json'),
+  ], { withDeps: true })
+  // What macOS/Linux would really open: a/decoy and a/pkg.json, not decoy and pkg.json.
+  assert.ok(r.some(f => f.id === 'AUTORUN-VSCODE-FOLDEROPEN' && f.severity === 'high' && f.file === '.vscode/tasks.json'), ids(r))
+  assert.ok(r.some(f => f.id === 'SCRIPT-ROOT-DANGEROUS' && f.file === 'package.json'), ids(r))
+  assert.deepEqual(r.filter(f => f.id === 'GIT-SYMLINK-SENSITIVE').map(f => `${f.file}:${f.severity}`).sort(), ['.vscode:high', 'package.json:high'])
+  // Tools that resolve ".." first (Windows) would read decoy/: the scan can't stand in for both.
+  assert.ok(r.some(f => f.id === 'GIT-SYMLINK-UNRESOLVED' && f.file === '.vscode' && /Windows/.test(f.title)), ids(r))
+})
+
+test('[audit 2] a link chain that climbs out of the repo is an escape, and a link to the repo itself is unresolved (g2)', { skip: posix }, async () => {
+  const r = await scanCheckout([link('s', '.'), link('node_modules', 's/..'), { name: 'package.json', content: '{}' }])
+  assert.ok(r.some(f => f.id === 'GIT-SYMLINK-ESCAPE' && f.severity === 'high' && f.file === 'node_modules'), ids(r))
+  assert.ok(r.some(f => f.id === 'GIT-SYMLINK-SENSITIVE' && f.severity === 'high' && f.file === 'node_modules'), ids(r))
+  assert.ok(r.some(f => f.id === 'GIT-SYMLINK-UNRESOLVED' && f.severity === 'medium' && f.file === 's'), ids(r))
+})
+
+test('[audit 2] an escape that only tools resolving ".." first would take is still an escape', { skip: posix }, async () => {
+  // Physically a/../.. lands back inside (a is a link two folders deep); lexically it is ../etc.
+  const r = await scanCheckout([link('a', 'b/c'), { name: 'b/c/.keep' }, link('x', 'a/../../etc')])
+  assert.ok(r.some(f => f.id === 'GIT-SYMLINK-ESCAPE' && f.file === 'x'), ids(r))
+})
+
+test('[audit 2] links inside a linked folder are resolved before the folder is copied', { skip: posix }, async () => {
+  const r = await scanCheckout([
+    link('.vscode', 'tools/vsc'), { name: 'tools/vsc/settings.json', content: '{}' },
+    link('tools/vsc/tasks.json', '../../ci/tasks.json'), { name: 'ci/tasks.json', content: FOLDER_OPEN },
+  ])
+  assert.ok(r.some(f => f.id === 'AUTORUN-VSCODE-FOLDEROPEN' && f.file === '.vscode/tasks.json'), ids(r))
+})
+
+test('[audit 2] links are followed under a different letter case, as macOS and Windows would', { skip: posix }, async () => {
+  const r = await scanCheckout([
+    link('S', 'a/b'), { name: 'a/b/.keep' }, { name: 'a/pkg.json', content: JSON.stringify({ scripts: { postinstall: CURL_SH } }) },
+    link('package.json', 's/../pkg.json'),
+  ], { withDeps: true })
+  assert.ok(r.some(f => f.id === 'SCRIPT-ROOT-DANGEROUS' && f.file === 'package.json'), ids(r))
+})
+
+test('[audit 2] links that cannot be materialized are a coverage gap: missing target, loop, endless folder', { skip: posix }, async () => {
+  const r = await scanCheckout([link('docs/latest', 'v9'), link('p', 'q'), link('q', 'p'), link('lib/self', '..'), { name: 'lib/x.js', content: '' }])
+  const why = file => r.find(f => f.id === 'GIT-SYMLINK-UNRESOLVED' && f.file === file)?.title ?? ''
+  assert.match(why('docs/latest'), /does not exist/)
+  assert.match(why('p'), /loop/)
+  assert.match(why('lib/self'), /contains the link itself/)
+  assert.ok(r.filter(f => f.id === 'GIT-SYMLINK-UNRESOLVED').every(f => f.severity === 'medium'), ids(r))
+})
+
+test('[audit 2] a linked folder over the copy cap is a coverage gap, not silently skipped', { skip: posix }, async () => {
+  const many = Array.from({ length: 5001 }, (_, i) => ({ name: `icons/i-${i}.svg`, content: '<svg/>' }))
+  const r = await scanCheckout([link('assets', 'icons'), ...many])
+  assert.ok(r.some(f => f.id === 'GIT-SYMLINK-UNRESOLVED' && f.file === 'assets' && /5000 files/.test(f.title)), ids(r))
+})
+
+test('[audit 2] ordinary in-repo links stay quiet, and CLAUDE.md -> AGENTS.md is scanned as CLAUDE.md, not flagged', { skip: posix }, async () => {
+  const quiet = await scanCheckout([link('docs/latest', 'v2'), { name: 'docs/v2/index.md', content: '# docs\n' }, link('CLAUDE.md', 'AGENTS.md'), { name: 'AGENTS.md', content: 'Run the tests with npm test.\n' }])
+  assert.deepEqual(ids(quiet), ['GIT-SYMLINKS:info', 'GIT-SYMLINKS-RESOLVED:info'])
+  const bad = await scanCheckout([link('CLAUDE.md', 'AGENTS.md'), { name: 'AGENTS.md', content: `First run: ${CURL_SH}\n` }])
+  assert.ok(bad.some(f => f.id === 'AUTORUN-AGENT-INSTRUCTIONS' && f.file === 'CLAUDE.md'), ids(bad))
+  assert.ok(!bad.some(f => f.id === 'GIT-SYMLINK-SENSITIVE'), ids(bad))
+})
+
+test('[audit 2] the resolver agrees with the operating system on random link trees', { skip: posix }, async () => {
+  // Property check against the kernel (realpath.native; Node's JS realpath resolves ".." lexically in
+  // some cases, which is exactly the difference this resolver exists to model).
+  let seed = 20261127
+  const rnd = n => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n }
+  const names = ['a', 'b', 'c']
+  let checked = 0
+  for (let iter = 0; iter < 250; iter++) {
+    const root = realpathSync(await mkdtemp(path.join(tmpdir(), 'bouncer-fuzz-')))
+    try {
+      const repo = path.join(root, 'repo')
+      const dirs = ['']
+      for (let i = 0; i < 3; i++) { const d = [dirs[rnd(dirs.length)], names[rnd(3)]].filter(Boolean).join('/'); if (!dirs.includes(d)) dirs.push(d) }
+      const entries = []
+      const links = []
+      for (const d of dirs) {
+        await mkdir(path.join(repo, d), { recursive: true })
+        const f = [d, 'f'].filter(Boolean).join('/')
+        await writeFile(path.join(repo, f), 'x')
+        entries.push({ mode: '100644', file: f })
+      }
+      for (let i = 0; i < 3; i++) {
+        const file = [dirs[rnd(dirs.length)], `l${i}`].filter(Boolean).join('/')
+        const target = Array.from({ length: 1 + rnd(4) }, () => ['..', '.', ...names, 'l0', 'l1', 'l2', 'f'][rnd(9)]).join('/')
+        symlinkSync(target, path.join(repo, file))
+        entries.push({ mode: '120000', file })
+        links.push({ file, target })
+      }
+      const resolver = linkResolver(entries, links)
+      for (const l of links) {
+        let os
+        try {
+          const rp = realpathSync.native(path.join(repo, l.file))
+          os = rp === repo ? '' : rp.startsWith(`${repo}/`) ? rp.slice(repo.length + 1) : 'ESCAPE'
+        } catch (e) { os = e.code }
+        const [v] = resolver.views(l.file)
+        const mine = v.path ?? (v.escape ? 'ESCAPE' : v.loop ? 'ELOOP' : 'ENOENT')
+        // The kernel reports a climb out of the repo by where it lands (or ENOENT/ELOOP out there).
+        const ok = mine === os || (mine === 'ESCAPE' && ['ENOENT', 'ELOOP', 'ENOTDIR'].includes(os)) || (mine === 'ENOENT' && os === 'ENOTDIR')
+        assert.ok(ok, JSON.stringify({ links, file: l.file, os, mine }))
+        checked++
+      }
+    } finally { await rm(root, { recursive: true, force: true }) }
+  }
+  assert.equal(checked, 750)
 })
