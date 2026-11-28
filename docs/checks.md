@@ -52,7 +52,7 @@ The **ID check** (look-alike owners, account age and more) runs on your machine 
 
 | ID | Severity | What it means |
 |---|---|---|
-| `HIDDEN-WHITESPACE-PAYLOAD` | high | Code pushed 150+ columns to the right, off-screen (PolinRider's build-config trick). |
+| `HIDDEN-WHITESPACE-PAYLOAD` | high | Code pushed 150+ columns to the right, off-screen (PolinRider's build-config trick). Every kind of blank counts toward the gap: Unicode spaces, blank-looking glyphs (Braille blank U+2800, the Hangul fillers), zero-width characters, and comments of any length with nothing visible in them. |
 | `OBFUSCATION-DECODE-EXEC` | high | Decodes base64/hex/char codes and executes the result (`eval(atob(...))`, `exec(base64.b64decode(...))`). |
 | `UNICODE-BIDI` | high (code) / low (prose) | Trojan Source direction controls (CVE-2021-42574). |
 | `UNICODE-TAG-SMUGGLING` | high | Unicode tag characters: invisible text that programs and AI models can still read. |
@@ -119,7 +119,8 @@ Known-malware and known-vulnerability lookups use [osv-scanner](https://github.c
 | ID | Severity | What it means |
 |---|---|---|
 | `SCAN-TRUNCATED` | medium | The repo was too big to scan completely (60,000 files or 400 MiB). |
-| `SCAN-LARGE-FILES` | info | Files over 2 MiB had only their first 2 MiB checked. |
+| `SCAN-LARGE-CODE-FILE` | medium | A code or build-config file is over 16 MiB (or `package.json`, a lockfile, `.npmrc` and similar are over the size the dependency checks read), so only part of it was checked. Padding a file past a scanner's limit is a known way to hide a payload. A coverage gap: the result is incomplete. |
+| `SCAN-LARGE-FILES` | info | Data files over 2 MiB had only their first 2 MiB checked. Code and config files are read up to 16 MiB. |
 | `SCAN-FINDINGS-TRUNCATED` | info | More findings existed than the report lists (25 per rule, 400 total). The verdict already counts the listed ones. |
 
 ## Adding a check

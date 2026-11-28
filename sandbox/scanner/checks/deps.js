@@ -10,7 +10,7 @@
 //
 // Nothing in this file executes code from the repo or its dependencies.
 
-import { open, rename, readdir } from 'node:fs/promises'
+import { open, rename, readdir, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { run, cleanEnv } from '../proc.js'
 import { DOWNLOAD_EXEC } from './content.js'
@@ -65,17 +65,31 @@ const LOCKFILE_NAMES = new Set(['package-lock.json', 'npm-shrinkwrap.json', 'yar
 const isRegistryUrl = u => { try { const x = new URL(u); return x.protocol === 'https:' && REGISTRY_HOSTS.has(x.hostname) } catch { return false } }
 const KNOWN_PY_INDEXES = /^https:\/\/(download\.pytorch\.org|pypi\.nvidia\.com|data\.pyg\.org)\//
 
-/** Read a whole file (size-capped) through one open handle, so the size check and the read can't diverge. */
-async function readText(file, max = 8 * 1024 * 1024) {
+const MAX_CONFIG_BYTES = 16 * 1024 * 1024
+const MAX_LOCKFILE_BYTES = 64 * 1024 * 1024
+
+/**
+ * Read a whole file (size-capped) through one open handle, so the size check and the read can't diverge.
+ * With `report`, a file over the cap is a coverage gap (SCAN-LARGE-CODE-FILE), never silently "absent":
+ * padding package.json or a lockfile past the cap must not make its scripts disappear.
+ * @param {{findings: object, label: string}} [report]
+ */
+async function readText(file, max = MAX_CONFIG_BYTES, report) {
   let fh
   try {
     fh = await open(file, 'r')
     const st = await fh.stat()
-    if (!st.isFile() || st.size > max) return null
+    if (!st.isFile()) return null
+    if (st.size > max) {
+      report?.findings.add({ id: 'SCAN-LARGE-CODE-FILE', severity: 'medium', file: report.label, evidence: `${(st.size / 1024 / 1024).toFixed(1)} MiB`,
+        title: `${path.posix.basename(report.label)} is too large to check`,
+        detail: `Package managers read this file automatically, but it is over the ${max / 1024 / 1024} MiB the scanner reads, so its scripts, settings or locked packages were not checked. Treat the result as incomplete.` })
+      return null
+    }
     return await fh.readFile('utf8')
   } catch { return null } finally { await fh?.close() }
 }
-async function readJson(file) { const t = await readText(file); if (t === null) return null; try { return JSON.parse(t.replace(/^\uFEFF/, '')) } catch { return undefined } }
+async function readJson(file, max, report) { const t = await readText(file, max, report); if (t === null) return null; try { return JSON.parse(t.replace(/^\uFEFF/, '')) } catch { return undefined } }
 
 /** Damerau-Levenshtein (optimal string alignment) distance, capped for speed. */
 export function editDistance(a, b, cap = 3) {
@@ -147,7 +161,7 @@ export async function lockfileChecks(root, findings, rel = '') {
   const label = n => (rel ? `${rel}/${n}` : n)
 
   for (const lockName of [...variantsOf(here, 'package-lock.json'), ...variantsOf(here, 'npm-shrinkwrap.json')]) {
-    const lock = await readJson(path.join(dir, lockName))
+    const lock = await readJson(path.join(dir, lockName), MAX_LOCKFILE_BYTES, { findings, label: label(lockName) })
     if (lock === undefined) {
       findings.add({ id: 'LOCK-UNPARSABLE', severity: 'medium', file: label(lockName), title: `${label(lockName)} is not valid JSON`,
         detail: 'npm can\'t use a broken lockfile, so the dependency tree couldn\'t be verified.' })
@@ -181,7 +195,7 @@ export async function lockfileChecks(root, findings, rel = '') {
   }
 
   for (const yarnName of variantsOf(here, 'yarn.lock')) {
-    const yarn = await readText(path.join(dir, yarnName))
+    const yarn = await readText(path.join(dir, yarnName), MAX_LOCKFILE_BYTES, { findings, label: label(yarnName) })
     if (!yarn) continue
     const t = newTally()
     for (const m of yarn.matchAll(/^"?(@?[^@\s"]+)@[^\n]*\n((?:[ \t]+[^\n]*\n?)*)/gm)) {
@@ -206,7 +220,7 @@ export async function lockfileChecks(root, findings, rel = '') {
   }
 
   for (const pnpmName of variantsOf(here, 'pnpm-lock.yaml')) {
-    const pnpm = await readText(path.join(dir, pnpmName))
+    const pnpm = await readText(path.join(dir, pnpmName), MAX_LOCKFILE_BYTES, { findings, label: label(pnpmName) })
     if (!pnpm) continue
     const t = newTally()
     for (const m of pnpm.matchAll(/^\s{2,4}'?\/?(@?[^@\s':]+)@([^:\n']*)'?:\n((?:\s{4,}[^\n]*\n?)*)/gm)) {
@@ -367,8 +381,9 @@ async function lifecycleFindings(dir, rel, pkg, findings, pkgName = 'package.jso
   }
   // A binding.gyp means npm runs `node-gyp rebuild` on install, even with no install script listed.
   for (const gypName of variantsOf(await readdir(dir).catch(() => []), 'binding.gyp')) {
-    const gyp = await readText(path.join(dir, gypName), 1024 * 1024)
-    if (gyp === null || typeof scripts.install === 'string' || typeof scripts.preinstall === 'string') continue
+    if (typeof scripts.install === 'string' || typeof scripts.preinstall === 'string') continue
+    if (!(await stat(path.join(dir, gypName)).catch(() => null))?.isFile()) continue
+    const gyp = (await readText(path.join(dir, gypName), MAX_CONFIG_BYTES, { findings, label: rel ? `${rel}/${gypName}` : gypName })) ?? ''
     const expand = /<!@?\(/.test(gyp) // gyp command expansion: runs a shell command while configuring
     findings.add({ id: expand ? 'SCRIPT-ROOT-DANGEROUS' : 'SCRIPT-ROOT-LIFECYCLE', severity: expand ? 'high' : 'medium', file: rel ? `${rel}/${gypName}` : gypName,
       evidence: expand ? (gyp.match(/<!@?\([^)]{0,160}/) || [''])[0] : 'binding.gyp',
@@ -405,8 +420,12 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
   const rootEntries = await readdir(root).catch(() => [])
   const spellings = name => variantsOf(rootEntries, name)
   for (const lower of ['.npmrc', '.yarnrc', '.yarnrc.yml']) for (const rc of spellings(lower)) {
-    const text = await readText(path.join(root, rc))
-    if (text === null) continue
+    const text = await readText(path.join(root, rc), MAX_CONFIG_BYTES, { findings, label: rc })
+    if (text === null) {
+      // Too large (reported) or unreadable: still never let the sandbox's own npm read it.
+      if (lower !== '.yarnrc.yml' && !dryRun) await rename(path.join(root, rc), path.join(root, `${rc}.bouncer-disabled`)).catch(() => {})
+      continue
+    }
     if (lower === '.yarnrc') {
       // Yarn classic: `yarn-path "./x.js"` makes every yarn command run that file.
       const yp = text.match(/^\s*yarn-path\s+["']?([^"'\n]+)/m)
@@ -467,13 +486,13 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
   }
   // pnpm runs .pnpmfile.cjs on every install, even with --ignore-scripts; bunfig.toml can preload scripts.
   for (const pnpmfile of [...spellings('.pnpmfile.cjs'), ...spellings('.pnpmfile.mjs')]) {
-    const t = (await readText(path.join(root, pnpmfile))) ?? ''
+    const t = (await readText(path.join(root, pnpmfile), MAX_CONFIG_BYTES, { findings, label: pnpmfile })) ?? ''
     findings.add({ id: 'PNPMFILE', severity: DOWNLOAD_EXEC.test(t) || /child_process/.test(t) ? 'high' : 'medium', file: pnpmfile,
       title: 'pnpm runs code from this repo on every install',
       detail: '.pnpmfile.cjs hooks run whenever pnpm installs, even with --ignore-scripts. Read it before running pnpm here.' })
   }
   for (const bunfig of spellings('bunfig.toml')) {
-    if (!/^\s*preload\s*=/m.test((await readText(path.join(root, bunfig))) ?? '')) continue
+    if (!/^\s*preload\s*=/m.test((await readText(path.join(root, bunfig), MAX_CONFIG_BYTES, { findings, label: bunfig })) ?? '')) continue
     findings.add({ id: 'BUNFIG-PRELOAD', severity: 'medium', file: bunfig, title: 'bunfig.toml preloads scripts',
       detail: '`preload` makes bun run these files before your code (and before tests).' })
   }
@@ -482,7 +501,7 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
   //    npm on macOS or Windows opens "Package.json" as package.json.
   const rootPkgs = []
   for (const name of spellings('package.json')) {
-    const p = await readJson(path.join(root, name))
+    const p = await readJson(path.join(root, name), MAX_CONFIG_BYTES, { findings, label: name })
     if (p && typeof p === 'object') rootPkgs.push([name, p])
   }
   const pkg = (rootPkgs.find(([n]) => n === 'package.json') ?? rootPkgs[0])?.[1] ?? null
@@ -492,7 +511,7 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
     await lifecycleFindings(root, '', pkg, findings, pkgName)
     for (const ws of await workspaceDirs(root, pkg)) {
       for (const wsName of variantsOf(await readdir(path.join(root, ws)).catch(() => []), 'package.json')) {
-        const wpkg = await readJson(path.join(root, ws, wsName))
+        const wpkg = await readJson(path.join(root, ws, wsName), MAX_CONFIG_BYTES, { findings, label: `${ws}/${wsName}` })
         if (wpkg && typeof wpkg === 'object') await lifecycleFindings(path.join(root, ws), ws, wpkg, findings, wsName)
       }
     }
@@ -586,7 +605,7 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
       pm.installed = true
       if (!npmLock) {
         if (pm.kind === 'npm') { pm.lockfile = 'package-lock.json'; pm.generatedLockfile = true } else pm.analysisLockfile = true
-        const gen = await readJson(path.join(root, 'package-lock.json'))
+        const gen = await readJson(path.join(root, 'package-lock.json'), MAX_LOCKFILE_BYTES)
         if (gen && gen.packages) lockEntries = Object.entries(gen.packages)
       }
     } else if (/EINTEGRITY|integrity checksum failed|sha512-.* integrity/i.test(err)) {
@@ -629,7 +648,7 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
     const dpkg = /^[\w@./-]+$/.test(key) && !key.includes('..') ? await readJson(path.join(root, key, 'package.json')) : null
     const s = dpkg && typeof dpkg.scripts === 'object' && dpkg.scripts ? dpkg.scripts : null
     const cmd = s ? DEP_LIFECYCLE.filter(k => typeof s[k] === 'string').map(k => `${k}: ${s[k]}`).join(' ; ') : ''
-    const gyp = !cmd && dpkg ? await readText(path.join(root, key, 'binding.gyp'), 1024 * 1024) : null
+    const gyp = !cmd && dpkg ? await readText(path.join(root, key, 'binding.gyp')) : null
     const shown = cmd || (gyp !== null ? 'node-gyp rebuild (implicit, from binding.gyp)' : '')
     const dangerous = DOWNLOAD_EXEC.test(cmd) || (gyp !== null && /<!@?\(/.test(gyp))
     if (KNOWN_INSTALL_SCRIPTS.has(name) && fromRegistry && !dangerous) { known.push(`${name}@${entry.version}`); continue }
@@ -651,7 +670,7 @@ export async function dependencyChecks(root, findings, { osvBin = 'osv-scanner',
   // The npm-resolved analysis tree is only useful to OSV when the project's own lockfile can't be read.
   if (pm.analysisLockfile && pm.kind !== 'bun') lockfiles = lockfiles.filter(l => l !== 'package-lock.json')
   for (const l of lockfiles.filter(f => /requirements[\w.-]*\.txt$/.test(f))) {
-    const text = await readText(path.join(root, l))
+    const text = await readText(path.join(root, l), MAX_CONFIG_BYTES, { findings, label: l })
     const m = text && text.match(/^\s*(-i|--index-url|--extra-index-url|--trusted-host|-f|--find-links)\b\s*=?\s*(\S*)/m)
     if (m) {
       const knownIndex = KNOWN_PY_INDEXES.test(m[2] || '')
