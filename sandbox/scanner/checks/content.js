@@ -512,7 +512,9 @@ export async function contentChecks(root, findings) {
     } else if (st.size > limit) stats.skippedLarge++
 
     // Identical bytes are checked once, unless the name changes what they mean (code, config, fonts).
-    const digest = createHash('sha1').update(buf).digest('hex')
+    // SHA-256, not SHA-1: with a SHA-1 collision an attacker could make a malicious file look like a
+    // duplicate of a harmless one and skip its checks. (Flagged by Snyk Code at the release gate.)
+    const digest = createHash('sha256').update(buf).digest('hex')
     if (seen.has(digest) && kind === 'other' && !FONT_EXT.has(ext) && !MAGIC[ext]) { stats.duplicates++; continue }
     seen.add(digest)
     stats.bytes += buf.length
