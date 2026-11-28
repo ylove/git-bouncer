@@ -67,14 +67,15 @@ npm/yarn/pnpm lifecycle scripts (`preinstall`, `install`, `postinstall`, `prepar
 - Lockfile tampering: `resolved` URLs that point anywhere but the registry (http, git, random tarball hosts) → FAIL/WARN. Missing or weak (sha1) integrity → WARN.
 - Project `.npmrc` that redirects the registry, or sets `git`, `script-shell`, `node-options` and similar (which can make npm run arbitrary programs even with `--ignore-scripts`) → FAIL. In the sandbox the project `.npmrc` is moved aside before npm runs.
 - Typosquatted dependency names (`expresss`, `crossenv`) → WARN.
-- Ordinary known vulnerabilities (CVEs) → WARN only. git-bouncer answers "will this repo attack *me*?", not "is this app secure?". A tutorial repo with an old lodash isn't an attack on you.
+- Ordinary known vulnerabilities (CVEs) → LOW: shown with counts, but they don't block. git-bouncer answers "will this repo attack *me*?", not "is this app secure?". A tutorial repo with an old lodash isn't an attack on you.
 
 ### T5. The repo attacks git during clone
 Malicious repos have exploited git itself (CVE-2024-32002, CVE-2025-48384).
 - The clone happens **inside the sandbox**, never on your machine first.
 - Only `https` is allowed (`protocol.allow=never` + `protocol.https.allow=always`, `GIT_ALLOW_PROTOCOL=https`): no `ext::`, `file://`, `ssh` command tricks.
 - No hooks (`core.hooksPath=/dev/null`, empty template dir), no symlink creation (`core.symlinks=false`), object verification on (`transfer.fsckObjects=true`), submodules never fetched, NTFS/HFS path protections on, empty credential helper, no terminal prompts.
-- Symlinks escaping the repo, `.git` look-alike paths, case-colliding paths, and suspicious submodule URLs/paths → reported.
+- Symlinks are resolved the way the operating system would (one path component at a time, and under case variants): any that escape the repo, or that sit at a sensitive path (`node_modules`, `.vscode`, `package.json`, …), are FAIL. `.git` look-alike paths, paths that collide once case and Unicode are folded the way macOS and Windows fold them (FAIL), and suspicious submodule URLs/paths are reported.
+- Projects in subfolders (`frontend/package.json`) get their install scripts listed too; their dependencies aren't installed in the sandbox, which is reported as an incomplete check.
 
 ### T6. Look-alike and low-reputation sources (the ID check)
 Runs on your machine **before** anything is downloaded, using the GitHub API (through `gh` if you're signed in, so the token stays host-side; otherwise anonymously):
