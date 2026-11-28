@@ -1,7 +1,8 @@
 name: Release
 
-# Publishes git-bouncer to npm from a version tag, with npm trusted publishing: GitHub's OIDC token
-# proves to npm which repo and workflow is publishing, so there is NO long-lived npm token anywhere.
+# Stages git-bouncer on npm from a version tag, with npm trusted publishing: GitHub's OIDC token proves
+# to npm which repo and workflow is publishing, so there is NO long-lived npm token anywhere, and the
+# staged version only goes public after the maintainer approves it with 2FA.
 # (This week's 1Password and SAP breaches both started from stolen developer tokens.)
 #
 # Runs only for a v*.*.* tag that matches package.json, and the publish job waits for approval
@@ -81,10 +82,18 @@ jobs:
         with:
           name: release-files
 
-      # Trusted publishing needs no token. NODE_AUTH_TOKEN is only set for the one-time first publish
-      # (see RELEASING.md): a 1-day token stored on the release environment, then deleted.
-      - name: Publish to npm with provenance
-        run: npm publish "./$(cat package-name.txt)" --provenance --access public --ignore-scripts
+      # Staged publishing (npm 11.15+): CI uploads the version to npm's staging area, and it only becomes
+      # public after the maintainer approves it on npmjs.com (or `npm stage approve`) with 2FA. Even a
+      # compromised workflow can't publish on its own.
+      - name: npm must support staged publishing
+        run: |
+          v="$(npm --version)"
+          node -e 'const [a,b]=process.argv[1].split(".").map(Number); process.exit(a>11||(a===11&&b>=15)?0:1)' "$v" || { echo "npm $v is too old for npm stage publish (needs 11.15.0+)"; exit 1; }
+
+      # Trusted publishing (OIDC) needs no token. NODE_AUTH_TOKEN is only for the first version, before a
+      # trusted publisher can be configured (see RELEASING.md); that token can stage but never publish.
+      - name: Stage the release on npm (with provenance)
+        run: npm stage publish "./$(cat package-name.txt)" --provenance --access public --ignore-scripts
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
