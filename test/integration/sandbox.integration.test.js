@@ -105,11 +105,25 @@ test('known vulnerabilities are reported, and the repo cannot hide them with its
   const first = await scanFixture(files)
   const vuln = first.findings.find(f => f.id === 'DEP-VULN')
   assert.ok(vuln, JSON.stringify(first.findings.map(f => f.id)))
+  assert.equal(vuln.severity, 'low', 'an ordinary CVE is context, not a reason to turn the repo away')
   const ids = [...new Set((vuln.evidence.match(/GHSA-[a-z0-9-]+|CVE-\d+-\d+/g) || []))]
   assert.ok(ids.length > 0, vuln.evidence)
   const toml = ids.map(id => `[[IgnoredVulns]]\nid = "${id}"\nreason = "trust me"\n`).join('\n')
   const second = await scanFixture({ ...files, 'osv-scanner.toml': toml })
   assert.ok(second.findings.some(f => f.id === 'DEP-VULN'), 'the repo-supplied osv-scanner.toml must be ignored')
+})
+
+test('osv-scanner in the image accepts --no-resolve, so a pom.xml cannot point it at other servers', { skip }, async () => {
+  // Without --no-resolve, osv-scanner fetches the parent POM from the <repositories> URL (and fails
+  // here, because .invalid never resolves). With it, the declared dependency is matched as written.
+  const pom = '<project><modelVersion>4.0.0</modelVersion><groupId>x</groupId><artifactId>y</artifactId><version>1</version>' +
+    '<parent><groupId>x.audit</groupId><artifactId>parent</artifactId><version>9.9.9</version></parent>' +
+    '<repositories><repository><id>r</id><url>https://repo.example.invalid/maven/</url></repository></repositories>' +
+    '<dependencies><dependency><groupId>junit</groupId><artifactId>junit</artifactId><version>4.12</version></dependency></dependencies></project>'
+  const report = await scanFixture({ 'pom.xml': pom })
+  assert.ok(!report.findings.some(f => f.id === 'DEP-OSV-UNAVAILABLE'), JSON.stringify(report.findings))
+  // junit 4.12 has a published advisory (CVE-2020-15250), so a match proves osv-scanner really ran on it.
+  assert.ok(report.findings.some(f => f.id === 'DEP-VULN' && /junit/.test(f.evidence)), JSON.stringify(report.findings.map(f => [f.id, f.evidence])))
 })
 
 test('a project .npmrc that redirects the registry is flagged, and npm still uses the real registry', { skip }, async () => {
