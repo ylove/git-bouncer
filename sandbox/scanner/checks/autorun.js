@@ -72,6 +72,12 @@ const cmdText = v => (Array.isArray(v) ? v.map(cmdText).join(' ') : typeof v ===
 const VSCODE_EXEC_SETTINGS = /^(typescript\.tsdk|eslint\.(nodePath|runtime)|python\.(defaultInterpreterPath|pythonPath)|git\.path|terminal\.integrated\.(profiles|shell|shellArgs|automationProfile|env)\.?|php\.validate\.executablePath|go\.(alternateTools|goroot)|rust-analyzer\.server\.path|.*\.(executablePath|serverPath|binaryPath))/
 // Claude Code settings that run a shell command, not just hooks.
 const CLAUDE_COMMAND_SETTINGS = ['apiKeyHelper', 'awsAuthRefresh', 'awsCredentialExport', 'otelHeadersHelper']
+// Environment variables that make programs load or run extra code, choose which program runs, or send
+// traffic (and the credentials in it) somewhere else. Claude Code applies a project's `env` settings to
+// itself and to every command, hook and MCP server it starts.
+const AGENT_ENV_RISK = /^(NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|ELECTRON_RUN_AS_NODE|LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT|DYLD_\w+|PYTHONSTARTUP|PYTHONPATH|PYTHONHOME|PYTHONUSERBASE|BASH_ENV|ENV|ZDOTDIR|PROMPT_COMMAND|PATH|SHELL|PERL5OPT|PERL5LIB|PERLLIB|RUBYOPT|RUBYLIB|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS|CLASSPATH|DOTNET_STARTUP_HOOKS|CORECLR_\w+|COR_PROFILER\w*|GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|SSH_ASKPASS|GIT_EXTERNAL_DIFF|GIT_EDITOR|GIT_PAGER|GIT_EXEC_PATH|GIT_TEMPLATE_DIR|GIT_CONFIG\w*|EDITOR|VISUAL|PAGER|BROWSER|NPM_CONFIG_\w+|YARN_\w+|HTTPS?_PROXY|ALL_PROXY|SSL_CERT_FILE|SSL_CERT_DIR|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE|ANTHROPIC_BASE_URL|ANTHROPIC_BEDROCK_BASE_URL|ANTHROPIC_VERTEX_BASE_URL)$/i
+// Agent instruction files that are read from any folder (agents pick up the nearest one).
+const NESTED_INSTRUCTIONS = /(^|\/)(agents|claude|claude\.local|gemini)\.md$/
 
 export async function autorunChecks(root, findings) {
   const index = await fileIndex(root)
@@ -161,7 +167,21 @@ export async function autorunChecks(root, findings) {
     }
   }
 
-  // 4. AI coding agents: hooks, helper commands and MCP servers start processes on their own.
+  /** Does an env value point into the repo ("./hook.js", "bin", "${CLAUDE_PROJECT_DIR}/x", "." in PATH)? */
+  const pointsIntoRepo = async value => {
+    for (const raw of String(value).split(/[\s:;,=()"'`]+/)) {
+      const project = raw.match(/^\$\{?(CLAUDE_PROJECT_DIR|PWD)\}?(\/|$)/)
+      const tok = project ? raw.slice(project[0].length) || '.' : raw
+      if (!tok || tok.startsWith('-') || tok.startsWith('$') || tok.startsWith('~') || path.posix.isAbsolute(tok)) continue
+      const norm = path.posix.normalize(tok)
+      if (norm === '..' || norm.startsWith('../')) continue
+      if (project || tok === '.' || tok.startsWith('./')) return true // anchored at the project folder
+      if (await stat(path.join(root, norm)).then(() => true, () => false)) return true
+    }
+    return false
+  }
+
+  // 4. AI coding agents: hooks, helper commands, environment and MCP servers start processes on their own.
   for (const f of [...await readAll('.claude/settings.json'), ...await readAll('.claude/settings.local.json')]) {
     let conf = null
     try { conf = parseJsonc(f.text) } catch { unparsable(f.rel) }
@@ -178,6 +198,31 @@ export async function autorunChecks(root, findings) {
       findings.add({ id: 'AUTORUN-AGENT-HOOKS', severity: FETCH_AND_RUN.test(all) ? 'high' : 'medium', file: f.rel,
         evidence: all.slice(0, 200), title: 'Repo configures commands your AI agent runs automatically',
         detail: 'Hooks, the status line and helper settings are shell commands an AI coding agent runs on its own (on session start, on tool use, to fetch keys). A repo that ships them can run code as soon as you point an agent at it.' })
+    }
+    // `env`: NODE_OPTIONS=--require ./x.js or PATH=./bin:$PATH runs repo code inside every command the agent starts.
+    const env = conf && conf.env && typeof conf.env === 'object' ? Object.entries(conf.env).filter(([k]) => AGENT_ENV_RISK.test(k)) : []
+    const envText = conf ? '' : unescapeJson(f.text)
+    const textHits = conf ? [] : [...envText.matchAll(/"([A-Za-z_][A-Za-z0-9_]*)"\s*:/g)].map(m => m[1]).filter(k => AGENT_ENV_RISK.test(k))
+    if (env.length || textHits.length) {
+      let intoRepo = false
+      for (const [, v] of env) if (await pointsIntoRepo(v)) intoRepo = true
+      findings.add({ id: 'AUTORUN-AGENT-ENV', severity: intoRepo ? 'high' : 'medium', file: f.rel,
+        evidence: (env.length ? env.map(([k, v]) => `${k}=${cmdText(v)}`) : [...new Set(textHits)]).join(' ; ').slice(0, 200),
+        title: intoRepo ? 'Agent settings make every command load a file from the repo' : 'Agent settings change how every command runs',
+        detail: 'Claude Code applies a project\'s `env` settings to itself and to every command, hook and MCP server it starts. Variables like NODE_OPTIONS, LD_PRELOAD, DYLD_*, PYTHONSTARTUP, BASH_ENV or PATH make those programs load extra code or pick a different program; proxy and base-URL variables send traffic, and the credentials in it, somewhere else.' +
+          (intoRepo ? ' Here they point at a file in this repo, so its code runs as soon as the agent runs anything.' : '') })
+    }
+  }
+  // Cursor hooks: commands Cursor's agent runs around its own actions (before shell commands, after edits, ...).
+  for (const f of await readAll('.cursor/hooks.json')) {
+    let conf = null
+    try { conf = parseJsonc(f.text) } catch { unparsable(f.rel) }
+    const all = conf ? (conf.hooks && typeof conf.hooks === 'object' && Object.keys(conf.hooks).length ? cmdText(conf.hooks) : '')
+      : (/"command"\s*:/.test(unescapeJson(f.text)) ? unescapeJson(f.text).slice(0, 300) : '')
+    if (all) {
+      findings.add({ id: 'AUTORUN-AGENT-HOOKS', severity: FETCH_AND_RUN.test(all) ? 'high' : 'medium', file: f.rel,
+        evidence: all.slice(0, 200), title: 'Repo configures commands your AI agent runs automatically',
+        detail: 'Cursor runs the commands in .cursor/hooks.json on its own, around the agent\'s actions (before shell commands, after file edits, when it stops). A repo that ships them can run code as soon as you use the agent in it.' })
     }
   }
   for (const f of (await Promise.all(['.mcp.json', '.cursor/mcp.json', '.vscode/mcp.json', '.gemini/settings.json', '.roo/mcp.json'].map(readAll))).flat()) {
@@ -197,8 +242,11 @@ export async function autorunChecks(root, findings) {
     }
   }
 
-  // 5. Hidden instructions for AI agents in instruction files.
-  for (const f of (await Promise.all(['AGENTS.md', 'CLAUDE.md', 'GEMINI.md', '.cursorrules', '.github/copilot-instructions.md', '.windsurfrules'].map(readAll))).flat()) {
+  // 5. Hidden instructions for AI agents in instruction files: AGENTS.md, CLAUDE.md and GEMINI.md in any
+  //    folder (agents read the ones nearest the files they work on), plus the root-only ones.
+  const instructionFiles = [...matching(NESTED_INSTRUCTIONS).slice(0, 200).map(read),
+    ...['.cursorrules', '.github/copilot-instructions.md', '.windsurfrules'].map(readAll)]
+  for (const f of (await Promise.all(instructionFiles)).flat().filter(Boolean)) {
     if (FETCH_AND_RUN.test(f.text)) {
       findings.add({ id: 'AUTORUN-AGENT-INSTRUCTIONS', severity: 'medium', file: f.rel,
         title: 'Agent instruction file tells the agent to download and run something',

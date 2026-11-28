@@ -40,9 +40,10 @@ The **ID check** (look-alike owners, account age and more) runs on your machine 
 | `AUTORUN-DEVCONTAINER-HOST` | high | The dev container's `initializeCommand` runs **on your host**. |
 | `AUTORUN-DEVCONTAINER-MOUNTS` | high | The dev container mounts `~/.ssh`, cloud credentials or the Docker socket, or runs privileged. |
 | `AUTORUN-GIT-HOOK` | high | A husky git hook downloads or executes code. |
-| `AUTORUN-AGENT-HOOKS` | medium / high | `.claude/settings.json` defines hooks: shell commands an AI agent runs automatically. High if they download and execute. |
+| `AUTORUN-AGENT-HOOKS` | medium / high | `.claude/settings.json` (or `settings.local.json`) defines hooks, a status line or helper commands, or `.cursor/hooks.json` defines Cursor hooks: shell commands an AI agent runs automatically. High if they download and execute. |
+| `AUTORUN-AGENT-ENV` | medium / high | `.claude/settings.json` (or `settings.local.json`) sets `env` variables that make every command the agent starts load extra code or pick a different program (`NODE_OPTIONS`, `LD_PRELOAD`, `DYLD_*`, `PYTHONSTARTUP`, `BASH_ENV`, `PATH`, ...) or send traffic elsewhere (proxies, `ANTHROPIC_BASE_URL`). High when a value points at a file or folder in the repo (`--require ./x.js`, `PATH=.:$PATH`). |
 | `AUTORUN-AGENT-MCP` | medium / high | MCP server configs (`.mcp.json`, `.cursor/mcp.json`, `.vscode/mcp.json`, `.gemini/settings.json`) that launch local programs. |
-| `AUTORUN-AGENT-INSTRUCTIONS` | medium | `AGENTS.md`, `CLAUDE.md` or similar tells the agent to download and run something. |
+| `AUTORUN-AGENT-INSTRUCTIONS` | medium | `AGENTS.md`, `CLAUDE.md` or `GEMINI.md` (in any folder, up to five deep) or `.cursorrules`, `.github/copilot-instructions.md`, `.windsurfrules` tells the agent to download and run something. |
 | `AUTORUN-VSCODE-SETTINGS` | medium | Workspace settings choose which programs the editor runs (`typescript.tsdk`, interpreter paths, terminal profiles). |
 | `AUTORUN-DEVCONTAINER` | low / medium | Dev container lifecycle commands (run inside the container or Codespace). |
 | `AUTORUN-CONFIG-UNPARSABLE` | medium | An editor or agent config couldn't be parsed strictly. Editors are lenient, so it was checked with text matching too. |
