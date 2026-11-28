@@ -16,7 +16,8 @@ import { has } from '../proc.js'
 
 // Findings that mean "a check didn't run to the end". The result is then INCOMPLETE, not a WARN.
 const COVERAGE_GAPS = new Set(['SCAN-TRUNCATED', 'SCAN-INCOMPLETE', 'DEP-OSV-UNAVAILABLE', 'DEP-OSV-PARTIAL', 'DEP-INSTALL-FAILED',
-  'DEP-INSTALL-SKIPPED', 'LOCK-OUT-OF-SYNC', 'LOCK-UNPARSABLE', 'DEP-SIGNATURES-UNCHECKED', 'ID-API-UNAVAILABLE', 'ID-IOC-UNAVAILABLE'])
+  'DEP-INSTALL-SKIPPED', 'LOCK-OUT-OF-SYNC', 'LOCK-UNPARSABLE', 'DEP-SIGNATURES-UNCHECKED', 'ID-API-UNAVAILABLE', 'ID-IOC-UNAVAILABLE',
+  'GIT-SYMLINK-UNRESOLVED', 'SCAN-LARGE-CODE-FILE', 'GIT-LISTING-INCOMPLETE', 'DEP-NESTED-PROJECT'])
 
 /** The ID check (src/idcheck): look-alikes, known-bad repos and reputation, before anything downloads. */
 async function runIdCheck(target, deps) {

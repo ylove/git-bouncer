@@ -139,14 +139,16 @@ function classifyResolved(resolved) {
   if (/^git(\+ssh|\+https|\+http|\+file)?:|^github:|^gitlab:|^bitbucket:/.test(resolved)) return 'git'
   let u
   try { u = new URL(resolved) } catch { return 'odd' }
-  if (u.protocol === 'http:') return 'insecure'
+  // npm rewrites registry.npmjs.org "resolved" URLs to the configured https registry, so an old
+  // http:// registry URL is noted, not treated like a download from an arbitrary http server.
+  if (u.protocol === 'http:') return REGISTRY_HOSTS.has(u.hostname) ? 'oldRegistryHttp' : 'insecure'
   if (u.protocol !== 'https:') return 'odd'
   if (REGISTRY_HOSTS.has(u.hostname)) return null
   if (u.hostname === 'codeload.github.com') return 'git'
   return 'nonregistry'
 }
 
-const newTally = () => ({ insecure: [], nonregistry: [], git: [], odd: [], noIntegrity: 0, sha1Only: 0 })
+const newTally = () => ({ insecure: [], oldRegistryHttp: [], nonregistry: [], git: [], odd: [], noIntegrity: 0, sha1Only: 0 })
 const note = (t, kind, label) => { t[kind].push(t[kind].length < 5 ? label : null) }
 
 /**
@@ -242,6 +244,9 @@ function reportTally(findings, file, t) {
   if (t.insecure.length) findings.add({ id: 'LOCK-RESOLVED-INSECURE', severity: 'high', file, evidence: show(t.insecure),
     title: `${t.insecure.length} package(s) download over plain http`,
     detail: 'Anyone on the network path can replace these packages in transit. Registry packages always use https.' })
+  if (t.oldRegistryHttp.length) findings.add({ id: 'LOCK-RESOLVED-HTTP-REGISTRY', severity: 'low', file, evidence: show(t.oldRegistryHttp),
+    title: `${t.oldRegistryHttp.length} package(s) list the npm registry over http`,
+    detail: 'Old lockfiles sometimes record http://registry.npmjs.org. npm rewrites these to the https registry when installing, so this is noted rather than treated as an insecure download.' })
   if (t.nonregistry.length) findings.add({ id: 'LOCK-RESOLVED-NONREGISTRY', severity: 'medium', file, evidence: show(t.nonregistry),
     title: `${t.nonregistry.length} package(s) come from outside the npm registry`,
     detail: 'Packages downloaded from arbitrary servers skip the registry\'s malware takedowns and signatures. A swapped lockfile URL is a known supply-chain trick.' })
