@@ -15,6 +15,7 @@ import { lstat, rm, writeFile, readdir } from 'node:fs/promises'
 import { devNull } from 'node:os'
 import path from 'node:path'
 import { run, which } from './proc.js'
+import { validateDir } from './cli.js'
 
 // Host git runs with none of the system's or your global configuration (no LFS smudge filter, no hooks
 // path, no fsmonitor, no aliases), plus explicit hardening on every command.
@@ -112,7 +113,11 @@ async function npmCommand() {
  * @returns {Promise<{dest: string, installed: boolean, ignoreScripts: boolean|null, manual: string|null}>}
  */
 export async function handoff({ target, report, findings, dir, install, runtime, session, prompter, out, cwd = process.cwd(), onCreated = () => {} }) {
-  const dest = path.resolve(cwd, dir)
+  // The folder name was validated by the CLI; validate it again here, where it becomes a path, so this
+  // function is safe whoever calls it. Plain relative names only, inside the current folder.
+  let safeDir
+  try { safeDir = validateDir(dir) } catch { throw new HandoffError('that destination folder name is not allowed') }
+  const dest = path.resolve(cwd, safeDir)
   const rel = path.relative(cwd, dest)
   if (rel.startsWith('..') || path.isAbsolute(rel)) throw new HandoffError('the destination must be inside the current folder')
   if (await lstat(dest).catch(() => null)) throw new HandoffError(`"${dir}" already exists. Choose a new folder name; git-bouncer never writes into an existing folder.`)

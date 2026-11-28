@@ -159,9 +159,9 @@ export async function check(cmd, deps) {
     try {
       // onSession hands us the sandbox's name before it starts, so an interrupt can always remove it.
       result = await runtime.scan({ url: target.url, ref: options.ref, nonce, image, sandboxDir: SANDBOX_DIR, onSession: s => { session = s } })
-    } catch (e) {
-      session = e.session ?? session
-      throw e
+    } finally {
+      // onSession already registered the sandbox before it started, so cleanup never depends on the
+      // error object. (Reading the session from a caught exception was redundant; Snyk Code flagged it.)
     }
     session = result.session
     const { report, complete, problems } = extractReport(result.reportText, nonce)
