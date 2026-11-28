@@ -385,3 +385,68 @@ test('[audit 6] padding package.json or the lockfile past the read limit is a co
   assert.ok(r.some(f => f.id === 'SCAN-LARGE-CODE-FILE' && f.file === 'package.json' && f.severity === 'medium'), ids(r))
   assert.ok(r.some(f => f.id === 'SCAN-LARGE-CODE-FILE' && f.file === '.npmrc'), ids(r))
 })
+
+// --- 4: npm projects in sub-folders (frontend/package.json + frontend/package-lock.json) -----------
+
+const INSTALL_SCRIPT_LOCK = JSON.stringify({ lockfileVersion: 3, packages: { '': { dependencies: { ms: '2.1.3' } },
+  'node_modules/ms': { version: '2.1.3', resolved: 'https://registry.npmjs.org/ms/-/ms-2.1.3.tgz', integrity: 'sha512-x', hasInstallScript: true } } })
+
+test('[audit 4] a nested project\'s scripts and lockfile install scripts are checked, and it is named as unverified (f8)', async () => {
+  const r = await deps({
+    'README.md': '# take-home\n\ncd frontend && npm install\n',
+    'frontend/package.json': JSON.stringify({ scripts: { postinstall: CURL_SH }, dependencies: { ms: '2.1.3' } }),
+    'frontend/package-lock.json': INSTALL_SCRIPT_LOCK,
+  })
+  assert.ok(r.some(f => f.id === 'SCRIPT-ROOT-DANGEROUS' && f.severity === 'high' && f.file === 'frontend/package.json' && /in frontend/.test(f.title)), ids(r))
+  assert.ok(r.some(f => f.id === 'DEP-INSTALL-SCRIPT' && /ms@2\.1\.3/.test(f.evidence) && /in frontend/.test(f.title)), ids(r))
+  assert.ok(r.some(f => f.id === 'DEP-NESTED-PROJECT' && f.severity === 'medium' && /frontend/.test(f.evidence)), ids(r))
+})
+
+test('[audit 4] every package.json is analyzed: deep folders, file: dependencies, and workspace globs the old expander missed', async () => {
+  const r = await deps({
+    'package.json': JSON.stringify({ workspaces: ['packages/*/'], dependencies: { helper: 'file:./tools/helper' } }),
+    'package-lock.json': JSON.stringify({ lockfileVersion: 3, packages: { '': {}, 'node_modules/helper': { resolved: 'tools/helper', link: true }, 'tools/helper': { version: '1.0.0' },
+      'node_modules/util': { resolved: 'packages/util', link: true }, 'packages/util': { version: '1.0.0' } } }),
+    'tools/helper/package.json': JSON.stringify({ name: 'helper', scripts: { postinstall: 'node setup.js' } }),
+    'packages/util/package.json': JSON.stringify({ name: 'util', scripts: { prepare: 'node build.js' }, dependencies: { ms: '2.1.3' } }),
+    'a/b/c/d/e/package.json': JSON.stringify({ scripts: { preinstall: 'node deep.js' } }),
+  })
+  for (const file of ['tools/helper/package.json', 'packages/util/package.json', 'a/b/c/d/e/package.json']) {
+    assert.ok(r.some(f => f.id === 'SCRIPT-ROOT-LIFECYCLE' && f.file === file), `${file}: ${ids(r)}`)
+  }
+  assert.ok(r.some(f => f.file === 'packages/util/package.json' && /workspace packages\/util/.test(f.title)), ids(r))
+  // A workspace and a file: dependency are installed with the root, and a project without dependencies has
+  // nothing to install: none of them is "unverified".
+  assert.ok(!r.some(f => f.id === 'DEP-NESTED-PROJECT'), ids(r))
+})
+
+test('[audit 4] more than 100 package.json files is reported, not silently cut off', async () => {
+  const files = { 'package.json': '{}' }
+  for (let i = 0; i < 105; i++) files[`fixtures/p${i}/package.json`] = '{"type":"module"}'
+  const r = await deps(files)
+  assert.ok(r.some(f => f.id === 'DEP-NESTED-PROJECT' && /More than 100/.test(f.title)), ids(r))
+})
+
+test('[audit 4] a nested lockfile pointing off-registry does not stop the root install from being verified', { skip: posix }, async () => {
+  // The root has nothing to download, so the install (if npm is on the sandbox PATH here) is offline.
+  const osv = await fakeOsv()
+  try {
+    const r = await deps({
+      'package.json': '{"name":"root"}',
+      'tools/legacy/package.json': '{"dependencies":{"x":"1.0.0"}}',
+      'tools/legacy/package-lock.json': JSON.stringify({ lockfileVersion: 3, packages: { '': {}, 'node_modules/x': { version: '1.0.0', resolved: 'https://files.example.invalid/x.tgz', integrity: 'sha512-x' } } }),
+    }, { skipInstall: false, osvBin: osv.bin })
+    assert.ok(r.some(f => f.id === 'LOCK-RESOLVED-NONREGISTRY' && f.file === 'tools/legacy/package-lock.json'), ids(r))
+    assert.ok(r.some(f => f.id === 'DEP-NESTED-PROJECT' && /tools\/legacy/.test(f.evidence)), ids(r))
+    assert.ok(!r.some(f => f.id === 'DEP-INSTALL-SKIPPED'), ids(r))
+  } finally { await osv.cleanup() }
+})
+
+test('[audit 4] a URL dependency is only "from GitHub" when its host really is github.com', async () => {
+  // Root install decisions: anything off the registry (and off GitHub) means the sandbox doesn't run npm.
+  const osv = await fakeOsv()
+  try {
+    const r = await deps({ 'package.json': JSON.stringify({ dependencies: { x: 'https://files.example.invalid/github.com/x.tgz' } }) }, { skipInstall: false, osvBin: osv.bin })
+    assert.ok(r.some(f => f.id === 'DEP-INSTALL-SKIPPED'), ids(r))
+  } finally { await osv.cleanup() }
+})
