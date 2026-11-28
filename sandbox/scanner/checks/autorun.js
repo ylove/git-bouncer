@@ -1,11 +1,13 @@
 // Auto-run checks: things that execute just because you OPENED the folder, started an AI
 // agent in it, or ran the project's normal commands. No install step required.
 //
-// Paths are matched case-insensitively: on macOS and Windows, `.VSCode/tasks.json` IS
-// `.vscode/tasks.json` as far as the editor is concerned.
+// Paths are compared the way macOS and Windows compare them (see ../paths.js): there, `.VSCode/tasks.json`
+// and a spelling with a Unicode look-alike letter ARE `.vscode/tasks.json` as far as the editor is
+// concerned. When several spellings exist, every one is checked and the worst result is kept.
 
 import { readFile, readdir, stat } from 'node:fs/promises'
 import path from 'node:path'
+import { foldPath } from '../paths.js'
 
 // Something fetched from the network and run, or decoded and run. (A plain URL is not enough here:
 // MCP configs legitimately point at remote servers.)
@@ -35,22 +37,32 @@ export function parseJsonc(text) {
 /** JSON string escapes decoded, so text fallbacks see "folderOpen" even if it was written folderOpen. */
 const unescapeJson = t => t.replace(/^\uFEFF/, '').replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(Number.parseInt(h, 16)))
 
-/** Map every lowercased relative path (a few levels deep) to its real spelling. */
-async function caseMap(root, maxDepth = 4) {
-  const map = new Map()
-  const walk = async (rel, depth) => {
-    let entries
-    try { entries = await readdir(path.join(root, rel), { withFileTypes: true }) } catch { return }
-    for (const e of entries) {
-      const r = rel ? `${rel}/${e.name}` : e.name
-      if (e.isDirectory()) {
-        if (depth < maxDepth && e.name !== '.git' && e.name !== 'node_modules') await walk(r, depth + 1)
-      } else if (e.isFile() && !map.has(r.toLowerCase())) map.set(r.toLowerCase(), r)
-      if (map.size > 20000) return
+/**
+ * Every file a few folders deep, with its folded path. Breadth-first, so the shallow auto-run locations
+ * are always listed before the cap is reached, however big the rest of the repo is.
+ * @returns {Promise<{rel: string, fold: string}[]>}
+ */
+async function fileIndex(root, maxDepth = 5, cap = 50000) {
+  const out = []
+  let level = ['']
+  for (let depth = 0; level.length && depth <= maxDepth; depth++) {
+    const next = []
+    for (const rel of level) {
+      let entries
+      try { entries = await readdir(path.join(root, rel), { withFileTypes: true }) } catch { continue }
+      for (const e of entries) {
+        const r = rel ? `${rel}/${e.name}` : e.name
+        if (e.isDirectory()) {
+          if (e.name !== '.git' && foldPath(e.name) !== 'node_modules') next.push(r)
+        } else if (e.isFile()) {
+          out.push({ rel: r, fold: foldPath(r) })
+          if (out.length >= cap) return out
+        }
+      }
     }
+    level = next
   }
-  await walk('', 0)
-  return map
+  return out
 }
 
 const cmdText = v => (Array.isArray(v) ? v.map(cmdText).join(' ') : typeof v === 'object' && v ? Object.values(v).map(cmdText).join(' ; ') : String(v ?? ''))
@@ -62,25 +74,31 @@ const VSCODE_EXEC_SETTINGS = /^(typescript\.tsdk|eslint\.(nodePath|runtime)|pyth
 const CLAUDE_COMMAND_SETTINGS = ['apiKeyHelper', 'awsAuthRefresh', 'awsCredentialExport', 'otelHeadersHelper']
 
 export async function autorunChecks(root, findings) {
-  const files = await caseMap(root)
-  const real = rel => files.get(rel.toLowerCase()) ?? null
-  const read = async rel => {
-    const r = real(rel)
-    if (!r) return null
-    try { return { rel: r, text: await readFile(path.join(root, r), 'utf8') } } catch { return null }
+  const index = await fileIndex(root)
+  const byFold = new Map()
+  for (const f of index) {
+    if (!byFold.has(f.fold)) byFold.set(f.fold, [])
+    byFold.get(f.fold).push(f.rel)
   }
+  const read = async rel => {
+    try { return { rel, text: await readFile(path.join(root, rel), 'utf8') } } catch { return null }
+  }
+  /** Every spelling of `rel` that exists in the repo (".vscode/tasks.json", ".VSCode/tasks.json", ...), read. */
+  const readAll = async rel => (await Promise.all((byFold.get(foldPath(rel)) ?? []).map(read))).filter(Boolean)
+  /** Real spellings of every file whose folded path matches `re` (write `re` in lowercase). */
+  const matching = re => index.filter(f => re.test(f.fold)).map(f => f.rel)
   const unparsable = rel => findings.add({ id: 'AUTORUN-CONFIG-UNPARSABLE', severity: 'medium', file: rel,
     title: `${rel} could not be parsed`,
     detail: 'Editors and agents read these files leniently, so a file that breaks a strict parser may still run commands. Its contents were checked with text matching instead.' })
 
   // 1. VS Code tasks that run on folder open (in .vscode/tasks.json or any *.code-workspace file).
-  const taskSources = [await read('.vscode/tasks.json'), ...await Promise.all([...files.values()].filter(f => /\.code-workspace$/i.test(f) && !f.includes('/')).slice(0, 10).map(read))].filter(Boolean)
+  const taskSources = [...await readAll('.vscode/tasks.json'), ...(await Promise.all(matching(/^[^/]*\.code-workspace$/).slice(0, 10).map(read))).filter(Boolean)]
   for (const { rel, text } of taskSources) {
     let flagged = false
     let parsed = true
     try {
       const conf = parseJsonc(text)
-      const tasks = (rel.endsWith('.code-workspace') ? conf.tasks?.tasks : conf.tasks) || []
+      const tasks = (foldPath(rel).endsWith('.code-workspace') ? conf.tasks?.tasks : conf.tasks) || []
       for (const t of Array.isArray(tasks) ? tasks : []) {
         if (t?.runOptions?.runOn === 'folderOpen') {
           flagged = true
@@ -101,8 +119,7 @@ export async function autorunChecks(root, findings) {
   }
 
   // 2. VS Code settings that point at executables.
-  const settings = await read('.vscode/settings.json')
-  if (settings) {
+  for (const settings of await readAll('.vscode/settings.json')) {
     try {
       const keys = Object.keys(parseJsonc(settings.text)).filter(k => VSCODE_EXEC_SETTINGS.test(k))
       if (keys.length) {
@@ -114,9 +131,10 @@ export async function autorunChecks(root, findings) {
   }
 
   // 3. Dev containers (root and named configs): initializeCommand runs on YOUR HOST.
-  const devcontainers = [...files.values()].filter(f => /^(\.devcontainer\/devcontainer\.json|\.devcontainer\.json|\.devcontainer\/[^/]+\/devcontainer\.json)$/i.test(f)).slice(0, 20)
+  const devcontainers = matching(/^(\.devcontainer\/devcontainer\.json|\.devcontainer\.json|\.devcontainer\/[^/]+\/devcontainer\.json)$/).slice(0, 20)
   for (const rel of devcontainers) {
-    const { text } = await read(rel)
+    const { text } = (await read(rel)) ?? {}
+    if (text === undefined) continue
     let conf = null
     try { conf = parseJsonc(text) } catch { unparsable(rel) }
     const flat = unescapeJson(text)
@@ -144,9 +162,7 @@ export async function autorunChecks(root, findings) {
   }
 
   // 4. AI coding agents: hooks, helper commands and MCP servers start processes on their own.
-  for (const rel of ['.claude/settings.json', '.claude/settings.local.json']) {
-    const f = await read(rel)
-    if (!f) continue
+  for (const f of [...await readAll('.claude/settings.json'), ...await readAll('.claude/settings.local.json')]) {
     let conf = null
     try { conf = parseJsonc(f.text) } catch { unparsable(f.rel) }
     const parts = []
@@ -164,9 +180,7 @@ export async function autorunChecks(root, findings) {
         detail: 'Hooks, the status line and helper settings are shell commands an AI coding agent runs on its own (on session start, on tool use, to fetch keys). A repo that ships them can run code as soon as you point an agent at it.' })
     }
   }
-  for (const rel of ['.mcp.json', '.cursor/mcp.json', '.vscode/mcp.json', '.gemini/settings.json', '.roo/mcp.json']) {
-    const f = await read(rel)
-    if (!f) continue
+  for (const f of (await Promise.all(['.mcp.json', '.cursor/mcp.json', '.vscode/mcp.json', '.gemini/settings.json', '.roo/mcp.json'].map(readAll))).flat()) {
     try {
       const conf = parseJsonc(f.text)
       const servers = conf.mcpServers || conf.servers || {}
@@ -184,9 +198,8 @@ export async function autorunChecks(root, findings) {
   }
 
   // 5. Hidden instructions for AI agents in instruction files.
-  for (const rel of ['AGENTS.md', 'CLAUDE.md', 'GEMINI.md', '.cursorrules', '.github/copilot-instructions.md', '.windsurfrules']) {
-    const f = await read(rel)
-    if (f && FETCH_AND_RUN.test(f.text)) {
+  for (const f of (await Promise.all(['AGENTS.md', 'CLAUDE.md', 'GEMINI.md', '.cursorrules', '.github/copilot-instructions.md', '.windsurfrules'].map(readAll))).flat()) {
+    if (FETCH_AND_RUN.test(f.text)) {
       findings.add({ id: 'AUTORUN-AGENT-INSTRUCTIONS', severity: 'medium', file: f.rel,
         title: 'Agent instruction file tells the agent to download and run something',
         detail: 'Instruction files are read by AI coding agents as if you wrote them. Download-and-execute commands here are a prompt-injection risk.' })
@@ -194,10 +207,11 @@ export async function autorunChecks(root, findings) {
   }
 
   // 6. Git hook managers wire commands into your commits after install: every husky hook, not just four names.
-  for (const rel of [...files.values()].filter(f => /^\.husky\/[^/_][^/]*$/i.test(f)).slice(0, 50)) {
+  for (const rel of matching(/^\.husky\/[^/_][^/]*$/).slice(0, 50)) {
     const st = await stat(path.join(root, rel)).catch(() => null)
     if (!st || st.size > 256 * 1024) continue
-    const { text } = await read(rel)
+    const { text } = (await read(rel)) ?? {}
+    if (text === undefined) continue
     if (FETCH_AND_RUN.test(text) || /https?:\/\//.test(text)) {
       findings.add({ id: 'AUTORUN-GIT-HOOK', severity: 'high', file: rel, evidence: text.trim().slice(0, 200),
         title: 'Git hook downloads or executes code',

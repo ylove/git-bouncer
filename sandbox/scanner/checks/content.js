@@ -18,6 +18,7 @@ import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { excerpt } from '../findings.js'
 import { iocIndex, matchIocStrings, IOC_SNAPSHOT_DATE } from './iocs.js'
+import { foldPath } from '../paths.js'
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024
 const MAX_TOTAL_BYTES = 400 * 1024 * 1024
@@ -420,7 +421,7 @@ async function listFiles(root, findings) {
       if (ent.isDirectory()) {
         if (ent.name === '.git' && relDir === '') continue
         // These checks run before anything is installed, so any node_modules here was committed.
-        if (ent.name === 'node_modules' && nmReported++ < 5) {
+        if (foldPath(ent.name) === 'node_modules' && nmReported++ < 5) {
           findings.add({ id: 'REPO-COMMITTED-NODE-MODULES', severity: 'medium', file: rel, title: 'node_modules is committed to the repo',
             detail: 'Committed dependencies bypass the lockfile and registry checks, and Node will load them from here. It\'s scanned like the rest of the repo, but nothing verifies where it came from.' })
         }
@@ -431,8 +432,9 @@ async function listFiles(root, findings) {
     }
   }
   const rank = rel => {
-    const base = path.posix.basename(rel).toLowerCase()
-    if (/^\.(vscode|devcontainer|claude|cursor|husky|github|idea)\//.test(rel) || CONFIG_FILE.test(base) || ['package.json', '.npmrc', 'conftest.py', 'setup.py'].includes(base)) return 0
+    const folded = foldPath(rel)
+    const base = path.posix.basename(folded)
+    if (/^\.(vscode|devcontainer|claude|cursor|husky|github|idea)\//.test(folded) || CONFIG_FILE.test(base) || ['package.json', '.npmrc', 'conftest.py', 'setup.py'].includes(base)) return 0
     const ext = path.posix.extname(base).slice(1)
     if (EXEC_EXT.has(ext) || EXEC_NAMES.has(base) || FONT_EXT.has(ext)) return 1
     return 2
@@ -463,7 +465,8 @@ export async function contentChecks(root, findings) {
     if (!st || !st.isFile()) { await fh.close(); continue }
     stats.files++
     const name = path.posix.basename(rel)
-    const base = name.toLowerCase()
+    // Classified by the folded name: "next.config.j<U+017F>" is next.config.js to Node on macOS.
+    const base = foldPath(name)
     const ext = path.posix.extname(base).slice(1)
     if (ioc.files.has(base)) {
       const c = ioc.files.get(base)

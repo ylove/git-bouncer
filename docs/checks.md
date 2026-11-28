@@ -10,6 +10,8 @@ Every finding has a stable ID, a severity and a plain-language explanation in th
 
 All of these run inside the sandbox. None of them executes code from the repository. The repository can't configure the scanner: no ignore files or settings are read from it. It can still try to *evade* the checks (see the limitations in [THREAT_MODEL.md](../THREAT_MODEL.md)), which is why the most important ones are written to be hard to dodge and are covered by regression tests for every bypass found in review.
 
+Paths are compared the way macOS (APFS) and Windows (NTFS) compare them: case-insensitively, ignoring Unicode normalization and invisible code points, and folding look-alike letters such as U+017F (a long s) into the letter they uppercase to. `.VSCode/tasks.json` and `.vſcode/tasks.json` are both checked as `.vscode/tasks.json`, `Package.json` as `package.json`, and when several spellings exist every one is checked and the worst result counts.
+
 The **ID check** (look-alike owners, account age and more) runs on your machine before anything is downloaded. Its findings are documented with that feature in [#2](https://github.com/ylove/git-bouncer/issues/2).
 
 ## Git (the clone itself)
@@ -20,8 +22,8 @@ The **ID check** (look-alike owners, account age and more) runs on your machine 
 | `GIT-UNSAFE-PATH` | high | git refused to check out a path (for example a `.git` look-alike) because of its NTFS/HFS protections. |
 | `GIT-DOTGIT-PATH` | high | A path component impersonates `.git` (case or trailing-dot variants, `GIT~1`). |
 | `GIT-SYMLINK-ESCAPE` | high | A symlink points outside the repo or at an absolute path (for example `~/.ssh`). |
+| `GIT-CASE-COLLISION` | high | Two paths are the same file on macOS/Windows: they differ only by letter case, Unicode normalization, or a look-alike letter those filesystems fold together (U+017F, a long s, is "s"). A file whose name folds onto another entry's folder counts too. They overwrite each other at checkout, so the file you get may not be the one that was scanned; this was the trigger for CVE-2024-32002. |
 | `GIT-SUBMODULE-PATH` | high | A submodule path contains `..`, `.git` or a leading `-`, which are known exploit patterns. |
-| `GIT-CASE-COLLISION` | medium | Two paths differ only by case. On macOS/Windows they overwrite each other; this was the trigger for CVE-2024-32002. |
 | `GIT-SUBMODULE-URL` | medium | A submodule uses a non-https URL. |
 | `GIT-LISTING-INCOMPLETE` | medium | `git ls-files` failed or its output was cut off, so the git-level checks above are incomplete. A coverage gap: the result is incomplete. |
 | `GIT-SUBMODULES` | low | Submodules exist and were not fetched or scanned. |
@@ -104,7 +106,7 @@ Known-malware and known-vulnerability lookups use [osv-scanner](https://github.c
 | `BUNFIG-PRELOAD` | medium | `bunfig.toml` preloads scripts before your code runs. |
 | `PY-INDEX-OVERRIDE` | medium | A requirements file adds or replaces the Python package index (dependency confusion). |
 | `NPMRC-TOKEN` | medium | An npm auth token is committed (poor hygiene, possibly stolen). |
-| `DEP-INSTALL-FAILED`, `DEP-INSTALL-SKIPPED`, `DEP-OSV-UNAVAILABLE`, `DEP-OSV-PARTIAL`, `DEP-SIGNATURES-UNCHECKED` | medium / low | A dependency check couldn't complete (or was deliberately skipped, because the lockfile points at servers the sandbox shouldn't contact), so the result is incomplete. |
+| `DEP-INSTALL-FAILED`, `DEP-INSTALL-SKIPPED`, `DEP-OSV-UNAVAILABLE`, `DEP-OSV-PARTIAL`, `DEP-SIGNATURES-UNCHECKED` | medium / low | A dependency check couldn't complete, so the result is incomplete. The install is deliberately skipped when the lockfile points at servers the sandbox shouldn't contact, or when `package.json` or the lockfile is spelled unusually (`Package.json`): npm on macOS/Windows reads that spelling, the sandbox's npm on Linux doesn't, so its install would verify a different tree. |
 | `DEP-PLATFORM-RESTRICTED` | low | The project refuses to install on Linux; the sandbox installed it anyway to check the dependencies. |
 | `DEP-VULN` | low | Known vulnerabilities (CVEs) in dependencies, with the critical and high counts in the title. Low, because the verdict answers "will this repo attack me?" and a CVE answers "is this app vulnerable?": it makes the app vulnerable, not your machine at install time. |
 | `LOCK-RESOLVED-GIT`, `LOCK-WEAK-INTEGRITY` | low | Git dependencies (no registry signatures) or SHA-1-only integrity. |

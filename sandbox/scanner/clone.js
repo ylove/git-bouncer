@@ -14,6 +14,7 @@
 import { mkdir, lstat, rm, cp, readdir } from 'node:fs/promises'
 import path from 'node:path'
 import { run, cleanEnv } from './proc.js'
+import { foldPath } from './paths.js'
 
 export const GIT_HARDENING = [
   '-c', 'protocol.allow=never',
@@ -257,10 +258,10 @@ export async function gitChecks(dir, findings) {
     await materializeLinks(dir, links, findings)
   }
 
-  // Path components git itself treats specially.
+  // Path components git itself treats specially (folded, so invisible or case variants count too).
   for (const e of entries) {
     const parts = e.file.split('/')
-    if (parts.some(p => /^\.git$/i.test(p.replace(/[ .]+$/, '')) || /^git~\d$/i.test(p))) {
+    if (parts.some(p => foldPath(p).replace(/[ .]+$/, '') === '.git' || /^git~\d$/i.test(p))) {
       findings.add({
         id: 'GIT-DOTGIT-PATH', severity: 'high', file: e.file,
         title: 'Path impersonates the .git directory',
@@ -269,17 +270,28 @@ export async function gitChecks(dir, findings) {
     }
   }
 
-  // Case collisions only matter on case-insensitive filesystems (macOS, Windows), which is where many devs work.
-  const seen = new Map()
+  // Collisions: two entries that macOS or Windows treat as the same path (letter case, Unicode
+  // normalization, U+017F for "s", invisible code points). They overwrite each other at checkout, so
+  // which one ends up on disk depends on checkout order, not on what was scanned. A file that folds onto
+  // another entry's folder is the same trick one level up (CVE-2024-32002: a symlink "a" next to "A/").
+  const files = new Map() // folded path -> first spelling seen
+  const dirs = new Map() // folded folder path -> first spelling seen
   for (const e of entries) {
-    const k = e.file.toLowerCase()
-    if (seen.has(k) && seen.get(k) !== e.file) {
-      findings.add({
-        id: 'GIT-CASE-COLLISION', severity: 'medium', file: e.file, evidence: `also: ${seen.get(k)}`,
-        title: 'Two paths differ only by letter case',
-        detail: 'On macOS and Windows these overwrite each other at checkout. Combined with symlinks this was the trigger for CVE-2024-32002.',
-      })
-    } else seen.set(k, e.file)
+    for (let at = e.file.indexOf('/'); at !== -1; at = e.file.indexOf('/', at + 1)) {
+      const d = e.file.slice(0, at)
+      const k = foldPath(d)
+      if (!dirs.has(k)) dirs.set(k, d)
+    }
+  }
+  for (const e of entries) {
+    const k = foldPath(e.file)
+    const other = files.has(k) && files.get(k) !== e.file ? files.get(k) : dirs.has(k) ? dirs.get(k) : null
+    if (other === null) { files.set(k, e.file); continue }
+    findings.add({
+      id: 'GIT-CASE-COLLISION', severity: 'high', file: e.file, evidence: `also: ${other}`,
+      title: 'Two paths are the same file on macOS and Windows',
+      detail: 'These names differ only by letter case or by Unicode look-alikes that macOS and Windows treat as the same letter (for example U+017F, a long s, for "s"). On those systems they overwrite each other at checkout, so the file you get is not necessarily the one that was scanned. Combined with symlinks this was the trigger for CVE-2024-32002.',
+    })
   }
 
   // Submodules are never fetched; list them and flag odd ones.
